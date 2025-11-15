@@ -1,0 +1,866 @@
+//! Query optimization rules
+//!
+//! Provides various optimization rules for query planning.
+
+use crate::{
+    Result,
+    sql::ast::{Expression, BinaryOperator, UnaryOperator},
+    executor::planner::PlanNode,
+    types::{Value, ValueKind},
+};
+
+/// Optimization rule trait
+pub trait OptimizerRule {
+    /// Apply the rule to a plan node
+    fn apply(&self, plan: &PlanNode) -> Result<PlanNode>;
+    /// Get rule name
+    fn name(&self) -> &'static str;
+    /// Check if rule should be applied
+    fn is_applicable(&self, plan: &PlanNode) -> bool {
+        true // Default: always applicable
+    }
+}
+
+/// Rule engine for applying optimization rules
+pub struct RuleEngine {
+    rules: Vec<Box<dyn OptimizerRule>>,
+    iteration_limit: usize,
+    enable_iteration: bool,
+}
+
+impl std::fmt::Debug for RuleEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuleEngine")
+            .field("rules_count", &self.rules.len())
+            .field("iteration_limit", &self.iteration_limit)
+            .field("enable_iteration", &self.enable_iteration)
+            .finish()
+    }
+}
+
+impl RuleEngine {
+    /// Create new rule engine
+    pub fn new() -> Self {
+        Self {
+            rules: Vec::new(),
+            iteration_limit: 10,
+            enable_iteration: true,
+        }
+    }
+
+    /// Create rule engine with custom configuration
+    pub fn with_config(iteration_limit: usize, enable_iteration: bool) -> Self {
+        Self {
+            rules: Vec::new(),
+            iteration_limit,
+            enable_iteration,
+        }
+    }
+
+    /// Add rule to engine
+    pub fn add_rule(&mut self, rule: Box<dyn OptimizerRule>) {
+        self.rules.push(rule);
+    }
+
+    /// Apply all rules to plan (with fixpoint iteration)
+    pub fn optimize(&self, initial_plan: &PlanNode) -> Result<PlanNode> {
+        let mut current_plan = initial_plan.clone();
+        let mut iteration_count = 0;
+
+        if self.enable_iteration {
+            // Apply rules iteratively until fixpoint
+            loop {
+                let old_plan = current_plan.clone();
+                let mut changed = false;
+
+                for rule in &self.rules {
+                    if rule.is_applicable(&current_plan) {
+                        let new_plan = rule.apply(&current_plan)?;
+                        if !self.plans_equal(&current_plan, &new_plan) {
+                            current_plan = new_plan;
+                            changed = true;
+                        }
+                    }
+                }
+
+                iteration_count += 1;
+                if !changed || iteration_count >= self.iteration_limit {
+                    break;
+                }
+            }
+        } else {
+            // Single pass application
+            for rule in &self.rules {
+                if rule.is_applicable(&current_plan) {
+                    current_plan = rule.apply(&current_plan)?;
+                }
+            }
+        }
+
+        Ok(current_plan)
+    }
+
+    /// Apply single rule
+    pub fn apply_rule(&self, plan: &PlanNode, rule_index: usize) -> Result<PlanNode> {
+        if rule_index < self.rules.len() {
+            self.rules[rule_index].apply(plan)
+        } else {
+            Ok(plan.clone())
+        }
+    }
+
+    /// Get all rules
+    pub fn rules(&self) -> &[Box<dyn OptimizerRule>] {
+        &self.rules
+    }
+
+    /// Check if two plans are equal (simplified)
+    fn plans_equal(&self, plan1: &PlanNode, plan2: &PlanNode) -> bool {
+        // This is a simplified equality check
+        // In a real implementation, this would be more sophisticated
+        std::mem::discriminant(plan1) == std::mem::discriminant(plan2)
+    }
+}
+
+/// Predicate pushdown rule
+#[derive(Debug)]
+pub struct PredicatePushdownRule;
+
+impl OptimizerRule for PredicatePushdownRule {
+    fn apply(&self, plan: &PlanNode) -> Result<PlanNode> {
+        match plan {
+            PlanNode::Filter { input, condition } => {
+                // Try to push filter down to the input plan
+                let pushed_down = self.try_pushdown_filter(input.as_ref(), condition.clone())?;
+                match pushed_down {
+                    Some(new_input) => {
+                        // Successfully pushed down, need to adjust the condition
+                        self.apply(&new_input)
+                    }
+                    None => {
+                        // Cannot push down, keep original structure
+                        let new_input = self.apply(input.as_ref())?;
+                        Ok(PlanNode::Filter {
+                            input: Box::new(new_input),
+                            condition: self.optimize_expression(condition)?.unwrap_or_else(|| condition.clone()),
+                        })
+                    }
+                }
+            }
+            PlanNode::Join { left, right, condition, join_type } => {
+                // Try to push conditions down to join inputs
+                let (left_condition, right_condition, remaining_condition) = self.classify_join_conditions(condition);
+
+                let optimized_left = if let Some(left_cond) = left_condition {
+                    let left_with_filter = PlanNode::Filter {
+                        input: left.clone(),
+                        condition: left_cond,
+                    };
+                    self.apply(&left_with_filter)?
+                } else {
+                    self.apply(left.as_ref())?
+                };
+
+                let optimized_right = if let Some(right_cond) = right_condition {
+                    let right_with_filter = PlanNode::Filter {
+                        input: right.clone(),
+                        condition: right_cond,
+                    };
+                    self.apply(&right_with_filter)?
+                } else {
+                    self.apply(right.as_ref())?
+                };
+
+                Ok(PlanNode::Join {
+                    left: Box::new(optimized_left),
+                    right: Box::new(optimized_right),
+                    condition: remaining_condition.and_then(|expr| self.optimize_expression(&expr).ok()).flatten(),
+                    join_type: join_type.clone(),
+                })
+            }
+            _ => self.apply_to_children(plan),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "PredicatePushdown"
+    }
+
+    fn is_applicable(&self, plan: &PlanNode) -> bool {
+        matches!(plan, PlanNode::Filter { .. } | PlanNode::Join { .. })
+    }
+}
+
+impl PredicatePushdownRule {
+    fn try_pushdown_filter(&self, input: &PlanNode, condition: Expression) -> Result<Option<PlanNode>> {
+        match input {
+            PlanNode::Scan { table_name, columns } => {
+                // Can always push filter to scan
+                Ok(Some(PlanNode::Scan {
+                    table_name: table_name.clone(),
+                    columns: columns.clone(),
+                }))
+            }
+            PlanNode::IndexScan { table_name, index_name, columns, .. } => {
+                // Can push filter to index scan if it's indexable
+                if self.is_condition_indexable(&condition) {
+                    Ok(Some(PlanNode::IndexScan {
+                        table_name: table_name.clone(),
+                        index_name: index_name.clone(),
+                        index_condition: Some(condition),
+                        columns: columns.clone(),
+                    }))
+                } else {
+                    // Can't push down, would need residual filter
+                    Ok(None)
+                }
+            }
+            PlanNode::IndexOnlyScan { table_name, index_name, columns, .. } => {
+                // Can push filter to index-only scan if it's indexable
+                if self.is_condition_indexable(&condition) {
+                    Ok(Some(PlanNode::IndexOnlyScan {
+                        table_name: table_name.clone(),
+                        index_name: index_name.clone(),
+                        index_condition: Some(condition),
+                        columns: columns.clone(),
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Ok(None), // Cannot push down through other plan types
+        }
+    }
+
+    fn is_condition_indexable(&self, condition: &Expression) -> bool {
+        match condition {
+            Expression::BinaryOp { op, .. } => {
+                matches!(op, BinaryOperator::Equals | BinaryOperator::LessThan |
+                           BinaryOperator::LessThanOrEquals | BinaryOperator::GreaterThan |
+                           BinaryOperator::GreaterThanOrEquals)
+            }
+            _ => false,
+        }
+    }
+
+    fn classify_join_conditions(&self, condition: &Option<Expression>) -> (Option<Expression>, Option<Expression>, Option<Expression>) {
+        match condition {
+            Some(expr) => {
+                // Simplified: if it's an AND condition, try to split it
+                if let Expression::BinaryOp { left, op: BinaryOperator::And, right } = expr {
+                    // Try to determine which side belongs to which table
+                    // This is very simplified - a real implementation would analyze column names
+                    if self.contains_only_left_columns(left) {
+                        (Some(*left.clone()), None, Some(*right.clone()))
+                    } else if self.contains_only_left_columns(right) {
+                        (Some(*right.clone()), None, Some(*left.clone()))
+                    } else {
+                        (None, None, Some(expr.clone()))
+                    }
+                } else {
+                    (None, None, Some(expr.clone()))
+                }
+            }
+            None => (None, None, None),
+        }
+    }
+
+    fn contains_only_left_columns(&self, _expr: &Expression) -> bool {
+        // Simplified - in a real implementation, this would analyze column names
+        // For now, assume it's always true for demonstration
+        true
+    }
+
+    fn apply_to_children(&self, plan: &PlanNode) -> Result<PlanNode> {
+        match plan {
+            PlanNode::Filter { input, condition } => {
+                let optimized_input = self.apply(input.as_ref())?;
+                Ok(PlanNode::Filter {
+                    input: Box::new(optimized_input),
+                    condition: self.optimize_expression(condition)?.unwrap_or_else(|| condition.clone()),
+                })
+            }
+            PlanNode::Project { input, columns } => {
+                let optimized_input = self.apply(input.as_ref())?;
+                Ok(PlanNode::Project {
+                    input: Box::new(optimized_input),
+                    columns: columns.clone(),
+                })
+            }
+            PlanNode::Join { left, right, condition, join_type } => {
+                let optimized_left = self.apply(left.as_ref())?;
+                let optimized_right = self.apply(right.as_ref())?;
+                Ok(PlanNode::Join {
+                    left: Box::new(optimized_left),
+                    right: Box::new(optimized_right),
+                    condition: match condition {
+                Some(expr) => Some(self.optimize_expression(expr)?.unwrap_or_else(|| expr.clone())),
+                None => None,
+            },
+                    join_type: join_type.clone(),
+                })
+            }
+            _ => Ok(plan.clone()),
+        }
+    }
+
+    fn optimize_expression(&self, expr: &Expression) -> Result<Option<Expression>> {
+        // Apply constant folding to expressions
+        let constant_folder = ConstantFoldingRule;
+        constant_folder.apply_to_expression(expr)
+    }
+}
+
+/// Projection pushdown rule
+#[derive(Debug)]
+pub struct ProjectionPushdownRule;
+
+impl OptimizerRule for ProjectionPushdownRule {
+    fn apply(&self, plan: &PlanNode) -> Result<PlanNode> {
+        match plan {
+            PlanNode::Project { input, columns } => {
+                // Try to push projection down to the input
+                let required_columns: Vec<String> = columns.iter()
+                    .filter_map(|(name, expr)| {
+                        if let Expression::Column { name: col_name, .. } = expr {
+                            Some(col_name.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                if self.can_pushdown_projection(input.as_ref(), &required_columns) {
+                    let pushed_down = self.pushdown_projection(input.as_ref(), &required_columns)?;
+                    match pushed_down {
+                        Some(new_input) => {
+                            // Successfully pushed down
+                            self.apply(&new_input)
+                        }
+                        None => {
+                            // Cannot push down further
+                            let optimized_input = self.apply(input.as_ref())?;
+                            Ok(PlanNode::Project {
+                                input: Box::new(optimized_input),
+                                columns: columns.clone(),
+                            })
+                        }
+                    }
+                } else {
+                    // Cannot push down
+                    let optimized_input = self.apply(input.as_ref())?;
+                    Ok(PlanNode::Project {
+                        input: Box::new(optimized_input),
+                        columns: columns.clone(),
+                    })
+                }
+            }
+            _ => self.apply_to_children(plan),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "ProjectionPushdown"
+    }
+
+    fn is_applicable(&self, plan: &PlanNode) -> bool {
+        matches!(plan, PlanNode::Project { .. })
+    }
+}
+
+impl ProjectionPushdownRule {
+    fn can_pushdown_projection(&self, input: &PlanNode, required_columns: &[String]) -> bool {
+        match input {
+            PlanNode::Scan { .. } => true, // Can always push down to scan
+            PlanNode::IndexScan { .. } => true, // Can push down to index scan
+            PlanNode::IndexOnlyScan { .. } => true, // Can push down to index-only scan
+            PlanNode::Filter { .. } => true, // Can push down past filter
+            _ => false, // Cannot push down through other plan types
+        }
+    }
+
+    fn pushdown_projection(&self, input: &PlanNode, required_columns: &[String]) -> Result<Option<PlanNode>> {
+        match input {
+            PlanNode::Scan { table_name, .. } => {
+                Ok(Some(PlanNode::Scan {
+                    table_name: table_name.clone(),
+                    columns: required_columns.to_vec(),
+                }))
+            }
+            PlanNode::IndexScan { table_name, index_name, index_condition, .. } => {
+                Ok(Some(PlanNode::IndexScan {
+                    table_name: table_name.clone(),
+                    index_name: index_name.clone(),
+                    index_condition: index_condition.clone(),
+                    columns: required_columns.to_vec(),
+                }))
+            }
+            PlanNode::IndexOnlyScan { table_name, index_name, index_condition, .. } => {
+                Ok(Some(PlanNode::IndexOnlyScan {
+                    table_name: table_name.clone(),
+                    index_name: index_name.clone(),
+                    index_condition: index_condition.clone(),
+                    columns: required_columns.to_vec(),
+                }))
+            }
+            PlanNode::Filter { input, condition } => {
+                if let Some(new_input) = self.pushdown_projection(input.as_ref(), required_columns)? {
+                    Ok(Some(PlanNode::Filter {
+                        input: Box::new(new_input),
+                        condition: condition.clone(),
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn apply_to_children(&self, plan: &PlanNode) -> Result<PlanNode> {
+        match plan {
+            PlanNode::Filter { input, condition } => {
+                let optimized_input = self.apply(input.as_ref())?;
+                Ok(PlanNode::Filter {
+                    input: Box::new(optimized_input),
+                    condition: condition.clone(),
+                })
+            }
+            PlanNode::Join { left, right, condition, join_type } => {
+                let optimized_left = self.apply(left.as_ref())?;
+                let optimized_right = self.apply(right.as_ref())?;
+                Ok(PlanNode::Join {
+                    left: Box::new(optimized_left),
+                    right: Box::new(optimized_right),
+                    condition: condition.clone(),
+                    join_type: join_type.clone(),
+                })
+            }
+            _ => Ok(plan.clone()),
+        }
+    }
+}
+
+/// Constant folding rule
+#[derive(Debug)]
+pub struct ConstantFoldingRule;
+
+impl OptimizerRule for ConstantFoldingRule {
+    fn apply(&self, plan: &PlanNode) -> Result<PlanNode> {
+        self.apply_to_children(plan)
+    }
+
+    fn name(&self) -> &'static str {
+        "ConstantFolding"
+    }
+
+    fn is_applicable(&self, plan: &PlanNode) -> bool {
+        // Constant folding is always applicable to optimize expressions
+        true
+    }
+}
+
+impl ConstantFoldingRule {
+    pub fn apply_to_expression(&self, expr: &Expression) -> Result<Option<Expression>> {
+        match expr {
+            Expression::BinaryOp { left, op, right } => {
+                let optimized_left = self.apply_to_expression(left.as_ref())?;
+                let optimized_right = self.apply_to_expression(right.as_ref())?;
+
+                let folded = if let (Some(Expression::Value(left_val)), Some(Expression::Value(right_val))) =
+                    (optimized_left.as_ref(), optimized_right.as_ref())
+                {
+                    self.fold_binary_operation(*op, left_val, right_val)
+                } else {
+                    None
+                };
+
+                if let Some(folded_expr) = folded {
+                    Ok(Some(folded_expr))
+                } else {
+                    Ok(Some(Expression::BinaryOp {
+                        left: optimized_left.map(Box::new).unwrap_or_else(|| left.clone()),
+                        op: *op,
+                        right: optimized_right.map(Box::new).unwrap_or_else(|| right.clone()),
+                    }))
+                }
+            }
+            Expression::UnaryOp { op, expr } => {
+                let optimized_expr = self.apply_to_expression(expr.as_ref())?;
+
+                if let Some(Expression::Value(val)) = optimized_expr.as_ref() {
+                    let folded = self.fold_unary_operation(*op, val);
+                    if let Some(folded_expr) = folded {
+                        return Ok(Some(folded_expr));
+                    }
+                }
+
+                Ok(Some(Expression::UnaryOp {
+                    op: *op,
+                    expr: optimized_expr.map(Box::new).unwrap_or_else(|| expr.clone()),
+                }))
+            }
+            Expression::Function { args, .. } => {
+                let mut optimized_args = Vec::new();
+                let mut changed = false;
+
+                for arg in args {
+                    if let Some(optimized_arg) = self.apply_to_expression(arg)? {
+                        optimized_args.push(optimized_arg);
+                        changed = true;
+                    } else {
+                        optimized_args.push(arg.clone());
+                    }
+                }
+
+                if changed {
+                    Ok(Some(Expression::Function {
+                        name: "temp".to_string(), // Placeholder
+                        args: optimized_args,
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+            Expression::List(expressions) => {
+                let mut optimized_expressions = Vec::new();
+                let mut changed = false;
+
+                for expr in expressions {
+                    if let Some(optimized_expr) = self.apply_to_expression(expr)? {
+                        optimized_expressions.push(optimized_expr);
+                        changed = true;
+                    } else {
+                        optimized_expressions.push(expr.clone());
+                    }
+                }
+
+                if changed {
+                    Ok(Some(Expression::List(optimized_expressions)))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Ok(None), // Cannot fold other expressions
+        }
+    }
+
+    fn apply_to_children(&self, plan: &PlanNode) -> Result<PlanNode> {
+        match plan {
+            PlanNode::Filter { input, condition } => {
+                let optimized_input = self.apply(input.as_ref())?;
+                let optimized_condition = self.apply_to_expression(condition)?
+                    .unwrap_or_else(|| condition.clone());
+                Ok(PlanNode::Filter {
+                    input: Box::new(optimized_input),
+                    condition: optimized_condition,
+                })
+            }
+            PlanNode::Project { input, columns } => {
+                let optimized_input = self.apply(input.as_ref())?;
+                let mut optimized_columns = Vec::new();
+                let mut changed = false;
+
+                for (name, expr) in columns {
+                    if let Some(optimized_expr) = self.apply_to_expression(expr)? {
+                        optimized_columns.push((name.clone(), optimized_expr));
+                        changed = true;
+                    } else {
+                        optimized_columns.push((name.clone(), expr.clone()));
+                    }
+                }
+
+                Ok(PlanNode::Project {
+                    input: Box::new(optimized_input),
+                    columns: if changed { optimized_columns } else { columns.clone() },
+                })
+            }
+            PlanNode::Join { left, right, condition, join_type } => {
+                let optimized_left = self.apply(left.as_ref())?;
+                let optimized_right = self.apply(right.as_ref())?;
+                let optimized_condition = condition.as_ref()
+                    .and_then(|expr| self.apply_to_expression(expr).ok().flatten());
+
+                Ok(PlanNode::Join {
+                    left: Box::new(optimized_left),
+                    right: Box::new(optimized_right),
+                    condition: optimized_condition,
+                    join_type: join_type.clone(),
+                })
+            }
+            _ => Ok(plan.clone()),
+        }
+    }
+
+    fn fold_binary_operation(&self, op: BinaryOperator, left: &crate::types::Value, right: &crate::types::Value) -> Option<Expression> {
+
+        match (&left.kind, &right.kind, op) {
+            // Integer arithmetic
+            (ValueKind::Integer(a), ValueKind::Integer(b), BinaryOperator::Add) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Integer(a + b) })),
+            (ValueKind::Integer(a), ValueKind::Integer(b), BinaryOperator::Subtract) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Integer(a - b) })),
+            (ValueKind::Integer(a), ValueKind::Integer(b), BinaryOperator::Multiply) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Integer(a * b) })),
+            (ValueKind::Integer(a), ValueKind::Integer(b), BinaryOperator::Divide) => {
+                if *b != 0 { Some(Expression::Value(crate::types::Value { kind: ValueKind::Integer(a / b) })) } else { None }
+            },
+
+            // Float operations
+            (ValueKind::Float(a), ValueKind::Float(b), BinaryOperator::Add) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Float(a + b) })),
+            (ValueKind::Float(a), ValueKind::Float(b), BinaryOperator::Subtract) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Float(a - b) })),
+            (ValueKind::Float(a), ValueKind::Float(b), BinaryOperator::Multiply) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Float(a * b) })),
+            (ValueKind::Float(a), ValueKind::Float(b), BinaryOperator::Divide) => {
+                if *b != 0.0 { Some(Expression::Value(crate::types::Value { kind: ValueKind::Float(a / b) })) } else { None }
+            },
+
+            // Mixed type operations (promote to higher precision)
+            (ValueKind::Integer(a), ValueKind::Float(b), _) => {
+                let real_left = crate::types::Value { kind: ValueKind::Float(*a as f64) };
+                self.fold_binary_operation(op, &real_left, right)
+            },
+            (ValueKind::Float(a), ValueKind::Integer(b), _) => {
+                let real_right = crate::types::Value { kind: ValueKind::Float(*b as f64) };
+                self.fold_binary_operation(op, left, &real_right)
+            },
+
+            // Boolean operations
+            (ValueKind::Boolean(a), ValueKind::Boolean(b), BinaryOperator::And) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Boolean(*a && *b) })),
+            (ValueKind::Boolean(a), ValueKind::Boolean(b), BinaryOperator::Or) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Boolean(*a || *b) })),
+
+            // Comparison operations
+            (ValueKind::Integer(a), ValueKind::Integer(b), BinaryOperator::Equals) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Boolean(a == b) })),
+            (ValueKind::Integer(a), ValueKind::Integer(b), BinaryOperator::NotEquals) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Boolean(a != b) })),
+            (ValueKind::Integer(a), ValueKind::Integer(b), BinaryOperator::LessThan) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Boolean(a < b) })),
+            (ValueKind::Integer(a), ValueKind::Integer(b), BinaryOperator::LessThanOrEquals) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Boolean(a <= b) })),
+            (ValueKind::Integer(a), ValueKind::Integer(b), BinaryOperator::GreaterThan) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Boolean(a > b) })),
+            (ValueKind::Integer(a), ValueKind::Integer(b), BinaryOperator::GreaterThanOrEquals) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Boolean(a >= b) })),
+
+            (ValueKind::Float(a), ValueKind::Float(b), BinaryOperator::Equals) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Boolean((a - b).abs() < f64::EPSILON) })),
+            (ValueKind::Float(a), ValueKind::Float(b), BinaryOperator::NotEquals) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Boolean((a - b).abs() >= f64::EPSILON) })),
+            (ValueKind::Float(a), ValueKind::Float(b), BinaryOperator::LessThan) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Boolean(a < b) })),
+            (ValueKind::Float(a), ValueKind::Float(b), BinaryOperator::LessThanOrEquals) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Boolean(a <= b) })),
+            (ValueKind::Float(a), ValueKind::Float(b), BinaryOperator::GreaterThan) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Boolean(a > b) })),
+            (ValueKind::Float(a), ValueKind::Float(b), BinaryOperator::GreaterThanOrEquals) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Boolean(a >= b) })),
+
+            (ValueKind::String(a), ValueKind::String(b), BinaryOperator::Equals) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Boolean(a == b) })),
+            (ValueKind::String(a), ValueKind::String(b), BinaryOperator::NotEquals) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Boolean(a != b) })),
+
+            (ValueKind::Boolean(a), ValueKind::Boolean(b), BinaryOperator::Equals) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Boolean(a == b) })),
+            (ValueKind::Boolean(a), ValueKind::Boolean(b), BinaryOperator::NotEquals) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Boolean(a != b) })),
+
+            _ => None,
+        }
+    }
+
+    fn fold_unary_operation(&self, op: UnaryOperator, operand: &crate::types::Value) -> Option<Expression> {
+        match (op, &operand.kind) {
+            (UnaryOperator::Not, ValueKind::Boolean(value)) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Boolean(!value) })),
+            (UnaryOperator::Minus, ValueKind::Integer(value)) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Integer(-value) })),
+            (UnaryOperator::Minus, ValueKind::Float(value)) => Some(Expression::Value(crate::types::Value { kind: ValueKind::Float(-value) })),
+            (UnaryOperator::Plus, _) => Some(Expression::Value(operand.clone())),
+            _ => None,
+        }
+    }
+}
+
+/// Aggregation pushdown optimization rule
+///
+/// This rule optimizes queries by:
+/// 1. Pushing aggregation operations earlier in the execution pipeline
+/// 2. Optimizing join-aggregation patterns
+/// 3. Reducing intermediate result sizes through early aggregation
+#[derive(Debug)]
+pub struct AggregationPushdownRule;
+
+impl OptimizerRule for AggregationPushdownRule {
+    fn apply(&self, plan: &PlanNode) -> Result<PlanNode> {
+        match plan {
+            // Case 1: Join followed by Aggregation - try to push aggregation down
+            PlanNode::Join { left, right, condition, join_type } => {
+                if self.can_pushdown_aggregation_through_join(left.as_ref(), right.as_ref()) {
+                    // Transform: Join -> Aggregate into Aggregate -> Join where possible
+                    if let Some(optimized_plan) = self.optimize_join_aggregation(left.as_ref(), right.as_ref(), condition, join_type.clone())? {
+                        return Ok(optimized_plan);
+                    }
+                }
+
+                // Apply rule to children if no pushdown possible
+                let optimized_left = self.apply(left.as_ref())?;
+                let optimized_right = self.apply(right.as_ref())?;
+                Ok(PlanNode::Join {
+                    left: Box::new(optimized_left),
+                    right: Box::new(optimized_right),
+                    condition: condition.clone(),
+                    join_type: join_type.clone(),
+                })
+            }
+
+            // Case 2: Project followed by Aggregation - eliminate unnecessary projections
+            PlanNode::Project { input, columns } => {
+                if let PlanNode::Aggregate { .. } = input.as_ref() {
+                    // Remove redundant projection before aggregation
+                    self.apply(input.as_ref())
+                } else {
+                    // Apply to input and keep projection
+                    let optimized_input = self.apply(input.as_ref())?;
+                    Ok(PlanNode::Project {
+                        input: Box::new(optimized_input),
+                        columns: columns.clone(),
+                    })
+                }
+            }
+
+            // Case 3: Filter followed by Aggregation - try to push filter below aggregation
+            PlanNode::Aggregate { input, group_by_columns, aggregate_functions, having_clause } => {
+                if let PlanNode::Filter { input: filter_input, condition } = input.as_ref() {
+                    // Check if filter can be pushed below aggregation
+                    if self.can_pushdown_filter_below_aggregation(condition, group_by_columns) {
+                        let optimized_filter_input = self.apply(filter_input.as_ref())?;
+                        let pushed_down_filter = PlanNode::Filter {
+                            input: Box::new(optimized_filter_input),
+                            condition: condition.clone(),
+                        };
+                        return Ok(PlanNode::Aggregate {
+                            input: Box::new(pushed_down_filter),
+                            group_by_columns: group_by_columns.clone(),
+                            aggregate_functions: aggregate_functions.clone(),
+                            having_clause: having_clause.clone(),
+                        });
+                    }
+                }
+
+                // Apply to input
+                let optimized_input = self.apply(input.as_ref())?;
+                Ok(PlanNode::Aggregate {
+                    input: Box::new(optimized_input),
+                    group_by_columns: group_by_columns.clone(),
+                    aggregate_functions: aggregate_functions.clone(),
+                    having_clause: having_clause.clone(),
+                })
+            }
+
+            // Apply to children for other plan nodes
+            _ => self.apply_to_children(plan),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "AggregationPushdown"
+    }
+
+    fn is_applicable(&self, plan: &PlanNode) -> bool {
+        match plan {
+            PlanNode::Join { .. } | PlanNode::Aggregate { .. } | PlanNode::Project { .. } => true,
+            _ => false,
+        }
+    }
+}
+
+impl AggregationPushdownRule {
+    /// Check if aggregation can be pushed down through a join
+    fn can_pushdown_aggregation_through_join(&self, left: &PlanNode, right: &PlanNode) -> bool {
+        // Can push down if one side of the join is already aggregated
+        // and the join condition doesn't interfere with the aggregation
+        matches!(left, PlanNode::Aggregate { .. }) || matches!(right, PlanNode::Aggregate { .. })
+    }
+
+    /// Optimize join-aggregation patterns
+    fn optimize_join_aggregation(
+        &self,
+        left: &PlanNode,
+        right: &PlanNode,
+        condition: &Option<Expression>,
+        join_type: crate::sql::ast::JoinType,
+    ) -> Result<Option<PlanNode>> {
+        // Pattern 1: (Table A) JOIN (Table B) GROUP BY A.id, B.id
+        // If possible, transform to: (Table A GROUP BY A.id) JOIN (Table B GROUP BY B.id)
+
+        // This is a simplified implementation - a full implementation would need to:
+        // 1. Analyze the aggregation expressions to see if they only reference one table
+        // 2. Check if the join condition references only the grouping columns
+        // 3. Ensure the transformation is semantically equivalent
+
+        // For now, return None to indicate no transformation applied
+        // A production implementation would analyze the plan structure in detail
+        Ok(None)
+    }
+
+    /// Check if filter can be pushed below aggregation
+    fn can_pushdown_filter_below_aggregation(&self, condition: &Expression, group_by_columns: &[Expression]) -> bool {
+        // Filter can be pushed below if:
+        // 1. It only references GROUP BY columns, or
+        // 2. It can be evaluated before aggregation without changing semantics
+
+        match condition {
+            Expression::BinaryOp { left, right, .. } => {
+                self.is_group_by_expression(left, group_by_columns) &&
+                self.is_group_by_expression(right, group_by_columns)
+            }
+            Expression::Column { .. } => {
+                self.is_group_by_expression(condition, group_by_columns)
+            }
+            _ => false,
+        }
+    }
+
+    /// Check if expression is a GROUP BY expression
+    fn is_group_by_expression(&self, expr: &Expression, group_by_columns: &[Expression]) -> bool {
+        group_by_columns.iter().any(|group_expr| {
+            self.expressions_equal(expr, group_expr)
+        })
+    }
+
+    /// Check if two expressions are equal (simplified)
+    fn expressions_equal(&self, a: &Expression, b: &Expression) -> bool {
+        match (a, b) {
+            (Expression::Column { name: name_a, .. }, Expression::Column { name: name_b, .. }) => {
+                name_a == name_b
+            }
+            (Expression::Value(val_a), Expression::Value(val_b)) => {
+                format!("{:?}", val_a) == format!("{:?}", val_b)
+            }
+            (Expression::Function { name: name_a, args: args_a }, Expression::Function { name: name_b, args: args_b }) => {
+                name_a == name_b && args_a.len() == args_b.len()
+            }
+            _ => false,
+        }
+    }
+
+    /// Apply rule to children nodes
+    fn apply_to_children(&self, plan: &PlanNode) -> Result<PlanNode> {
+        match plan {
+            PlanNode::Filter { input, condition } => {
+                let optimized_input = self.apply(input.as_ref())?;
+                Ok(PlanNode::Filter {
+                    input: Box::new(optimized_input),
+                    condition: condition.clone(),
+                })
+            }
+            PlanNode::Join { left, right, condition, join_type } => {
+                let optimized_left = self.apply(left.as_ref())?;
+                let optimized_right = self.apply(right.as_ref())?;
+                Ok(PlanNode::Join {
+                    left: Box::new(optimized_left),
+                    right: Box::new(optimized_right),
+                    condition: condition.clone(),
+                    join_type: join_type.clone(),
+                })
+            }
+            PlanNode::Project { input, columns } => {
+                let optimized_input = self.apply(input.as_ref())?;
+                Ok(PlanNode::Project {
+                    input: Box::new(optimized_input),
+                    columns: columns.clone(),
+                })
+            }
+            PlanNode::Aggregate { input, group_by_columns, aggregate_functions, having_clause } => {
+                let optimized_input = self.apply(input.as_ref())?;
+                Ok(PlanNode::Aggregate {
+                    input: Box::new(optimized_input),
+                    group_by_columns: group_by_columns.clone(),
+                    aggregate_functions: aggregate_functions.clone(),
+                    having_clause: having_clause.clone(),
+                })
+            }
+            _ => Ok(plan.clone()),
+        }
+    }
+}

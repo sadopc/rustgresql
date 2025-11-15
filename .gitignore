@@ -1,0 +1,71 @@
+# Rust build artifacts
+/target/
+Cargo.lock
+**/*.rs.bk
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Database files (project-specific databases)
+*.db
+*.rdb
+dummy.db
+eda.db
+rustgresql.db
+test_database.db
+
+# Test and temporary files
+test_insert.txt
+test_queries.txt
+test_parser
+*.tmp
+*.temp
+
+# Log files
+*.log
+
+# Backup files
+*.bak
+*.backup
+
+# Environment and configuration files
+.env
+.env.local
+.env.*.local
+
+# OS generated files
+.DS_Store?
+ehthumbs.db
+Icon?
+Thumbs.db
+
+# Rust analyzer
+.rust-analyzer/
+
+# Debug builds
+debug/
+target/debug/deps/
+target/debug/build/
+
+# Release builds
+target/release/deps/
+target/release/build/
+
+# Benchmark outputs
+target/criterion/
+benches/output/
+
+# Documentation build
+doc/
+target/doc/
+
+# Local development databases
+data/
+db/
+logs/
