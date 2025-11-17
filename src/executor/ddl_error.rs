@@ -292,6 +292,17 @@ impl DdlError {
         )
     }
 
+    /// Index already exists error
+    pub fn index_already_exists(index_name: &str) -> Self {
+        Self::new(
+            DdlErrorCode::IndexAlreadyExists,
+            format!("Index '{}' already exists", index_name),
+            DdlOperation::Create,
+            DdlObjectType::Index,
+            Some(index_name.to_string()),
+        )
+    }
+
     /// Column not found error
     pub fn column_not_found(column_name: &str, table_name: &str, operation: DdlOperation) -> Self {
         Self::new(

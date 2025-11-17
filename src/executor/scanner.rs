@@ -227,9 +227,11 @@ impl TableScanner {
     /// Validate that a value matches the expected column type
     fn validate_column_type(&self, expected_type: &DataType, value: &Value, column_index: usize) -> Result<()> {
         match (&expected_type.kind, &value.kind) {
-            (crate::types::DataTypeKind::Integer, ValueKind::Integer(_)) => Ok(()),
-            (crate::types::DataTypeKind::Real | crate::types::DataTypeKind::DoublePrecision, ValueKind::Float(_)) => Ok(()),
+            (crate::types::DataTypeKind::Integer | crate::types::DataTypeKind::Serial | crate::types::DataTypeKind::BigInt | crate::types::DataTypeKind::BigSerial, ValueKind::Integer(_)) => Ok(()),
+            (crate::types::DataTypeKind::Real | crate::types::DataTypeKind::DoublePrecision | crate::types::DataTypeKind::Numeric(_, _) | crate::types::DataTypeKind::Decimal(_, _), ValueKind::Float(_)) => Ok(()),
             (crate::types::DataTypeKind::Text | crate::types::DataTypeKind::Varchar(_), ValueKind::String(_)) => Ok(()),
+            (crate::types::DataTypeKind::Timestamp | crate::types::DataTypeKind::TimestampWithTimeZone, ValueKind::String(_) | ValueKind::Timestamp(_)) => Ok(()),
+            (crate::types::DataTypeKind::Date | crate::types::DataTypeKind::Time | crate::types::DataTypeKind::TimeWithTimeZone | crate::types::DataTypeKind::Interval, ValueKind::String(_)) => Ok(()),
             (crate::types::DataTypeKind::Boolean, ValueKind::Boolean(_)) => Ok(()),
             _ => Err(RustgreSQLError::Type(format!(
                 "Type mismatch at column {}: expected {:?}, got {:?}",

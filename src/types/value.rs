@@ -1,6 +1,7 @@
 //! Value representations
 
 use crate::Result;
+use chrono::{DateTime, Utc};
 
 /// Null value
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -13,6 +14,7 @@ pub enum ValueKind {
     String(String),
     Boolean(bool),
     Float(f64),
+    Timestamp(chrono::DateTime<chrono::Utc>),
     Null(NullValue),
 }
 
@@ -37,6 +39,10 @@ impl Value {
 
     pub fn float(value: f64) -> Self {
         Self { kind: ValueKind::Float(value) }
+    }
+
+    pub fn timestamp(value: DateTime<Utc>) -> Self {
+        Self { kind: ValueKind::Timestamp(value) }
     }
 
     pub fn null() -> Self {

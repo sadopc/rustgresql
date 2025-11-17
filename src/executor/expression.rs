@@ -70,6 +70,7 @@ impl ThreeValuedLogic {
             ValueKind::String(s) => {
                 if !s.is_empty() { ThreeValuedLogic::True } else { ThreeValuedLogic::False }
             }
+            ValueKind::Timestamp(_) => ThreeValuedLogic::True,
         }
     }
 
@@ -297,6 +298,7 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         (ValueKind::Float(a_val), ValueKind::Float(b_val)) => a_val.partial_cmp(b_val).unwrap_or(std::cmp::Ordering::Equal),
         (ValueKind::String(a_val), ValueKind::String(b_val)) => a_val.cmp(b_val),
         (ValueKind::Boolean(a_val), ValueKind::Boolean(b_val)) => a_val.cmp(b_val),
+        (ValueKind::Timestamp(a_val), ValueKind::Timestamp(b_val)) => a_val.cmp(b_val),
         // Different types - establish a priority order
         (ValueKind::Boolean(_), _) => std::cmp::Ordering::Less,
         (_, ValueKind::Boolean(_)) => std::cmp::Ordering::Greater,
@@ -306,6 +308,8 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         (ValueKind::String(_), ValueKind::Integer(_)) => std::cmp::Ordering::Greater,
         (ValueKind::Float(_), ValueKind::String(_)) => std::cmp::Ordering::Less,
         (ValueKind::String(_), ValueKind::Float(_)) => std::cmp::Ordering::Greater,
+        (ValueKind::Timestamp(_), _) => std::cmp::Ordering::Less,
+        (_, ValueKind::Timestamp(_)) => std::cmp::Ordering::Greater,
     }
 }
 

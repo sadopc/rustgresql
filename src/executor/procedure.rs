@@ -993,6 +993,7 @@ impl ValueExt for Value {
             crate::types::ValueKind::Integer(i) => *i != 0,
             crate::types::ValueKind::Float(f) => *f != 0.0,
             crate::types::ValueKind::String(s) => !s.is_empty(),
+            crate::types::ValueKind::Timestamp(_) => true,
         }
     }
 

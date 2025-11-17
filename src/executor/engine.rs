@@ -366,9 +366,41 @@ impl Executor {
     }
 
     /// Execute CREATE INDEX statement
-    fn execute_create_index(&mut self, _create: &CreateIndexStatement) -> Result<QueryResult> {
-        // In a real implementation, this would create the index
-        self.context.log("CREATE INDEX statement executed");
+    fn execute_create_index(&mut self, create: &CreateIndexStatement) -> Result<QueryResult> {
+        use crate::catalog::{get_catalog, IndexType};
+
+        let catalog = get_catalog();
+
+        // Check if index already exists
+        if let Some(_) = catalog.index_manager.get_index(&create.index_name)? {
+            if create.if_not_exists {
+                self.context.log(&format!("Index '{}' already exists, skipping", create.index_name));
+                return Ok(QueryResult {
+                    rows: vec![],
+                    column_names: vec![],
+                });
+            } else {
+                return Err(crate::executor::ddl_error::DdlError::index_already_exists(&create.index_name).into());
+            }
+        }
+
+        // Get table
+        let table_def = match catalog.get_table(&create.table_name)? {
+            Some(table) => table,
+            None => return Err(crate::executor::ddl_error::DdlError::table_not_found(&create.table_name, crate::executor::ddl_error::DdlOperation::Create).into()),
+        };
+
+        // Create the index
+        let index_id = catalog.index_manager.create_index(
+            &create.index_name,
+            table_def.table_id,
+            create.columns.clone(),
+            IndexType::BTree,
+            create.unique,
+        )?;
+
+        self.context.log(&format!("Created index '{}' with ID {}", create.index_name, index_id));
+
         Ok(QueryResult {
             rows: vec![],
             column_names: vec![],
@@ -1110,8 +1142,11 @@ impl Executor {
     fn is_data_type_supported(&self, data_type: &DataType) -> bool {
         match &data_type.kind {
             DataTypeKind::Integer | DataTypeKind::BigInt | DataTypeKind::Real |
-            DataTypeKind::DoublePrecision | DataTypeKind::Text | DataTypeKind::Varchar(_) |
-            DataTypeKind::Char(_) | DataTypeKind::Boolean | DataTypeKind::Date => true,
+            DataTypeKind::DoublePrecision | DataTypeKind::Numeric(_, _) | DataTypeKind::Decimal(_, _) |
+            DataTypeKind::Text | DataTypeKind::Varchar(_) |
+            DataTypeKind::Char(_) | DataTypeKind::Boolean | DataTypeKind::Date |
+            DataTypeKind::Timestamp | DataTypeKind::TimestampWithTimeZone |
+            DataTypeKind::Serial | DataTypeKind::BigSerial => true,
             _ => false, // Unsupported types for now
         }
     }

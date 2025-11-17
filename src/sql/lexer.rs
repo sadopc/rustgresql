@@ -82,6 +82,8 @@ pub enum TokenType {
     Concurrently,
     Cascade,
     Data,
+    Serial,
+    BigSerial,
 
     // Stored Procedure and Control Flow Keywords
     Procedure,
@@ -223,6 +225,8 @@ impl Token {
                 | TokenType::Concurrently
                 | TokenType::Cascade
                 | TokenType::Data
+                | TokenType::Serial
+                | TokenType::BigSerial
                 | TokenType::Procedure
                 | TokenType::Function
                 | TokenType::Language
@@ -578,6 +582,8 @@ impl Lexer {
             "CONCURRENTLY" => TokenType::Concurrently,
             "CASCADE" => TokenType::Cascade,
             "DATA" => TokenType::Data,
+            "SERIAL" => TokenType::Serial,
+            "BIGSERIAL" => TokenType::BigSerial,
             // Stored procedure and control flow keywords
             "PROCEDURE" => TokenType::Procedure,
             "FUNCTION" => TokenType::Function,

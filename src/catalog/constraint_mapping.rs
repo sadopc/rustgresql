@@ -241,6 +241,15 @@ fn parse_default_value(value_str: &str, data_type: &DataType) -> MappingResult<V
             // Simple date parsing - would need more sophisticated implementation
             Ok(Value::string(value_str.to_string()))
         }
+        DataTypeKind::Timestamp | DataTypeKind::TimestampWithTimeZone => {
+            // Handle CURRENT_TIMESTAMP specially
+            if value_str.to_uppercase() == "CURRENT_TIMESTAMP" {
+                Ok(Value::string("CURRENT_TIMESTAMP".to_string()))
+            } else {
+                // For other timestamp values, store as string for now
+                Ok(Value::string(value_str.to_string()))
+            }
+        }
         _ => {
             // For complex types, treat as string for now
             Ok(Value::string(value_str.to_string()))

@@ -740,7 +740,15 @@ impl Parser {
     /// Parse ALTER TABLE ADD CONSTRAINT operation
     fn parse_alter_add_constraint(&mut self) -> Result<AlterOperation> {
         self.consume_token(TokenType::Constraint, "Expected CONSTRAINT")?;
-        let constraint = self.parse_table_constraint()?;
+        let constraint_name = self.consume_identifier()?;
+        let mut constraint = self.parse_table_constraint()?;
+        // Set the constraint name
+        match &mut constraint {
+            crate::sql::ast::TableConstraint::PrimaryKey { name, .. } => *name = Some(constraint_name.clone()),
+            crate::sql::ast::TableConstraint::Unique { name, .. } => *name = Some(constraint_name.clone()),
+            crate::sql::ast::TableConstraint::ForeignKey { name, .. } => *name = Some(constraint_name.clone()),
+            crate::sql::ast::TableConstraint::Check { name, .. } => *name = Some(constraint_name),
+        }
         Ok(AlterOperation::AddConstraint { constraint })
     }
 
@@ -795,6 +803,7 @@ impl Parser {
                         crate::types::ValueKind::Integer(i) => i.to_string(),
                         crate::types::ValueKind::Float(f) => f.to_string(),
                         crate::types::ValueKind::Boolean(b) => b.to_string(),
+                        crate::types::ValueKind::Timestamp(ts) => ts.to_rfc3339(),
                         crate::types::ValueKind::Null(_) => "NULL".to_string(),
                     };
                     constraints.push(ColumnConstraint::Default(value_str));
@@ -938,10 +947,22 @@ impl Parser {
 
     /// Parse data type
     fn parse_data_type(&mut self) -> Result<crate::types::DataType> {
-        let type_name = self.consume_identifier()?;
-        let upper_name = type_name.to_uppercase();
-
-        match upper_name.as_str() {
+        // Check for SERIAL and BIGSERIAL token types first
+        let current_token = self.peek();
+        match current_token.token_type {
+            TokenType::Serial => {
+                self.advance(); // Consume the Serial token
+                Ok(crate::types::DataType::new(crate::types::DataTypeKind::Serial))
+            }
+            TokenType::BigSerial => {
+                self.advance(); // Consume the BigSerial token
+                Ok(crate::types::DataType::new(crate::types::DataTypeKind::BigSerial))
+            }
+            _ => {
+                // Handle other data types as identifiers
+                let type_name = self.consume_identifier()?;
+                let upper_name = type_name.to_uppercase();
+                match upper_name.as_str() {
             "INTEGER" | "INT" | "INT4" => Ok(crate::types::DataType::new(crate::types::DataTypeKind::Integer)),
             "BIGINT" | "INT8" => Ok(crate::types::DataType::new(crate::types::DataTypeKind::BigInt)),
             "SMALLINT" | "INT2" => Ok(crate::types::DataType::new(crate::types::DataTypeKind::SmallInt)),
@@ -997,6 +1018,8 @@ impl Parser {
             _ => Err(RustgreSQLError::Parse(
                 format!("Unknown data type: {}", type_name)
             ))
+                }
+            }
         }
     }
 
@@ -1260,8 +1283,14 @@ impl Parser {
                 let name = name.clone();
                 self.advance();
 
-                // Check if it's a function call
-                if self.match_token(TokenType::LeftParen) {
+                // Check if it's a qualified column reference (table.column)
+                if self.match_token(TokenType::Dot) {
+                    let column = self.consume_identifier()?;
+                    Ok(Expression::Column {
+                        table: Some(name),
+                        name: column,
+                    })
+                } else if self.match_token(TokenType::LeftParen) {
                     let mut args = Vec::new();
                     if !self.match_token(TokenType::RightParen) {
                         args.push(self.parse_expression()?);

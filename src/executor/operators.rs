@@ -2,10 +2,11 @@
 //!
 //! Physical operators for executing query plans
 
-use crate::{Result, sql::ast::{Expression, BinaryOperator, SetOperator as SetOperatorType}, executor::planner::PlanNode, types::{Value, ValueKind}};
+use crate::{Result, sql::ast::{Expression, BinaryOperator, SetOperator as SetOperatorType}, executor::planner::PlanNode, types::{Value, ValueKind, DataTypeKind, DataType}};
 use crate::executor::{TableScanner, ExpressionEvaluator, EvaluationContext, ThreeValuedLogic, RowData, AggregateState};
 use std::sync::Arc;
 use std::collections::HashMap;
+use serde_json;
 
 /// Compare two Values for sorting
 fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
@@ -16,6 +17,7 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         (ValueKind::Float(a_val), ValueKind::Float(b_val)) => a_val.partial_cmp(b_val).unwrap_or(std::cmp::Ordering::Equal),
         (ValueKind::String(a_val), ValueKind::String(b_val)) => a_val.cmp(b_val),
         (ValueKind::Boolean(a_val), ValueKind::Boolean(b_val)) => a_val.cmp(b_val),
+        (ValueKind::Timestamp(a_val), ValueKind::Timestamp(b_val)) => a_val.cmp(b_val),
         // Different types - establish a priority order
         (ValueKind::Boolean(_), _) => std::cmp::Ordering::Less,
         (_, ValueKind::Boolean(_)) => std::cmp::Ordering::Greater,
@@ -25,6 +27,8 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         (ValueKind::String(_), ValueKind::Integer(_)) => std::cmp::Ordering::Greater,
         (ValueKind::Float(_), ValueKind::String(_)) => std::cmp::Ordering::Less,
         (ValueKind::String(_), ValueKind::Float(_)) => std::cmp::Ordering::Greater,
+        (ValueKind::Timestamp(_), _) => std::cmp::Ordering::Less,
+        (_, ValueKind::Timestamp(_)) => std::cmp::Ordering::Greater,
     }
 }
 
@@ -616,7 +620,7 @@ impl InsertOperator {
             // Validate row data if scanner is available
             if let Some(ref scanner) = self.scanner {
                 // Map column names to values for validation
-                let validated_values = self.map_columns_to_values(&row_values)?;
+                let validated_values = self.map_columns_to_values(&row_values, context)?;
                 let row_data = RowData::new(validated_values);
 
                 // Validate against table schema
@@ -637,6 +641,11 @@ impl InsertOperator {
 
         context.log(&format!("Successfully inserted {} rows into table {}", inserted_rows, self.table_name));
 
+        // Save auto-increment counters after successful insert
+        if let Err(e) = context.save_auto_increment_counters() {
+            context.log(&format!("Warning: Failed to save auto-increment counters: {}", e));
+        }
+
         Ok(QueryResult {
             rows: vec![],
             column_names: vec![],
@@ -644,7 +653,7 @@ impl InsertOperator {
     }
 
     /// Map column values to match table schema
-    fn map_columns_to_values(&self, row_values: &[Value]) -> Result<Vec<Value>> {
+    fn map_columns_to_values(&self, row_values: &[Value], context: &mut ExecutionContext) -> Result<Vec<Value>> {
         if let Some(ref scanner) = self.scanner {
             let table_def = scanner.get_table_def();
 
@@ -677,7 +686,13 @@ impl InsertOperator {
                 } else {
                     // Column was NOT specified in INSERT - use DEFAULT or NULL
                     if let Some(ref default_val) = table_col.default_value {
-                        default_val.clone()
+                        self.evaluate_default_value(default_val, &table_col.data_type)
+                    } else if matches!(table_col.data_type.kind, DataTypeKind::Serial | DataTypeKind::BigSerial) {
+                        // Auto-increment for SERIAL/BIGSERIAL
+                        let counter_key = format!("{}.{}", self.table_name, table_col.name);
+                        let next_id = context.auto_increment_counters.entry(counter_key).or_insert(0);
+                        *next_id += 1;
+                        Value::integer(*next_id)
                     } else if table_col.nullable {
                         Value { kind: ValueKind::Null(crate::types::NullValue) }
                     } else {
@@ -720,6 +735,17 @@ impl InsertOperator {
                 // For unsupported expressions in INSERT, return NULL
                 Value { kind: ValueKind::Null(crate::types::NullValue) }
             }
+        }
+    }
+
+    /// Evaluate default values, handling special cases like CURRENT_TIMESTAMP
+    fn evaluate_default_value(&self, default_val: &Value, data_type: &DataType) -> Value {
+        match &default_val.kind {
+            ValueKind::String(s) if s == "CURRENT_TIMESTAMP" => {
+                // For CURRENT_TIMESTAMP, return current timestamp as proper timestamp value
+                Value::timestamp(chrono::Utc::now())
+            }
+            _ => default_val.clone(),
         }
     }
 
@@ -1676,15 +1702,24 @@ impl AggregateOperator {
                 output_column_names.push(alias.clone());
             }
 
-            // For empty input with no GROUP BY, return single row with NULL aggregates and window functions
+            // For empty input with no GROUP BY, return single row with initial aggregate values
             if self.group_by_columns.is_empty() {
-                let null_count = self.aggregate_functions.len() + self.window_functions.len();
-                let null_row: Vec<Value> = (0..null_count)
-                    .map(|_| Value { kind: ValueKind::Null(crate::types::NullValue) })
-                    .collect();
+                let mut row_values: Vec<Value> = Vec::new();
+
+                // Compute initial aggregate results
+                for (_, expr) in &self.aggregate_functions {
+                    let state = self.create_aggregate_state(expr);
+                    let value = state.result().unwrap_or(Value { kind: ValueKind::Null(crate::types::NullValue) });
+                    row_values.push(value);
+                }
+
+                // Window functions on empty input - return NULL
+                for _ in &self.window_functions {
+                    row_values.push(Value { kind: ValueKind::Null(crate::types::NullValue) });
+                }
 
                 return Ok(QueryResult {
-                    rows: vec![null_row],
+                    rows: vec![row_values],
                     column_names: output_column_names,
                 });
             } else {
@@ -2877,6 +2912,7 @@ pub struct ExecutionContext {
     pub logs: Vec<String>,
     pub catalog: Option<std::sync::Arc<crate::catalog::CatalogManager>>,
     pub buffer_manager: Option<std::sync::Arc<crate::storage::BufferPoolManager>>,
+    pub auto_increment_counters: std::collections::HashMap<String, i64>,
 }
 
 impl std::fmt::Debug for ExecutionContext {
@@ -2891,11 +2927,15 @@ impl std::fmt::Debug for ExecutionContext {
 
 impl ExecutionContext {
     pub fn new() -> Self {
-        Self {
+        let mut context = Self {
             logs: Vec::new(),
             catalog: None,
             buffer_manager: None,
-        }
+            auto_increment_counters: std::collections::HashMap::new(),
+        };
+        // Load persistent auto-increment counters
+        let _ = context.load_auto_increment_counters();
+        context
     }
 
     pub fn set_catalog(&mut self, catalog: std::sync::Arc<crate::catalog::CatalogManager>) {
@@ -2921,5 +2961,41 @@ impl ExecutionContext {
 
     pub fn get_logs(&self) -> &[String] {
         &self.logs
+    }
+
+    /// Load auto-increment counters from persistent storage
+    fn load_auto_increment_counters(&mut self) -> Result<()> {
+        let path = "auto_increment_counters.json";
+        if std::path::Path::new(path).exists() {
+            match std::fs::read_to_string(path) {
+                Ok(data) => {
+                    match serde_json::from_str(&data) {
+                        Ok(counters) => self.auto_increment_counters = counters,
+                        Err(e) => {
+                            self.logs.push(format!("Warning: Failed to parse auto-increment counters: {}", e));
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.logs.push(format!("Warning: Failed to read auto-increment counters file: {}", e));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Save auto-increment counters to persistent storage
+    pub fn save_auto_increment_counters(&mut self) -> Result<()> {
+        match serde_json::to_string(&self.auto_increment_counters) {
+            Ok(data) => {
+                if let Err(e) = std::fs::write("auto_increment_counters.json", data) {
+                    self.logs.push(format!("Warning: Failed to save auto-increment counters: {}", e));
+                }
+            }
+            Err(e) => {
+                self.logs.push(format!("Warning: Failed to serialize auto-increment counters: {}", e));
+            }
+        }
+        Ok(())
     }
 }

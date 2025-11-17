@@ -135,6 +135,7 @@ fn format_value(value: &rustgresql::types::Value) -> String {
         rustgresql::types::ValueKind::Integer(i) => i.to_string(),
         rustgresql::types::ValueKind::Float(f) => f.to_string(),
         rustgresql::types::ValueKind::Boolean(b) => b.to_string(),
+        rustgresql::types::ValueKind::Timestamp(ts) => format!("'{}'", ts.format("%Y-%m-%d %H:%M:%S")),
     }
 }
 
