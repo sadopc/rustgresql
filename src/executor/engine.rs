@@ -130,17 +130,17 @@ impl Executor {
             Statement::Perform(perform) => self.execute_perform(perform)?,
 
             // Control flow statements - these should only appear within procedures
-            Statement::Block(_) => Ok(QueryResult { rows: vec![], column_names: vec![] }),
-            Statement::Return(_) => Ok(QueryResult { rows: vec![], column_names: vec![] }),
-            Statement::IfStatement(_) => Ok(QueryResult { rows: vec![], column_names: vec![] }),
-            Statement::CaseStatement(_) => Ok(QueryResult { rows: vec![], column_names: vec![] }),
-            Statement::LoopStatement(_) => Ok(QueryResult { rows: vec![], column_names: vec![] }),
-            Statement::WhileStatement(_) => Ok(QueryResult { rows: vec![], column_names: vec![] }),
-            Statement::ForStatement(_) => Ok(QueryResult { rows: vec![], column_names: vec![] }),
-            Statement::Exit(_) => Ok(QueryResult { rows: vec![], column_names: vec![] }),
-            Statement::Continue(_) => Ok(QueryResult { rows: vec![], column_names: vec![] }),
-            Statement::Declare(_) => Ok(QueryResult { rows: vec![], column_names: vec![] }),
-            Statement::RaiseStatement(_) => Ok(QueryResult { rows: vec![], column_names: vec![] }),
+            Statement::Block(_) => QueryResult { rows: vec![], column_names: vec![] },
+            Statement::Return(_) => QueryResult { rows: vec![], column_names: vec![] },
+            Statement::IfStatement(_) => QueryResult { rows: vec![], column_names: vec![] },
+            Statement::CaseStatement(_) => QueryResult { rows: vec![], column_names: vec![] },
+            Statement::LoopStatement(_) => QueryResult { rows: vec![], column_names: vec![] },
+            Statement::WhileStatement(_) => QueryResult { rows: vec![], column_names: vec![] },
+            Statement::ForStatement(_) => QueryResult { rows: vec![], column_names: vec![] },
+            Statement::Exit(_) => QueryResult { rows: vec![], column_names: vec![] },
+            Statement::Continue(_) => QueryResult { rows: vec![], column_names: vec![] },
+            Statement::Declare(_) => QueryResult { rows: vec![], column_names: vec![] },
+            Statement::RaiseStatement(_) => QueryResult { rows: vec![], column_names: vec![] },
         };
 
         let execution_time = start_time.elapsed().as_millis() as u64;
@@ -2198,7 +2198,7 @@ impl Executor {
 
         let eval_context = EvaluationContext::new();
         let evaluator = ExpressionEvaluator::new();
-        evaluator.evaluate_expression(expr, &eval_context, &mut self.context)
+        evaluator.evaluate(expr, &eval_context)
     }
 }
 

@@ -2,7 +2,7 @@
 //!
 //! Provides cost-based query optimization with index selection and plan caching.
 
-use crate::{Result, sql::ast::{*, BinaryOperator}, executor::planner::{ExecutionPlan, PlanNode, QueryPlanner}, catalog::{IndexDef, IndexType}, optimizer::{cost_model::{CostModel, CostEstimate}, statistics::StatisticsManager, index_selection::{IndexSelector, IndexAccessPath}, rules::{RuleEngine, PredicatePushdownRule, ProjectionPushdownRule, ConstantFoldingRule, AggregationPushdownRule}}};
+use crate::{Result, sql::ast::{*, BinaryOperator}, executor::planner::{ExecutionPlan, PlanNode, QueryPlanner}, catalog::{IndexDef, IndexType}, optimizer::{cost_model::{CostModel, CostEstimate}, statistics::StatisticsManager, index_selection::{IndexSelector, IndexAccessPath}, rules::{RuleEngine, PredicatePushdownRule, ProjectionPushdownRule, ConstantFoldingRule, AggregationPushdownRule, ParallelPlanSelectionRule, ParallelJoinOrderingRule, ParallelAggregationOptimizationRule}}};
 
 /// Optimized query planner that considers index usage, costs, and optimization rules
 #[derive(Debug)]
@@ -23,10 +23,13 @@ impl OptimizedQueryPlanner {
         let mut rule_engine = RuleEngine::new();
 
         // Add optimization rules in order of priority
-        rule_engine.add_rule(Box::new(ConstantFoldingRule));     // First: simplify expressions
-        rule_engine.add_rule(Box::new(PredicatePushdownRule));   // Second: push filters down
-        rule_engine.add_rule(Box::new(ProjectionPushdownRule));  // Third: push projections down
-        rule_engine.add_rule(Box::new(AggregationPushdownRule)); // Fourth: optimize aggregations
+        rule_engine.add_rule(Box::new(ConstantFoldingRule));                     // First: simplify expressions
+        rule_engine.add_rule(Box::new(ParallelPlanSelectionRule::new(cost_model.clone()))); // Second: consider parallel execution
+        rule_engine.add_rule(Box::new(PredicatePushdownRule));                   // Third: push filters down
+        rule_engine.add_rule(Box::new(ParallelJoinOrderingRule::new(cost_model.clone())));   // Fourth: optimize join order for parallelism
+        rule_engine.add_rule(Box::new(ProjectionPushdownRule));                  // Fifth: push projections down
+        rule_engine.add_rule(Box::new(AggregationPushdownRule));                 // Sixth: optimize aggregations
+        rule_engine.add_rule(Box::new(ParallelAggregationOptimizationRule::new(cost_model.clone()))); // Seventh: parallel-specific aggregation optimization
 
         Self {
             base_planner: QueryPlanner::new(),

@@ -313,6 +313,11 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
 pub struct ExpressionEvaluator;
 
 impl ExpressionEvaluator {
+    /// Create a new expression evaluator
+    pub fn new() -> Self {
+        Self
+    }
+
     /// Evaluate an expression in the given context
     pub fn evaluate(&self, expr: &Expression, context: &EvaluationContext) -> Result<Value> {
         match expr {

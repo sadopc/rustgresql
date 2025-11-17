@@ -9,6 +9,9 @@ pub mod ddl_error;
 pub mod query_rewrite;
 pub mod procedure;
 
+#[cfg(feature = "parallel")]
+pub mod parallel;
+
 #[cfg(test)]
 mod ddl_tests;
 
@@ -23,3 +26,6 @@ pub use scanner::{TableScanner, SimpleRowIterator, RowData, MultiTableScanner};
 pub use ddl_error::*;
 pub use query_rewrite::{QueryRewriter, RewriteResult, ViewFreshness, RewriterStats};
 pub use procedure::{ProcedureExecutor, ProcedureContext, ExecutionFrame, ProcedureDef, FunctionDef};
+
+#[cfg(feature = "parallel")]
+pub use parallel::{ParallelExecutor, ParallelExecutorConfig, ParallelExecutionResult};

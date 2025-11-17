@@ -17,6 +17,25 @@ pub struct CostEstimate {
     pub memory_cost: f64,
     /// Total cost (weighted sum of all costs)
     pub total_cost: f64,
+    /// Parallel execution cost (coordination overhead)
+    pub parallel_cost: f64,
+    /// Number of workers for parallel execution
+    pub parallel_workers: usize,
+}
+
+/// Parallel execution cost estimate
+#[derive(Debug, Clone, Copy)]
+pub struct ParallelCostEstimate {
+    /// Base sequential cost estimate
+    pub sequential_cost: CostEstimate,
+    /// Parallel cost estimate
+    pub parallel_cost: CostEstimate,
+    /// Speedup factor (sequential_time / parallel_time)
+    pub speedup: f64,
+    /// Parallel efficiency (speedup / num_workers)
+    pub efficiency: f64,
+    /// Optimal number of workers
+    pub optimal_workers: usize,
 }
 
 impl CostEstimate {
@@ -28,6 +47,21 @@ impl CostEstimate {
             cpu_cost,
             memory_cost,
             total_cost,
+            parallel_cost: 0.0,
+            parallel_workers: 1,
+        }
+    }
+
+    /// Create a new cost estimate with parallel information
+    pub fn with_parallel(io_cost: f64, cpu_cost: f64, memory_cost: f64, parallel_cost: f64, parallel_workers: usize) -> Self {
+        let total_cost = io_cost + cpu_cost * 0.1 + memory_cost * 0.01 + parallel_cost;
+        Self {
+            io_cost,
+            cpu_cost,
+            memory_cost,
+            total_cost,
+            parallel_cost,
+            parallel_workers,
         }
     }
 
@@ -38,20 +72,65 @@ impl CostEstimate {
 
     /// Add another cost estimate to this one
     pub fn add(&self, other: &CostEstimate) -> CostEstimate {
-        CostEstimate::new(
+        CostEstimate::with_parallel(
             self.io_cost + other.io_cost,
             self.cpu_cost + other.cpu_cost,
             self.memory_cost + other.memory_cost,
+            self.parallel_cost + other.parallel_cost,
+            std::cmp::max(self.parallel_workers, other.parallel_workers),
         )
     }
 
     /// Multiply this cost estimate by a factor
     pub fn multiply(&self, factor: f64) -> CostEstimate {
-        CostEstimate::new(
+        CostEstimate::with_parallel(
             self.io_cost * factor,
             self.cpu_cost * factor,
             self.memory_cost * factor,
+            self.parallel_cost * factor,
+            self.parallel_workers,
         )
+    }
+
+    /// Convert to parallel cost estimate with given number of workers
+    pub fn to_parallel(&self, workers: usize, parallel_overhead: f64) -> ParallelCostEstimate {
+        let parallel_workers = workers.max(1);
+        let speedup = self.estimate_speedup(parallel_workers);
+        let parallel_cost = self.multiply(1.0 / speedup);
+
+        // Add parallel coordination overhead
+        let parallel_cost_with_overhead = CostEstimate::with_parallel(
+            parallel_cost.io_cost,
+            parallel_cost.cpu_cost,
+            parallel_cost.memory_cost,
+            parallel_overhead,
+            parallel_workers,
+        );
+
+        ParallelCostEstimate {
+            sequential_cost: *self,
+            parallel_cost: parallel_cost_with_overhead,
+            speedup,
+            efficiency: speedup / parallel_workers as f64,
+            optimal_workers: workers,
+        }
+    }
+
+    /// Estimate speedup for given number of workers using Amdahl's Law
+    pub fn estimate_speedup(&self, workers: usize) -> f64 {
+        if workers <= 1 {
+            return 1.0;
+        }
+
+        // Assume 80% of the work can be parallelized (configurable in real system)
+        let parallel_fraction = 0.8;
+        let serial_fraction = 1.0 - parallel_fraction;
+
+        // Amdahl's Law: Speedup = 1 / (serial_fraction + parallel_fraction / workers)
+        let speedup = 1.0 / (serial_fraction + parallel_fraction / workers as f64);
+
+        // Cap speedup at theoretical maximum
+        speedup.min(workers as f64)
     }
 }
 
@@ -91,6 +170,27 @@ pub struct CostModelConfig {
     pub cpu_operator_cost: f64,
     /// Buffer pool size in pages
     pub effective_cache_size: usize,
+    /// Parallel execution configuration
+    pub parallel_config: ParallelCostConfig,
+}
+
+/// Parallel execution cost configuration
+#[derive(Debug, Clone)]
+pub struct ParallelCostConfig {
+    /// Base parallel startup overhead
+    pub parallel_startup_cost: f64,
+    /// Cost per additional worker
+    pub parallel_worker_cost: f64,
+    /// Communication overhead per tuple
+    pub tuple_comm_cost: f64,
+    /// Maximum parallel workers per operation
+    pub max_parallel_workers: usize,
+    /// Minimum table size for parallel execution
+    pub min_parallel_table_size: usize,
+    /// Parallel efficiency threshold (below this, don't use parallel)
+    pub min_parallel_efficiency: f64,
+    /// Memory overhead per worker
+    pub parallel_memory_per_worker: f64,
 }
 
 impl Default for CostModelConfig {
@@ -103,6 +203,21 @@ impl Default for CostModelConfig {
             cpu_index_tuple_cost: 0.005,
             cpu_operator_cost: 0.0025,
             effective_cache_size: 16384, // 128MB with 8KB pages
+            parallel_config: ParallelCostConfig::default(),
+        }
+    }
+}
+
+impl Default for ParallelCostConfig {
+    fn default() -> Self {
+        Self {
+            parallel_startup_cost: 1000.0,    // Base overhead for parallel setup
+            parallel_worker_cost: 100.0,      // Cost per additional worker
+            tuple_comm_cost: 0.01,            // Communication overhead per tuple
+            max_parallel_workers: num_cpus::get(),
+            min_parallel_table_size: 1000,    // Minimum rows to consider parallel
+            min_parallel_efficiency: 0.25,    // Minimum 25% efficiency
+            parallel_memory_per_worker: 16.0 * 1024.0, // 16MB per worker
         }
     }
 }
@@ -335,6 +450,155 @@ impl CostModel {
         }
     }
 
+    /// Estimate cost for parallel sequential scan
+    pub fn estimate_parallel_seq_scan(&self, num_pages: usize, num_tuples: usize) -> ParallelCostEstimate {
+        let sequential_cost = self.estimate_seq_scan(num_pages, num_tuples);
+
+        // Don't use parallel for small tables
+        if num_tuples < self.config.parallel_config.min_parallel_table_size {
+            return ParallelCostEstimate {
+                sequential_cost,
+                parallel_cost: sequential_cost,
+                speedup: 1.0,
+                efficiency: 1.0,
+                optimal_workers: 1,
+            };
+        }
+
+        // Calculate optimal number of workers
+        let optimal_workers = self.calculate_optimal_workers(num_tuples);
+        let parallel_overhead = self.calculate_parallel_overhead(optimal_workers, num_tuples);
+
+        sequential_cost.to_parallel(optimal_workers, parallel_overhead)
+    }
+
+    /// Estimate cost for parallel hash join
+    pub fn estimate_parallel_hash_join(
+        &self,
+        outer_tuples: usize,
+        inner_tuples: usize,
+        outer_cost: CostEstimate,
+        inner_cost: CostEstimate,
+        join_selectivity: f64,
+    ) -> ParallelCostEstimate {
+        let sequential_cost = self.estimate_hash_join(
+            outer_tuples, inner_tuples, outer_cost, inner_cost, join_selectivity
+        );
+
+        // Don't use parallel for small joins
+        let total_tuples = outer_tuples + inner_tuples;
+        if total_tuples < self.config.parallel_config.min_parallel_table_size {
+            return ParallelCostEstimate {
+                sequential_cost,
+                parallel_cost: sequential_cost,
+                speedup: 1.0,
+                efficiency: 1.0,
+                optimal_workers: 1,
+            };
+        }
+
+        // Hash joins benefit significantly from parallelism
+        let optimal_workers = self.calculate_optimal_workers(total_tuples);
+        let parallel_overhead = self.calculate_parallel_overhead(optimal_workers, total_tuples);
+
+        // Hash join has better parallel efficiency than most operations
+        let mut parallel_estimate = sequential_cost.to_parallel(optimal_workers, parallel_overhead);
+        parallel_estimate.efficiency *= 1.2; // 20% bonus for hash join parallelism
+        parallel_estimate.efficiency = parallel_estimate.efficiency.min(1.0);
+
+        parallel_estimate
+    }
+
+    /// Estimate cost for parallel aggregation
+    pub fn estimate_parallel_aggregation(
+        &self,
+        input_cost: CostEstimate,
+        input_tuples: usize,
+        num_groups: usize,
+        aggregate_functions: usize,
+    ) -> ParallelCostEstimate {
+        let sequential_cost = self.estimate_aggregation(
+            input_cost, input_tuples, num_groups, aggregate_functions
+        );
+
+        // Don't use parallel for small aggregations
+        if input_tuples < self.config.parallel_config.min_parallel_table_size {
+            return ParallelCostEstimate {
+                sequential_cost,
+                parallel_cost: sequential_cost,
+                speedup: 1.0,
+                efficiency: 1.0,
+                optimal_workers: 1,
+            };
+        }
+
+        // Aggregations can benefit from parallelism if there are many groups
+        let optimal_workers = self.calculate_optimal_workers_for_aggregation(input_tuples, num_groups);
+        let parallel_overhead = self.calculate_parallel_overhead(optimal_workers, input_tuples);
+
+        // Aggregation parallel efficiency depends on number of groups
+        let mut parallel_estimate = sequential_cost.to_parallel(optimal_workers, parallel_overhead);
+        let group_factor = (num_groups as f64 / 1000.0).min(1.0); // More groups = better parallelism
+        parallel_estimate.efficiency *= (0.5 + group_factor * 0.5); // Scale efficiency based on groups
+        parallel_estimate.efficiency = parallel_estimate.efficiency.min(1.0);
+
+        parallel_estimate
+    }
+
+    /// Calculate optimal number of workers for a given data size
+    fn calculate_optimal_workers(&self, num_tuples: usize) -> usize {
+        let max_workers = self.config.parallel_config.max_parallel_workers;
+
+        // Scale workers based on data size
+        if num_tuples < 1000 {
+            return 1;
+        } else if num_tuples < 10000 {
+            return 2.min(max_workers);
+        } else if num_tuples < 100000 {
+            return (num_cpus::get() / 2).min(max_workers);
+        } else {
+            return max_workers;
+        }
+    }
+
+    /// Calculate optimal workers for aggregation (considers group count)
+    fn calculate_optimal_workers_for_aggregation(&self, num_tuples: usize, num_groups: usize) -> usize {
+        let base_workers = self.calculate_optimal_workers(num_tuples);
+
+        // Reduce workers if few groups (less parallelism opportunity)
+        if num_groups < 10 {
+            return 1;
+        } else if num_groups < 100 {
+            return base_workers / 2;
+        } else {
+            return base_workers;
+        }
+    }
+
+    /// Calculate parallel execution overhead
+    fn calculate_parallel_overhead(&self, workers: usize, num_tuples: usize) -> f64 {
+        let config = &self.config.parallel_config;
+
+        // Startup cost + worker cost + communication cost
+        let startup_cost = config.parallel_startup_cost;
+        let worker_cost = (workers - 1) as f64 * config.parallel_worker_cost;
+        let comm_cost = num_tuples as f64 * config.tuple_comm_cost * workers as f64;
+
+        startup_cost + worker_cost + comm_cost
+    }
+
+    /// Check if parallel execution is beneficial
+    pub fn should_use_parallel(&self, parallel_estimate: &ParallelCostEstimate) -> bool {
+        parallel_estimate.efficiency >= self.config.parallel_config.min_parallel_efficiency
+            && parallel_estimate.optimal_workers > 1
+            && parallel_estimate.parallel_cost.total_cost < parallel_estimate.sequential_cost.total_cost
+    }
+
+    /// Get the parallel configuration
+    pub fn parallel_config(&self) -> &ParallelCostConfig {
+        &self.config.parallel_config
+    }
+
     /// Get configuration reference
     pub fn config(&self) -> &CostModelConfig {
         &self.config
@@ -367,11 +631,111 @@ mod tests {
     }
 
     #[test]
+    fn test_cost_estimate_with_parallel() {
+        let cost = CostEstimate::with_parallel(10.0, 5.0, 2.0, 1.0, 4);
+        assert_eq!(cost.io_cost, 10.0);
+        assert_eq!(cost.cpu_cost, 5.0);
+        assert_eq!(cost.memory_cost, 2.0);
+        assert_eq!(cost.parallel_cost, 1.0);
+        assert_eq!(cost.parallel_workers, 4);
+    }
+
+    #[test]
+    fn test_parallel_speedup_estimation() {
+        let cost = CostEstimate::new(100.0, 50.0, 10.0);
+
+        // Test speedup for different worker counts
+        let speedup_1 = cost.estimate_speedup(1);
+        assert_eq!(speedup_1, 1.0);
+
+        let speedup_2 = cost.estimate_speedup(2);
+        assert!(speedup_2 > 1.0);
+        assert!(speedup_2 <= 2.0);
+
+        let speedup_8 = cost.estimate_speedup(8);
+        assert!(speedup_8 > 1.0);
+        assert!(speedup_8 <= 8.0);
+    }
+
+    #[test]
+    fn test_parallel_conversion() {
+        let cost = CostEstimate::new(100.0, 50.0, 10.0);
+        let parallel_estimate = cost.to_parallel(4, 50.0);
+
+        assert_eq!(parallel_estimate.optimal_workers, 4);
+        assert!(parallel_estimate.speedup > 1.0);
+        assert!(parallel_estimate.efficiency > 0.0);
+        assert!(parallel_estimate.efficiency <= 1.0);
+    }
+
+    #[test]
     fn test_seq_scan_cost() {
         let model = CostModel::new();
         let cost = model.estimate_seq_scan(100, 1000);
         assert!(cost.io_cost > 0.0);
         assert!(cost.cpu_cost > 0.0);
+    }
+
+    #[test]
+    fn test_parallel_seq_scan_cost() {
+        let model = CostModel::new();
+        let parallel_cost = model.estimate_parallel_seq_scan(100, 10000); // Large table
+
+        assert_eq!(parallel_cost.sequential_cost, model.estimate_seq_scan(100, 10000));
+        assert!(parallel_cost.optimal_workers > 1);
+        assert!(parallel_cost.speedup > 1.0);
+
+        // Small table should not use parallel
+        let small_parallel_cost = model.estimate_parallel_seq_scan(10, 500);
+        assert_eq!(small_parallel_cost.optimal_workers, 1);
+        assert_eq!(small_parallel_cost.speedup, 1.0);
+    }
+
+    #[test]
+    fn test_parallel_hash_join_cost() {
+        let model = CostModel::new();
+        let outer_cost = model.estimate_seq_scan(100, 5000);
+        let inner_cost = model.estimate_seq_scan(50, 3000);
+
+        let parallel_cost = model.estimate_parallel_hash_join(
+            5000, 3000, outer_cost, inner_cost, 0.1
+        );
+
+        assert!(parallel_cost.optimal_workers > 1);
+        assert!(parallel_cost.speedup > 1.0);
+        assert!(parallel_cost.efficiency > 0.0);
+    }
+
+    #[test]
+    fn test_parallel_aggregation_cost() {
+        let model = CostModel::new();
+        let input_cost = model.estimate_seq_scan(200, 20000);
+
+        let parallel_cost = model.estimate_parallel_aggregation(
+            input_cost, 20000, 1000, 3
+        );
+
+        assert!(parallel_cost.optimal_workers > 1);
+        assert!(parallel_cost.speedup > 1.0);
+    }
+
+    #[test]
+    fn test_should_use_parallel() {
+        let model = CostModel::new();
+        let cost = CostEstimate::new(100.0, 50.0, 10.0);
+        let parallel_estimate = cost.to_parallel(4, 10.0);
+
+        // Should use parallel if efficiency is high enough
+        assert!(model.should_use_parallel(&parallel_estimate));
+    }
+
+    #[test]
+    fn test_parallel_config_default() {
+        let config = ParallelCostConfig::default();
+        assert!(config.parallel_startup_cost > 0.0);
+        assert!(config.max_parallel_workers > 0);
+        assert!(config.min_parallel_efficiency > 0.0);
+        assert!(config.min_parallel_efficiency <= 1.0);
     }
 
     #[test]

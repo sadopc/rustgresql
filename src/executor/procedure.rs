@@ -133,7 +133,8 @@ impl ProcedureExecutor {
         context: &mut ExecutionContext,
     ) -> Result<QueryResult> {
         let procedure = self.procedures.get(name)
-            .ok_or_else(|| crate::error::RustgreSQLError::Procedure(format!("Procedure '{}' does not exist", name)))?;
+            .ok_or_else(|| crate::error::RustgreSQLError::Procedure(format!("Procedure '{}' does not exist", name)))?
+            .clone();
 
         // Validate argument count
         if arguments.len() != procedure.parameters.len() {
@@ -192,7 +193,8 @@ impl ProcedureExecutor {
         context: &mut ExecutionContext,
     ) -> Result<Value> {
         let function = self.functions.get(name)
-            .ok_or_else(|| crate::error::RustgreSQLError::Procedure(format!("Function '{}' does not exist", name)))?;
+            .ok_or_else(|| crate::error::RustgreSQLError::Procedure(format!("Function '{}' does not exist", name)))?
+            .clone();
 
         // Validate argument count
         if arguments.len() != function.parameters.len() {
@@ -589,16 +591,16 @@ impl ProcedureExecutor {
                 let lower_val = self.evaluate_expression(lower_bound, proc_context, context)?;
                 let upper_val = self.evaluate_expression(upper_bound, proc_context, context)?;
 
-                if let (ValueKind::Integer(lower), ValueKind::Integer(upper)) = (lower_val, upper_val) {
+                if let (ValueKind::Integer(lower), ValueKind::Integer(upper)) = (&lower_val.kind, &upper_val.kind) {
                     let range: Vec<i64> = if *reverse {
-                        (upper..=lower).rev().collect()
+                        (*upper..=*lower).rev().collect()
                     } else {
-                        (lower..=upper).collect()
+                        (*lower..=*upper).collect()
                     };
 
                     for i in range {
                         // Set loop variable
-                        proc_context.variables.insert(variable.clone(), ValueKind::Integer(i));
+                        proc_context.variables.insert(variable.clone(), Value::integer(i));
 
                         // Execute statements
                         for stmt in statements {
@@ -823,7 +825,7 @@ impl ProcedureExecutor {
                 }
 
                 let evaluator = ExpressionEvaluator::new();
-                evaluator.evaluate_expression(expr, &eval_context, context)
+                evaluator.evaluate(expr, &eval_context)
             }
         }
     }
@@ -835,14 +837,14 @@ impl ProcedureExecutor {
             BinaryOperator::Subtract => left.subtract(right),
             BinaryOperator::Multiply => left.multiply(right),
             BinaryOperator::Divide => left.divide(right),
-            BinaryOperator::Equals => Ok(ValueKind::Boolean(left.equals(right))),
-            BinaryOperator::NotEquals => Ok(ValueKind::Boolean(!left.equals(right))),
-            BinaryOperator::LessThan => Ok(ValueKind::Boolean(left.less_than(right))),
-            BinaryOperator::LessThanOrEquals => Ok(ValueKind::Boolean(left.less_than_or_equal(right))),
-            BinaryOperator::GreaterThan => Ok(ValueKind::Boolean(left.greater_than(right))),
-            BinaryOperator::GreaterThanOrEquals => Ok(ValueKind::Boolean(left.greater_than_or_equal(right))),
-            BinaryOperator::And => Ok(ValueKind::Boolean(left.is_truthy() && right.is_truthy())),
-            BinaryOperator::Or => Ok(ValueKind::Boolean(left.is_truthy() || right.is_truthy())),
+            BinaryOperator::Equals => Ok(Value::boolean(left.equals(right))),
+            BinaryOperator::NotEquals => Ok(Value::boolean(!left.equals(right))),
+            BinaryOperator::LessThan => Ok(Value::boolean(left.less_than(right))),
+            BinaryOperator::LessThanOrEquals => Ok(Value::boolean(left.less_than_or_equal(right))),
+            BinaryOperator::GreaterThan => Ok(Value::boolean(left.greater_than(right))),
+            BinaryOperator::GreaterThanOrEquals => Ok(Value::boolean(left.greater_than_or_equal(right))),
+            BinaryOperator::And => Ok(Value::boolean(left.is_truthy() && right.is_truthy())),
+            BinaryOperator::Or => Ok(Value::boolean(left.is_truthy() || right.is_truthy())),
             _ => Err(crate::error::RustgreSQLError::Procedure(
                 format!("Binary operator {:?} not yet implemented in procedures", op)
             )),
@@ -852,7 +854,7 @@ impl ProcedureExecutor {
     /// Evaluate a unary operation
     fn evaluate_unary_op(&self, op: UnaryOperator, operand: &Value) -> Result<Value> {
         match op {
-            UnaryOperator::Not => Ok(ValueKind::Boolean(!operand.is_truthy())),
+            UnaryOperator::Not => Ok(Value::boolean(!operand.is_truthy())),
             UnaryOperator::Minus => operand.negate(),
             UnaryOperator::Plus => Ok(operand.clone()),
         }
@@ -887,7 +889,7 @@ impl ProcedureExecutor {
                 }
 
                 match &args[0].kind {
-                    crate::types::ValueKind::String(s) => Ok(ValueKind::Integer(s.len() as i64)),
+                    crate::types::ValueKind::String(s) => Ok(Value::integer(s.len() as i64)),
                     _ => Err(crate::error::RustgreSQLError::Procedure("LENGTH() argument must be a string".to_string())),
                 }
             }
@@ -898,7 +900,7 @@ impl ProcedureExecutor {
                 }
 
                 match &args[0].kind {
-                    crate::types::ValueKind::String(s) => Ok(ValueKind::String(s.to_uppercase())),
+                    crate::types::ValueKind::String(s) => Ok(Value::string(s.to_uppercase())),
                     _ => Err(crate::error::RustgreSQLError::Procedure("UPPER() argument must be a string".to_string())),
                 }
             }
@@ -909,7 +911,7 @@ impl ProcedureExecutor {
                 }
 
                 match &args[0].kind {
-                    crate::types::ValueKind::String(s) => Ok(ValueKind::String(s.to_lowercase())),
+                    crate::types::ValueKind::String(s) => Ok(Value::string(s.to_lowercase())),
                     _ => Err(crate::error::RustgreSQLError::Procedure("LOWER() argument must be a string".to_string())),
                 }
             }
@@ -1038,19 +1040,19 @@ impl ValueExt for Value {
     fn add(&self, other: &Value) -> Result<Value> {
         match (&self.kind, &other.kind) {
             (crate::types::ValueKind::Integer(a), crate::types::ValueKind::Integer(b)) => {
-                Ok(ValueKind::Integer(a + b))
+                Ok(Value::integer(a + b))
             }
             (crate::types::ValueKind::Float(a), crate::types::ValueKind::Float(b)) => {
-                Ok(ValueKind::Float(a + b))
+                Ok(Value::float(a + b))
             }
             (crate::types::ValueKind::Integer(a), crate::types::ValueKind::Float(b)) => {
-                Ok(ValueKind::Float((*a as f64) + b))
+                Ok(Value::float((*a as f64) + b))
             }
             (crate::types::ValueKind::Float(a), crate::types::ValueKind::Integer(b)) => {
-                Ok(ValueKind::Float(a + (*b as f64)))
+                Ok(Value::float(a + (*b as f64)))
             }
             (crate::types::ValueKind::String(a), crate::types::ValueKind::String(b)) => {
-                Ok(ValueKind::String(a.clone() + b))
+                Ok(Value::string(a.clone() + b))
             }
             _ => Err(crate::error::RustgreSQLError::Procedure("Invalid types for addition".to_string())),
         }
@@ -1059,16 +1061,16 @@ impl ValueExt for Value {
     fn subtract(&self, other: &Value) -> Result<Value> {
         match (&self.kind, &other.kind) {
             (crate::types::ValueKind::Integer(a), crate::types::ValueKind::Integer(b)) => {
-                Ok(ValueKind::Integer(a - b))
+                Ok(Value::integer(a - b))
             }
             (crate::types::ValueKind::Float(a), crate::types::ValueKind::Float(b)) => {
-                Ok(ValueKind::Float(a - b))
+                Ok(Value::float(a - b))
             }
             (crate::types::ValueKind::Integer(a), crate::types::ValueKind::Float(b)) => {
-                Ok(ValueKind::Float((*a as f64) - b))
+                Ok(Value::float((*a as f64) - b))
             }
             (crate::types::ValueKind::Float(a), crate::types::ValueKind::Integer(b)) => {
-                Ok(ValueKind::Float(a - (*b as f64)))
+                Ok(Value::float(a - (*b as f64)))
             }
             _ => Err(crate::error::RustgreSQLError::Procedure("Invalid types for subtraction".to_string())),
         }
@@ -1077,16 +1079,16 @@ impl ValueExt for Value {
     fn multiply(&self, other: &Value) -> Result<Value> {
         match (&self.kind, &other.kind) {
             (crate::types::ValueKind::Integer(a), crate::types::ValueKind::Integer(b)) => {
-                Ok(ValueKind::Integer(a * b))
+                Ok(Value::integer(a * b))
             }
             (crate::types::ValueKind::Float(a), crate::types::ValueKind::Float(b)) => {
-                Ok(ValueKind::Float(a * b))
+                Ok(Value::float(a * b))
             }
             (crate::types::ValueKind::Integer(a), crate::types::ValueKind::Float(b)) => {
-                Ok(ValueKind::Float((*a as f64) * b))
+                Ok(Value::float((*a as f64) * b))
             }
             (crate::types::ValueKind::Float(a), crate::types::ValueKind::Integer(b)) => {
-                Ok(ValueKind::Float(a * (*b as f64)))
+                Ok(Value::float(a * (*b as f64)))
             }
             _ => Err(crate::error::RustgreSQLError::Procedure("Invalid types for multiplication".to_string())),
         }
@@ -1098,25 +1100,25 @@ impl ValueExt for Value {
                 if *b == 0 {
                     return Err(crate::error::RustgreSQLError::Procedure("Division by zero".to_string()));
                 }
-                Ok(ValueKind::Integer(a / b))
+                Ok(Value::integer(a / b))
             }
             (crate::types::ValueKind::Float(a), crate::types::ValueKind::Float(b)) => {
                 if *b == 0.0 {
                     return Err(crate::error::RustgreSQLError::Procedure("Division by zero".to_string()));
                 }
-                Ok(ValueKind::Float(a / b))
+                Ok(Value::float(a / b))
             }
             (crate::types::ValueKind::Integer(a), crate::types::ValueKind::Float(b)) => {
                 if *b == 0.0 {
                     return Err(crate::error::RustgreSQLError::Procedure("Division by zero".to_string()));
                 }
-                Ok(ValueKind::Float((*a as f64) / b))
+                Ok(Value::float((*a as f64) / b))
             }
             (crate::types::ValueKind::Float(a), crate::types::ValueKind::Integer(b)) => {
                 if *b == 0 {
                     return Err(crate::error::RustgreSQLError::Procedure("Division by zero".to_string()));
                 }
-                Ok(ValueKind::Float(a / (*b as f64)))
+                Ok(Value::float(a / (*b as f64)))
             }
             _ => Err(crate::error::RustgreSQLError::Procedure("Invalid types for division".to_string())),
         }
@@ -1124,16 +1126,16 @@ impl ValueExt for Value {
 
     fn negate(&self) -> Result<Value> {
         match &self.kind {
-            crate::types::ValueKind::Integer(a) => Ok(ValueKind::Integer(-a)),
-            crate::types::ValueKind::Float(a) => Ok(ValueKind::Float(-a)),
+            crate::types::ValueKind::Integer(a) => Ok(Value::integer(-a)),
+            crate::types::ValueKind::Float(a) => Ok(Value::float(-a)),
             _ => Err(crate::error::RustgreSQLError::Procedure("Cannot negate non-numeric value".to_string())),
         }
     }
 
     fn abs(&self) -> Result<Value> {
         match &self.kind {
-            crate::types::ValueKind::Integer(a) => Ok(ValueKind::Integer(a.abs())),
-            crate::types::ValueKind::Float(a) => Ok(ValueKind::Float(a.abs())),
+            crate::types::ValueKind::Integer(a) => Ok(Value::integer(a.abs())),
+            crate::types::ValueKind::Float(a) => Ok(Value::float(a.abs())),
             _ => Err(crate::error::RustgreSQLError::Procedure("ABS() argument must be numeric".to_string())),
         }
     }

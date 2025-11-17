@@ -7,6 +7,7 @@ use crate::{
     sql::ast::{Expression, BinaryOperator, UnaryOperator},
     executor::planner::PlanNode,
     types::{Value, ValueKind},
+    optimizer::cost_model::{CostModel, ParallelCostEstimate, CostEstimate},
 };
 
 /// Optimization rule trait
@@ -863,4 +864,540 @@ impl AggregationPushdownRule {
             _ => Ok(plan.clone()),
         }
     }
+}
+
+/// Parallel plan selection rule
+///
+/// This rule decides whether to use parallel execution for various plan nodes
+/// based on the extended cost model with parallel support.
+#[derive(Debug)]
+pub struct ParallelPlanSelectionRule {
+    cost_model: CostModel,
+}
+
+impl ParallelPlanSelectionRule {
+    /// Create new parallel plan selection rule
+    pub fn new(cost_model: CostModel) -> Self {
+        Self { cost_model }
+    }
+}
+
+impl OptimizerRule for ParallelPlanSelectionRule {
+    fn apply(&self, plan: &PlanNode) -> Result<PlanNode> {
+        // First apply to children
+        let optimized_plan = self.apply_to_children(plan)?;
+
+        // Then consider parallel execution for this node
+        match &optimized_plan {
+            PlanNode::Scan { table_name, columns: _ } => {
+                // Get table statistics (simplified - in real implementation would query catalog)
+                let table_stats = self.get_table_statistics(table_name)?;
+
+                if table_stats.row_count > 10000 {
+                    // Consider parallel scan for large tables
+                    let parallel_cost = self.cost_model.estimate_parallel_seq_scan(
+                        table_stats.page_count,
+                        table_stats.row_count
+                    );
+
+                    if self.cost_model.should_use_parallel(&parallel_cost) {
+                        // Create parallel scan node - would need to extend PlanNode enum
+                        // For now, return the original plan
+                        Ok(optimized_plan)
+                    } else {
+                        Ok(optimized_plan)
+                    }
+                } else {
+                    Ok(optimized_plan)
+                }
+            }
+
+            PlanNode::Join { left, right, condition: _, join_type: _ } => {
+                // Consider parallel hash join
+                if self.can_use_parallel_hash_join(&**left, &**right) {
+                    let left_stats = self.estimate_plan_statistics(&**left)?;
+                    let right_stats = self.estimate_plan_statistics(&**right)?;
+
+                    // Create cost estimates for left and right sides
+                    let left_cost = CostEstimate::new(
+                        left_stats.estimated_rows as f64 * 0.1, // IO cost
+                        left_stats.estimated_rows as f64 * 0.01, // CPU cost
+                        left_stats.estimated_rows as f64 * 0.001, // Memory cost
+                    );
+                    let right_cost = CostEstimate::new(
+                        right_stats.estimated_rows as f64 * 0.1,
+                        right_stats.estimated_rows as f64 * 0.01,
+                        right_stats.estimated_rows as f64 * 0.001,
+                    );
+
+                    let parallel_cost = self.cost_model.estimate_parallel_hash_join(
+                        left_stats.estimated_rows,
+                        right_stats.estimated_rows,
+                        left_cost,
+                        right_cost,
+                        0.1, // join selectivity
+                    );
+
+                    if self.cost_model.should_use_parallel(&parallel_cost) {
+                        // Create parallel hash join node - would need to extend PlanNode enum
+                        // For now, return the original plan
+                        Ok(optimized_plan)
+                    } else {
+                        Ok(optimized_plan)
+                    }
+                } else {
+                    Ok(optimized_plan)
+                }
+            }
+
+            PlanNode::Aggregate { input, group_by_columns, aggregate_functions, having_clause: _ } => {
+                // Consider parallel aggregation
+                if group_by_columns.len() > 0 || !aggregate_functions.is_empty() {
+                    let input_stats = self.estimate_plan_statistics(&**input)?;
+                    let group_count_estimate = (input_stats.estimated_rows as f64 * 0.1) as usize;
+
+                    // Create input cost estimate
+                    let input_cost = CostEstimate::new(
+                        input_stats.estimated_rows as f64 * 0.1, // IO cost
+                        input_stats.estimated_rows as f64 * 0.01, // CPU cost
+                        input_stats.estimated_rows as f64 * 0.001, // Memory cost
+                    );
+
+                    let parallel_cost = self.cost_model.estimate_parallel_aggregation(
+                        input_cost,
+                        input_stats.estimated_rows,
+                        group_count_estimate,
+                        aggregate_functions.len(),
+                    );
+
+                    if self.cost_model.should_use_parallel(&parallel_cost) {
+                        // Create parallel aggregate node - would need to extend PlanNode enum
+                        // For now, return the original plan
+                        Ok(optimized_plan)
+                    } else {
+                        Ok(optimized_plan)
+                    }
+                } else {
+                    Ok(optimized_plan)
+                }
+            }
+
+            _ => Ok(optimized_plan),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "ParallelPlanSelection"
+    }
+
+    fn is_applicable(&self, plan: &PlanNode) -> bool {
+        matches!(plan, PlanNode::Scan { .. } | PlanNode::Join { .. } | PlanNode::Aggregate { .. })
+    }
+}
+
+impl ParallelPlanSelectionRule {
+    fn apply_to_children(&self, plan: &PlanNode) -> Result<PlanNode> {
+        match plan {
+            PlanNode::Filter { input, condition } => {
+                let optimized_input = self.apply(input.as_ref())?;
+                Ok(PlanNode::Filter {
+                    input: Box::new(optimized_input),
+                    condition: condition.clone(),
+                })
+            }
+            PlanNode::Join { left, right, condition, join_type } => {
+                let optimized_left = self.apply(left.as_ref())?;
+                let optimized_right = self.apply(right.as_ref())?;
+                Ok(PlanNode::Join {
+                    left: Box::new(optimized_left),
+                    right: Box::new(optimized_right),
+                    condition: condition.clone(),
+                    join_type: join_type.clone(),
+                })
+            }
+            PlanNode::Aggregate { input, group_by_columns, aggregate_functions, having_clause } => {
+                let optimized_input = self.apply(input.as_ref())?;
+                Ok(PlanNode::Aggregate {
+                    input: Box::new(optimized_input),
+                    group_by_columns: group_by_columns.clone(),
+                    aggregate_functions: aggregate_functions.clone(),
+                    having_clause: having_clause.clone(),
+                })
+            }
+            _ => Ok(plan.clone()),
+        }
+    }
+
+    fn get_table_statistics(&self, table_name: &str) -> Result<TableStatistics> {
+        // Simplified implementation - in real system would query catalog
+        match table_name {
+            "users" => Ok(TableStatistics {
+                name: table_name.to_string(),
+                row_count: 50000,
+                page_count: 1000,
+                avg_row_size: 200,
+            }),
+            "orders" => Ok(TableStatistics {
+                name: table_name.to_string(),
+                row_count: 250000,
+                page_count: 5000,
+                avg_row_size: 300,
+            }),
+            "products" => Ok(TableStatistics {
+                name: table_name.to_string(),
+                row_count: 10000,
+                page_count: 200,
+                avg_row_size: 150,
+            }),
+            _ => Ok(TableStatistics {
+                name: table_name.to_string(),
+                row_count: 1000,
+                page_count: 20,
+                avg_row_size: 100,
+            }),
+        }
+    }
+
+    fn can_use_parallel_hash_join(&self, left: &PlanNode, right: &PlanNode) -> bool {
+        // Simplified heuristic: use parallel hash join for large result sets
+        let left_stats = self.estimate_plan_statistics(left).unwrap_or_default();
+        let right_stats = self.estimate_plan_statistics(right).unwrap_or_default();
+
+        left_stats.estimated_rows > 5000 && right_stats.estimated_rows > 5000
+    }
+
+    fn estimate_plan_statistics(&self, plan: &PlanNode) -> Result<PlanStatistics> {
+        match plan {
+            PlanNode::Scan { table_name, .. } => {
+                let table_stats = self.get_table_statistics(table_name)?;
+                Ok(PlanStatistics {
+                    estimated_rows: table_stats.row_count,
+                    estimated_width: table_stats.avg_row_size,
+                })
+            }
+            PlanNode::Filter { input, condition } => {
+                let input_stats = self.estimate_plan_statistics(input)?;
+                // Assume 50% selectivity for filters (simplified)
+                Ok(PlanStatistics {
+                    estimated_rows: input_stats.estimated_rows / 2,
+                    estimated_width: input_stats.estimated_width,
+                })
+            }
+            PlanNode::Join { left, right, .. } => {
+                let left_stats = self.estimate_plan_statistics(left)?;
+                let right_stats = self.estimate_plan_statistics(right)?;
+                // Simplified join cardinality estimation
+                Ok(PlanStatistics {
+                    estimated_rows: (left_stats.estimated_rows * right_stats.estimated_rows) / 100,
+                    estimated_width: left_stats.estimated_width + right_stats.estimated_width,
+                })
+            }
+            _ => Ok(PlanStatistics {
+                estimated_rows: 1000,
+                estimated_width: 100,
+            }),
+        }
+    }
+}
+
+/// Parallel join ordering rule
+///
+/// This rule optimizes join order considering parallel execution costs.
+#[derive(Debug)]
+pub struct ParallelJoinOrderingRule {
+    cost_model: CostModel,
+}
+
+impl ParallelJoinOrderingRule {
+    /// Create new parallel join ordering rule
+    pub fn new(cost_model: CostModel) -> Self {
+        Self { cost_model }
+    }
+}
+
+impl OptimizerRule for ParallelJoinOrderingRule {
+    fn apply(&self, plan: &PlanNode) -> Result<PlanNode> {
+        match plan {
+            PlanNode::Join { left, right, condition, join_type } => {
+                // Try to optimize join order based on parallel execution costs
+                if let Some(optimized_join) = self.optimize_join_order(left.as_ref(), right.as_ref(), condition, *join_type)? {
+                    Ok(optimized_join)
+                } else {
+                    // Apply to children and keep current order
+                    let optimized_left = self.apply(left.as_ref())?;
+                    let optimized_right = self.apply(right.as_ref())?;
+                    Ok(PlanNode::Join {
+                        left: Box::new(optimized_left),
+                        right: Box::new(optimized_right),
+                        condition: condition.clone(),
+                        join_type: join_type.clone(),
+                    })
+                }
+            }
+            _ => self.apply_to_children(plan),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "ParallelJoinOrdering"
+    }
+
+    fn is_applicable(&self, plan: &PlanNode) -> bool {
+        matches!(plan, PlanNode::Join { .. })
+    }
+}
+
+impl ParallelJoinOrderingRule {
+    fn apply_to_children(&self, plan: &PlanNode) -> Result<PlanNode> {
+        match plan {
+            PlanNode::Filter { input, condition } => {
+                let optimized_input = self.apply(input.as_ref())?;
+                Ok(PlanNode::Filter {
+                    input: Box::new(optimized_input),
+                    condition: condition.clone(),
+                })
+            }
+            PlanNode::Join { left, right, condition, join_type } => {
+                let optimized_left = self.apply(left.as_ref())?;
+                let optimized_right = self.apply(right.as_ref())?;
+                Ok(PlanNode::Join {
+                    left: Box::new(optimized_left),
+                    right: Box::new(optimized_right),
+                    condition: condition.clone(),
+                    join_type: join_type.clone(),
+                })
+            }
+            _ => Ok(plan.clone()),
+        }
+    }
+
+    fn optimize_join_order(
+        &self,
+        left: &PlanNode,
+        right: &PlanNode,
+        condition: &Option<Expression>,
+        join_type: crate::sql::ast::JoinType,
+    ) -> Result<Option<PlanNode>> {
+        // Simplified implementation: compare costs of current vs swapped order
+        let left_stats = self.estimate_plan_statistics(left);
+        let right_stats = self.estimate_plan_statistics(right);
+
+        // Create cost estimates for both orders
+        let left_cost = CostEstimate::new(
+            left_stats.estimated_rows as f64 * 0.1, // IO cost
+            left_stats.estimated_rows as f64 * 0.01, // CPU cost
+            left_stats.estimated_rows as f64 * 0.001, // Memory cost
+        );
+        let right_cost = CostEstimate::new(
+            right_stats.estimated_rows as f64 * 0.1,
+            right_stats.estimated_rows as f64 * 0.01,
+            right_stats.estimated_rows as f64 * 0.001,
+        );
+
+        // Calculate parallel join costs for both orders
+        let cost_current = self.cost_model.estimate_parallel_hash_join(
+            left_stats.estimated_rows,
+            right_stats.estimated_rows,
+            left_cost,
+            right_cost,
+            0.1, // join selectivity
+        );
+
+        let cost_swapped = self.cost_model.estimate_parallel_hash_join(
+            right_stats.estimated_rows,
+            left_stats.estimated_rows,
+            right_cost,
+            left_cost,
+            0.1,
+        );
+
+        // If swapped order is significantly cheaper, swap the join
+        if cost_swapped.parallel_cost.total_cost < cost_current.parallel_cost.total_cost * 0.9 {
+            return Ok(Some(PlanNode::Join {
+                left: Box::new(right.clone()),
+                right: Box::new(left.clone()),
+                condition: condition.clone(),
+                join_type,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    fn estimate_plan_statistics(&self, plan: &PlanNode) -> PlanStatistics {
+        // Simplified implementation
+        match plan {
+            PlanNode::Scan { table_name, .. } => {
+                match table_name.as_str() {
+                    "users" => PlanStatistics { estimated_rows: 50000, estimated_width: 200 },
+                    "orders" => PlanStatistics { estimated_rows: 250000, estimated_width: 300 },
+                    "products" => PlanStatistics { estimated_rows: 10000, estimated_width: 150 },
+                    _ => PlanStatistics { estimated_rows: 1000, estimated_width: 100 },
+                }
+            }
+            _ => PlanStatistics { estimated_rows: 1000, estimated_width: 100 },
+        }
+    }
+}
+
+/// Parallel aggregation optimization rule
+///
+/// This rule optimizes aggregation operations for parallel execution.
+#[derive(Debug)]
+pub struct ParallelAggregationOptimizationRule {
+    cost_model: CostModel,
+}
+
+impl ParallelAggregationOptimizationRule {
+    /// Create new parallel aggregation optimization rule
+    pub fn new(cost_model: CostModel) -> Self {
+        Self { cost_model }
+    }
+}
+
+impl OptimizerRule for ParallelAggregationOptimizationRule {
+    fn apply(&self, plan: &PlanNode) -> Result<PlanNode> {
+        match plan {
+            PlanNode::Aggregate { input, group_by_columns, aggregate_functions, having_clause } => {
+                // First apply to input and keep regular aggregation
+                let optimized_input = self.apply(input.as_ref())?;
+                let optimized_plan = PlanNode::Aggregate {
+                    input: Box::new(optimized_input),
+                    group_by_columns: group_by_columns.clone(),
+                    aggregate_functions: aggregate_functions.clone(),
+                    having_clause: having_clause.clone(),
+                };
+
+                // Check if this aggregation can benefit from parallel execution
+                if self.can_benefit_from_parallel_aggregation(&*input, &group_by_columns, &aggregate_functions) {
+                    let input_stats = self.estimate_input_statistics(&*input)?;
+                    let group_count = self.estimate_group_count(&input_stats, &group_by_columns);
+
+                    // Create input cost estimate
+                    let input_cost = CostEstimate::new(
+                        input_stats.estimated_rows as f64 * 0.1, // IO cost
+                        input_stats.estimated_rows as f64 * 0.01, // CPU cost
+                        input_stats.estimated_rows as f64 * 0.001, // Memory cost
+                    );
+
+                    let parallel_cost = self.cost_model.estimate_parallel_aggregation(
+                        input_cost,
+                        input_stats.estimated_rows,
+                        group_count,
+                        aggregate_functions.len(),
+                    );
+
+                    if self.cost_model.should_use_parallel(&parallel_cost) {
+                        // Create parallel aggregate node - would need to extend PlanNode enum
+                        // For now, return the original plan since we can't create parallel nodes yet
+                        Ok(optimized_plan)
+                    } else {
+                        Ok(optimized_plan)
+                    }
+                } else {
+                    Ok(optimized_plan)
+                }
+            }
+            _ => self.apply_to_children(plan),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "ParallelAggregationOptimization"
+    }
+
+    fn is_applicable(&self, plan: &PlanNode) -> bool {
+        matches!(plan, PlanNode::Aggregate { .. })
+    }
+}
+
+impl ParallelAggregationOptimizationRule {
+    fn apply_to_children(&self, plan: &PlanNode) -> Result<PlanNode> {
+        match plan {
+            PlanNode::Filter { input, condition } => {
+                let optimized_input = self.apply(input.as_ref())?;
+                Ok(PlanNode::Filter {
+                    input: Box::new(optimized_input),
+                    condition: condition.clone(),
+                })
+            }
+            PlanNode::Join { left, right, condition, join_type } => {
+                let optimized_left = self.apply(left.as_ref())?;
+                let optimized_right = self.apply(right.as_ref())?;
+                Ok(PlanNode::Join {
+                    left: Box::new(optimized_left),
+                    right: Box::new(optimized_right),
+                    condition: condition.clone(),
+                    join_type: join_type.clone(),
+                })
+            }
+            _ => Ok(plan.clone()),
+        }
+    }
+
+    fn can_benefit_from_parallel_aggregation(
+        &self,
+        input: &PlanNode,
+        group_by_columns: &[Expression],
+        aggregate_functions: &[(String, Expression)],
+    ) -> bool {
+        // Parallel aggregation is beneficial when:
+        // 1. Input has many rows
+        // 2. There are aggregation functions
+        // 3. Either many groups or few expensive aggregations
+
+        let input_stats = self.estimate_input_statistics(input).unwrap_or_default();
+        let has_many_rows = input_stats.estimated_rows > 10000;
+        let has_aggregations = !aggregate_functions.is_empty();
+        let has_many_groups = group_by_columns.len() > 2 || self.estimate_group_count(&input_stats, group_by_columns) > 1000;
+        let has_expensive_aggregations = aggregate_functions.iter().any(|(name, _expr)| {
+            matches!(name.to_lowercase().as_str(), "avg" | "sum" | "stddev" | "variance" | "count")
+        });
+
+        has_many_rows && has_aggregations && (has_many_groups || has_expensive_aggregations)
+    }
+
+    fn estimate_input_statistics(&self, input: &PlanNode) -> Result<PlanStatistics> {
+        // Simplified implementation
+        match input {
+            PlanNode::Scan { table_name, .. } => {
+                match table_name.as_str() {
+                    "users" => Ok(PlanStatistics { estimated_rows: 50000, estimated_width: 200 }),
+                    "orders" => Ok(PlanStatistics { estimated_rows: 250000, estimated_width: 300 }),
+                    "products" => Ok(PlanStatistics { estimated_rows: 10000, estimated_width: 150 }),
+                    _ => Ok(PlanStatistics { estimated_rows: 1000, estimated_width: 100 }),
+                }
+            }
+            PlanNode::Filter { input, .. } => {
+                let input_stats = self.estimate_input_statistics(input.as_ref())?;
+                Ok(PlanStatistics {
+                    estimated_rows: input_stats.estimated_rows / 2,
+                    estimated_width: input_stats.estimated_width,
+                })
+            }
+            _ => Ok(PlanStatistics { estimated_rows: 1000, estimated_width: 100 }),
+        }
+    }
+
+    fn estimate_group_count(&self, input_stats: &PlanStatistics, group_by_columns: &[Expression]) -> usize {
+        // Simplified heuristic: estimate 10% of rows as unique groups
+        // In real implementation would use statistics on columns
+        (input_stats.estimated_rows as f64 * 0.1) as usize
+    }
+}
+
+/// Supporting types for parallel optimization rules
+
+#[derive(Debug, Clone, Default)]
+struct TableStatistics {
+    name: String,
+    row_count: usize,
+    page_count: usize,
+    avg_row_size: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PlanStatistics {
+    estimated_rows: usize,
+    estimated_width: usize,
 }

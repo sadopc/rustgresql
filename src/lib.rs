@@ -23,6 +23,9 @@ pub use catalog::{CatalogManager, TableDef, ColumnDef, IndexDef, get_catalog};
 pub use types::{DataType, DataTypeKind, Value, ValueKind};
 pub use optimizer::{CostModel, StatisticsManager, IndexSelector, OptimizedQueryPlanner as QueryOptimizer};
 
+#[cfg(feature = "parallel")]
+pub use executor::parallel::{ParallelExecutor, ParallelExecutorConfig, ParallelExecutionResult};
+
 // Type aliases for convenience
 pub type PageId = u64;
 pub type TransactionId = u64;
