@@ -2,27 +2,32 @@
 
 ## Overview
 
-RustgreSQL is a PostgreSQL-like relational database implemented in Rust. It provides basic SQL functionality with ACID compliance through MVCC (Multi-Version Concurrency Control) and WAL (Write-Ahead Logging).
+RustgreSQL is a PostgreSQL-like relational database implemented in Rust. It provides comprehensive SQL functionality with ACID compliance through MVCC (Multi-Version Concurrency Control) and WAL (Write-Ahead Logging).
 
 **Version**: 0.1.0
-**Status**: Educational/Development Implementation
+**Status**: Phase 1.1 - Query Execution Engine (Educational/Development Implementation)
 
 ## Features
 
 ### ✅ Currently Implemented
-- **Storage Engine**: B-Tree based storage with buffer pool management
-- **Transaction Management**: ACID transactions with MVCC
-- **Write-Ahead Logging (WAL)**: Durability and crash recovery
-- **Data Types**: Comprehensive PostgreSQL-compatible data types
-- **SQL Parsing**: Basic SQL statement parsing
-- **Catalog Management**: System tables for metadata storage
-- **File Management**: Persistent database file storage
+- **Storage Engine**: B-Tree based storage with buffer pool management and schema evolution
+- **Transaction Management**: ACID transactions with MVCC and comprehensive isolation levels
+- **Write-Ahead Logging (WAL)**: Durability and crash recovery with DDL transaction support
+- **Data Types**: Comprehensive PostgreSQL-compatible data types with type conversion
+- **SQL Execution Engine**: Complete SELECT, INSERT, UPDATE, DELETE execution with expression evaluation
+- **Query Optimization**: Cost-based optimization with statistics, index selection, and plan caching
+- **Advanced SQL Features**: CTEs (Common Table Expressions), Views, Stored Procedures, Window Functions
+- **Catalog Management**: System tables for metadata storage with schema and view management
+- **Index Management**: B-Tree indexing with primary key and unique constraint support
+- **Parallel Execution**: Optional parallel query execution engine
+- **File Management**: Persistent database file storage with schema evolution support
 
 ### 🚧 In Development
-- SQL execution engine
-- Query optimization
-- Index management
-- Full SQL standard compliance
+- PostgreSQL wire protocol for external client connections
+- Authentication and authorization system
+- Advanced query optimization (join ordering, advanced statistics)
+- Full SQL standard compliance (advanced features)
+- Network interface and connection pooling
 
 ## Installation & Setup
 
@@ -64,18 +69,50 @@ cargo run my_database.db
 When you start RustgreSQL, you'll enter the interactive REPL (Read-Eval-Print Loop):
 
 ```
-RustgreSQL v0.1.0
-Type 'help' for commands or 'exit' to quit.
+RustgreSQL v0.1.0 - Phase 1.1 Query Execution Engine
+Type 'help' for commands, SQL queries, or 'exit' to quit.
 rustgresql>
 ```
 
-### 3. Available Commands
+### 3. Your First SQL Commands
 
-Currently supported commands:
+Try these SQL commands in the interactive prompt:
 
-- `help` - Show available commands
+```sql
+-- Create a table
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    email VARCHAR(255) UNIQUE,
+    age INTEGER
+);
+
+-- Insert some data
+INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'alice@example.com', 30);
+INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'bob@example.com', 25);
+
+-- Query the data
+SELECT * FROM users;
+
+-- Query with conditions
+SELECT name, age FROM users WHERE age > 26;
+
+-- Update data
+UPDATE users SET age = 31 WHERE name = 'Alice';
+
+-- Delete data
+DELETE FROM users WHERE age < 26;
+```
+
+### 4. Available Commands
+
+Supported commands:
+
+- `help` - Show available commands and SQL features
 - `status` - Display database status information
+- `examples` - Show SQL usage examples
 - `exit` or `quit` - Exit the database
+- **SQL Statements**: Full SQL execution support (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, etc.)
 
 ## Configuration
 
@@ -110,31 +147,51 @@ let config = Config {
 ### Core Components
 
 1. **Storage Layer** (`src/storage/`)
-   - `BufferPoolManager`: Manages in-memory page caching
-   - `FileManager`: Handles disk I/O operations
-   - `BTree`: B-Tree implementation for indexing
-   - `Page`: Database page structure and management
+    - `BufferPoolManager`: Manages in-memory page caching
+    - `FileManager`: Handles disk I/O operations
+    - `BTree`: B-Tree implementation for indexing
+    - `Page`: Database page structure and management
+    - `SchemaEvolutionManager`: Handles schema changes and migrations
 
 2. **Transaction System** (`src/transaction/`)
-   - `TransactionManager`: Coordinates transactions
-   - `WALManager`: Write-ahead logging for durability
-   - `MVCCManager`: Multi-version concurrency control
-   - `LockManager`: Row-level locking
+    - `TransactionManager`: Coordinates transactions
+    - `WALManager`: Write-ahead logging for durability
+    - `MVCCManager`: Multi-version concurrency control
+    - `LockManager`: Row-level locking
+    - `DdlTransactionManager`: DDL transaction support
+    - `DdlWALManager`: DDL-specific WAL operations
 
 3. **SQL Engine** (`src/sql/`, `src/executor/`)
-   - `Parser`: SQL statement parsing
-   - `Planner`: Query execution planning
-   - `Executor`: Query execution engine
+    - `Parser`: Complete SQL statement parsing (SELECT, INSERT, UPDATE, DELETE, DDL)
+    - `Planner`: Query execution planning with optimization
+    - `Executor`: Query execution engine with operators
+    - `ExpressionEvaluator`: SQL expression evaluation with three-valued logic
+    - `QueryRewriter`: Query rewriting and view expansion
+    - `ProcedureExecutor`: Stored procedure execution
 
-4. **Catalog System** (`src/catalog/`)
-   - `CatalogManager`: Metadata management
-   - `TableManager`: Table definition and management
-   - `IndexManager`: Index definition and management
+4. **Query Optimizer** (`src/optimizer/`)
+    - `CostModel`: Cost-based query optimization
+    - `StatisticsManager`: Table and column statistics
+    - `IndexSelector`: Index access path selection
+    - `PlanCache`: Query plan caching for performance
+    - `RuleEngine`: Optimization rules (pushdown, folding, etc.)
 
-5. **Type System** (`src/types/`)
-   - `DataType`: PostgreSQL-compatible data types
-   - `Value`: Runtime value representation
-   - `TypeConverter`: Type conversion utilities
+5. **Catalog System** (`src/catalog/`)
+    - `CatalogManager`: Unified metadata management
+    - `TableManager`: Table definition and management
+    - `IndexManager`: Index definition and management
+    - `SchemaManager`: Schema management
+    - `ViewManager`: View definition and management
+
+6. **Type System** (`src/types/`)
+    - `DataType`: PostgreSQL-compatible data types
+    - `Value`: Runtime value representation with NULL handling
+    - `TypeConverter`: Type conversion and casting utilities
+
+7. **Parallel Execution** (`src/executor/parallel/`) - *Optional Feature*
+    - `ParallelExecutor`: Parallel query execution
+    - `ParallelExecutorConfig`: Configuration for parallel processing
+    - `ResourceManager`: Resource management for parallel tasks
 
 ## Supported Data Types
 
@@ -165,6 +222,108 @@ let config = Config {
 
 ### Boolean Type
 - `BOOLEAN` / `BOOL` - Logical true/false values
+
+## Advanced SQL Features
+
+### Common Table Expressions (CTEs)
+
+RustgreSQL supports CTEs for complex query construction:
+
+```sql
+-- Basic CTE
+WITH user_stats AS (
+    SELECT department, COUNT(*) as user_count
+    FROM users
+    GROUP BY department
+)
+SELECT * FROM user_stats WHERE user_count > 5;
+
+-- Recursive CTE
+WITH RECURSIVE employee_hierarchy AS (
+    SELECT id, name, manager_id, 0 as level
+    FROM employees
+    WHERE manager_id IS NULL
+
+    UNION ALL
+
+    SELECT e.id, e.name, e.manager_id, eh.level + 1
+    FROM employees e
+    JOIN employee_hierarchy eh ON e.manager_id = eh.id
+)
+SELECT * FROM employee_hierarchy;
+```
+
+### Views
+
+Create virtual tables based on queries:
+
+```sql
+-- Create a view
+CREATE VIEW active_users AS
+SELECT id, name, email
+FROM users
+WHERE status = 'active';
+
+-- Query the view
+SELECT * FROM active_users;
+
+-- Materialized view (refreshed on demand)
+CREATE MATERIALIZED VIEW user_summary AS
+SELECT department, COUNT(*) as count, AVG(salary) as avg_salary
+FROM users
+GROUP BY department;
+
+-- Refresh materialized view
+REFRESH MATERIALIZED VIEW user_summary;
+```
+
+### Window Functions
+
+Advanced analytical functions:
+
+```sql
+-- ROW_NUMBER, RANK, DENSE_RANK
+SELECT name, department, salary,
+       ROW_NUMBER() OVER (ORDER BY salary DESC) as row_num,
+       RANK() OVER (ORDER BY salary DESC) as rank,
+       DENSE_RANK() OVER (ORDER BY salary DESC) as dense_rank
+FROM employees;
+
+-- Running totals and moving averages
+SELECT date, sales,
+       SUM(sales) OVER (ORDER BY date) as running_total,
+       AVG(sales) OVER (ORDER BY date ROWS 2 PRECEDING) as moving_avg
+FROM daily_sales;
+```
+
+### Stored Procedures and Functions
+
+```sql
+-- Create a stored procedure
+CREATE PROCEDURE update_user_status(user_id INT, new_status VARCHAR(50))
+AS $$
+BEGIN
+    UPDATE users SET status = new_status, updated_at = CURRENT_TIMESTAMP
+    WHERE id = user_id;
+END;
+$$;
+
+-- Call the procedure
+CALL update_user_status(123, 'inactive');
+
+-- Create a function
+CREATE FUNCTION calculate_bonus(salary NUMERIC, performance_score INT)
+RETURNS NUMERIC
+AS $$
+BEGIN
+    RETURN salary * (performance_score / 100.0);
+END;
+$$;
+
+-- Use the function
+SELECT name, salary, calculate_bonus(salary, performance_score) as bonus
+FROM employees;
+```
 
 ## DDL Statements (Data Definition Language)
 
@@ -411,36 +570,51 @@ ROLLBACK;
 
 ## Development Status
 
+### Current Capabilities
+
+✅ **Phase 1.1 - Query Execution Engine COMPLETED**
+- Full SQL statement execution (SELECT, INSERT, UPDATE, DELETE)
+- Comprehensive expression evaluation with three-valued logic
+- NULL value handling and type casting
+- DDL operations (CREATE/DROP TABLE, INDEX, VIEW)
+- CTEs (Common Table Expressions) and subqueries
+- Window functions and aggregate operations
+- Stored procedures and functions
+- Cost-based query optimization
+- Index selection and plan caching
+- Parallel query execution (optional feature)
+
 ### Current Limitations
 
-1. **SQL Execution**: Basic parsing only, no execution yet
-2. **Query Optimization**: No optimization phase
-3. **Indexes**: B-Tree structure exists but not fully integrated
-4. **SQL Standards**: Limited SQL compliance
-5. **Network Interface**: No client/server protocol yet
-6. **Authentication**: No user management system
+1. **Network Interface**: No PostgreSQL wire protocol yet (CLI-only access)
+2. **Authentication**: No user management or authorization system
+3. **Advanced Optimization**: Some optimization rules still developing
+4. **Production Features**: Monitoring, backup/restore utilities pending
 
 ### Roadmap
 
-#### Phase 1: Core SQL Execution
-- [ ] INSERT statement execution
-- [ ] SELECT statement execution
-- [ ] UPDATE statement execution
-- [ ] DELETE statement execution
-- [ ] Basic WHERE clause support
+#### ✅ Phase 1: Core SQL Execution - **COMPLETED**
+- [x] INSERT, UPDATE, DELETE statement execution
+- [x] SELECT with WHERE, JOIN, GROUP BY, HAVING
+- [x] Expression evaluation and type conversion
+- [x] DDL operations (tables, indexes, views)
+- [x] CTEs and subqueries
+- [x] Window functions and aggregates
 
-#### Phase 2: Advanced SQL Features
-- [ ] JOIN operations
-- [ ] Aggregate functions
-- [ ] GROUP BY and HAVING
-- [ ] Subqueries
-- [ ] Views
+#### 🚧 Phase 2: Advanced SQL Features - **IN PROGRESS**
+- [x] Views and materialized views
+- [x] Stored procedures and functions
+- [ ] Advanced JOIN types and optimization
+- [ ] Full subquery support in all contexts
+- [ ] Advanced window functions
 
-#### Phase 3: Performance & Scalability
-- [ ] Query optimization
-- [ ] Index management
-- [ ] Parallel query execution
+#### 📋 Phase 3: Performance & Scalability
+- [x] Query optimization framework
+- [x] Index management and selection
+- [x] Parallel query execution
+- [ ] Advanced statistics and cost modeling
 - [ ] Connection pooling
+- [ ] Memory management optimization
 
 #### Phase 4: Production Features
 - [ ] Network protocol implementation
@@ -453,7 +627,7 @@ ROLLBACK;
 ### Basic Database Operations
 
 ```rust
-use rustgresql::{Database, Config};
+use rustgresql::{Database, Config, sql::parse_sql, executor::ExecutionEngine};
 
 fn main() -> rustgresql::Result<()> {
     // Create configuration
@@ -463,12 +637,35 @@ fn main() -> rustgresql::Result<()> {
     let db = Database::new(config)?;
     db.initialize()?;
 
-    // Begin transaction
-    let tx = db.begin_transaction()?;
+    // Initialize execution engine
+    let execution_engine = ExecutionEngine::new();
 
-    // Use transaction...
+    // Execute SQL directly
+    let statements = parse_sql("SELECT * FROM users WHERE age > 21;")?;
+    for statement in statements {
+        let (result, stats) = execution_engine.execute_query(&statement)?;
+        println!("Query executed in {}ms", stats.execution_time_ms);
+    }
 
     Ok(())
+}
+```
+
+### Advanced Features
+
+```rust
+use rustgresql::optimizer::OptimizedQueryPlanner;
+
+// Use the query optimizer
+let planner = OptimizedQueryPlanner::new();
+let optimized_plan = planner.optimize_query(&parsed_query)?;
+
+// Parallel execution (if feature enabled)
+#[cfg(feature = "parallel")]
+{
+    use rustgresql::executor::parallel::ParallelExecutor;
+    let parallel_executor = ParallelExecutor::new(config);
+    let result = parallel_executor.execute_parallel(plan)?;
 }
 ```
 
@@ -504,8 +701,11 @@ cargo test -- --nocapture
 ### Benchmarking
 
 ```bash
-# Run benchmarks (when implemented)
+# Run benchmarks
 cargo bench
+
+# Run specific benchmark
+cargo bench btree_bench
 ```
 
 ## Contributing

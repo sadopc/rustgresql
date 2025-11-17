@@ -645,9 +645,56 @@ impl InsertOperator {
 
     /// Map column values to match table schema
     fn map_columns_to_values(&self, row_values: &[Value]) -> Result<Vec<Value>> {
-        // For now, assume the values are already in the correct order
-        // In a real implementation, this would map based on column names
-        Ok(row_values.to_vec())
+        if let Some(ref scanner) = self.scanner {
+            let table_def = scanner.get_table_def();
+
+            // If no columns specified, INSERT should provide values for all columns in order
+            if self.columns.is_empty() {
+                if row_values.len() != table_def.columns.len() {
+                    return Err(crate::error::RustgreSQLError::Type(format!(
+                        "Column count mismatch: expected {} values for all columns, got {}",
+                        table_def.columns.len(),
+                        row_values.len()
+                    )));
+                }
+                return Ok(row_values.to_vec());
+            }
+
+            // Build a complete row with all table columns
+            let mut complete_row = Vec::new();
+
+            for table_col in &table_def.columns {
+                // Find the value for this column
+                let value = if let Some(insert_col_index) = self.columns.iter().position(|c| c == &table_col.name) {
+                    // Column was specified in INSERT - use the provided value
+                    if insert_col_index < row_values.len() {
+                        row_values[insert_col_index].clone()
+                    } else {
+                        return Err(crate::error::RustgreSQLError::Type(format!(
+                            "Value missing for column '{}'", table_col.name
+                        )));
+                    }
+                } else {
+                    // Column was NOT specified in INSERT - use DEFAULT or NULL
+                    if let Some(ref default_val) = table_col.default_value {
+                        default_val.clone()
+                    } else if table_col.nullable {
+                        Value { kind: ValueKind::Null(crate::types::NullValue) }
+                    } else {
+                        return Err(crate::error::RustgreSQLError::Type(format!(
+                            "Column '{}' requires a value (NOT NULL without DEFAULT)", table_col.name
+                        )));
+                    }
+                };
+
+                complete_row.push(value);
+            }
+
+            Ok(complete_row)
+        } else {
+            // Fallback: no scanner available, pass through as-is
+            Ok(row_values.to_vec())
+        }
     }
 
     /// Insert row data into storage
