@@ -5,11 +5,13 @@
 pub mod table;
 pub mod schema;
 pub mod index;
+pub mod view;
 pub mod constraint_mapping;
 
 pub use table::{TableDef, ColumnDef, TableConstraint, SystemTable, SystemTableManager};
 pub use schema::{SchemaDef, SchemaManager};
 pub use index::{IndexType, IndexDef, IndexInfo, IndexStats, IndexManager};
+pub use view::{ViewDef, ViewManager, ViewStats, RefreshType, DependencyType, DataType as ViewDataType};
 pub use constraint_mapping::*;
 
 use crate::Result;
@@ -21,6 +23,7 @@ pub struct CatalogManager {
     pub table_manager: Arc<SystemTableManager>,
     pub schema_manager: Arc<SchemaManager>,
     pub index_manager: Arc<IndexManager>,
+    pub view_manager: Arc<ViewManager>,
 }
 
 impl CatalogManager {
@@ -30,6 +33,7 @@ impl CatalogManager {
             table_manager: Arc::new(SystemTableManager::new()),
             schema_manager: Arc::new(SchemaManager::new()),
             index_manager: Arc::new(IndexManager::new()),
+            view_manager: Arc::new(ViewManager::new()),
         }
     }
 
@@ -37,6 +41,10 @@ impl CatalogManager {
     pub fn initialize(&self) -> Result<()> {
         // Create system tables in the catalog if they don't exist
         // This is already handled by the individual managers during initialization
+
+        // Initialize view manager
+        self.view_manager.initialize()?;
+
         Ok(())
     }
 
@@ -157,11 +165,13 @@ impl CatalogManager {
         let table_count = self.table_manager.list_tables()?.len();
         let schema_count = self.schema_manager.list_schemas()?.len();
         let index_count = self.index_manager.list_indexes()?.len();
+        let view_count = self.view_manager.list_views()?.len();
 
         Ok(CatalogStats {
             table_count,
             schema_count,
             index_count,
+            view_count,
         })
     }
 
@@ -185,6 +195,71 @@ pub struct CatalogStats {
     pub table_count: usize,
     pub schema_count: usize,
     pub index_count: usize,
+    pub view_count: usize,
+}
+
+impl CatalogManager {
+    /// Create a view
+    pub fn create_view(
+        &self,
+        name: &str,
+        schema_name: &str,
+        columns: Vec<(String, crate::catalog::view::DataType)>,
+        query: String,
+        materialized: bool,
+    ) -> Result<u64> {
+        // Resolve schema
+        let schema_def = self.schema_manager.get_schema(schema_name)?;
+        if schema_def.is_none() {
+            return Err(crate::error::RustgreSQLError::NotFound(format!("Schema '{}' not found", schema_name)));
+        }
+
+        let schema_id = schema_def.unwrap().schema_id;
+
+        // Create the view
+        self.view_manager.create_view(name, schema_id, columns, query, materialized)
+    }
+
+    /// Drop a view
+    pub fn drop_view(&self, name: &str, cascade: bool) -> Result<()> {
+        self.view_manager.drop_view(name, cascade)
+    }
+
+    /// Get view definition
+    pub fn get_view(&self, name: &str) -> Result<Option<ViewDef>> {
+        self.view_manager.get_view(name)
+    }
+
+    /// List all views
+    pub fn list_views(&self) -> Result<Vec<ViewDef>> {
+        self.view_manager.list_views()
+    }
+
+    /// List views in a specific schema
+    pub fn list_views_in_schema(&self, schema_name: &str) -> Result<Vec<ViewDef>> {
+        let schema_def = self.schema_manager.get_schema(schema_name)?;
+        if schema_def.is_none() {
+            return Err(crate::error::RustgreSQLError::NotFound(format!("Schema '{}' not found", schema_name)));
+        }
+
+        let schema_id = schema_def.unwrap().schema_id;
+        self.view_manager.list_views_in_schema(schema_id)
+    }
+
+    /// Refresh a materialized view
+    pub fn refresh_materialized_view(&self, name: &str, with_data: bool) -> Result<()> {
+        self.view_manager.refresh_materialized_view(name, with_data)
+    }
+
+    /// Check if a view exists
+    pub fn view_exists(&self, name: &str) -> bool {
+        self.view_manager.view_exists(name)
+    }
+
+    /// Get views that depend on a specific table
+    pub fn get_dependent_views(&self, table_name: &str) -> Result<Vec<ViewDef>> {
+        self.view_manager.get_dependent_views(table_name)
+    }
 }
 
 /// Global catalog instance

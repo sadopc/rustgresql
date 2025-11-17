@@ -55,7 +55,7 @@ impl OptimizedQueryPlanner {
     /// Create optimized execution plan for SELECT statement
     pub fn plan_select(&self, select: &SelectStatement, table_indexes: &[(String, Vec<IndexDef>)]) -> Result<ExecutionPlan> {
         match select {
-            SelectStatement::Simple { from, joins, where_clause, columns, group_by, having, .. } => {
+            SelectStatement::Simple { with_clause: _, from, joins, where_clause, columns, group_by, having, .. } => {
                 // Extract required columns for the query
                 let required_columns = self.extract_required_columns(select);
 
@@ -641,6 +641,7 @@ mod tests {
         let planner = OptimizedQueryPlanner::new();
 
         let select = SelectStatement::Simple {
+            with_clause: None,
             distinct: false,
             columns: vec![
                 Expression::Column { name: "id".to_string(), table: Some("users".to_string()) },
@@ -657,6 +658,7 @@ mod tests {
             order_by: Vec::new(),
             limit: None,
             offset: None,
+            named_windows: Vec::new(),
         };
 
         let required_columns = planner.extract_required_columns(&select);

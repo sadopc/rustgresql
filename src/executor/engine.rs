@@ -2,9 +2,11 @@
 //!
 //! Coordinates query execution and manages executor state
 
-use crate::{Result, sql::{Statement, SelectStatement, InsertStatement, UpdateStatement, DeleteStatement, CreateTableStatement}, sql::ast::{CreateIndexStatement, DropTableStatement, DropIndexStatement, AlterTableStatement}, executor::planner::{QueryPlanner, PlanNode}, executor::operators::{QueryResult, ExecutionContext}};
+use crate::{Result, sql::{Statement, SelectStatement, InsertStatement, UpdateStatement, DeleteStatement, CreateTableStatement}, sql::ast::{CreateIndexStatement, DropTableStatement, DropIndexStatement, AlterTableStatement, CreateViewStatement, DropViewStatement, RefreshMaterializedViewStatement, CreateProcedureStatement, CreateFunctionStatement, DropProcedureStatement, DropFunctionStatement, CallProcedureStatement, PerformStatement}, executor::planner::{QueryPlanner, PlanNode}, executor::operators::{QueryResult, ExecutionContext}};
 use crate::executor::ddl_error::{DdlError, DdlOperation};
-use crate::types::{DataType, DataTypeKind};
+use crate::executor::query_rewrite::QueryRewriter;
+use crate::executor::procedure::ProcedureExecutor;
+use crate::types::{DataType, DataTypeKind, Value};
 use crate::catalog::{CatalogManager, get_catalog};
 use crate::transaction::ddl_transaction::{get_ddl_transaction_manager, DdlOperationType, RollbackInfo};
 use crate::transaction::ddl_wal::{get_ddl_wal_manager};
@@ -27,6 +29,8 @@ pub struct Executor {
     stats: ExecutionStats,
     catalog: std::sync::Arc<CatalogManager>,
     buffer_manager: std::sync::Arc<crate::storage::BufferPoolManager>,
+    query_rewriter: QueryRewriter,
+    procedure_executor: ProcedureExecutor,
 }
 
 impl Executor {
@@ -49,6 +53,8 @@ impl Executor {
             },
             catalog,
             buffer_manager,
+            query_rewriter: QueryRewriter::new(),
+            procedure_executor: ProcedureExecutor::new(),
         }
     }
 
@@ -77,7 +83,32 @@ impl Executor {
     pub fn execute_statement(&mut self, statement: &Statement) -> Result<QueryResult> {
         let start_time = std::time::Instant::now();
 
-        let result = match statement {
+        // Apply query rewriting for SELECT statements
+        let final_statement = if let Statement::Select(_) = statement {
+            match self.query_rewriter.rewrite_query(statement) {
+                Ok(rewrite_result) => {
+                    if rewrite_result.was_rewritten {
+                        if let Some(rewritten_query) = rewrite_result.rewritten_query {
+                            // Log the rewrite for debugging
+                            eprintln!("Query rewritten using materialized view: {:?}", rewrite_result.view_name);
+                            rewritten_query
+                        } else {
+                            statement.clone()
+                        }
+                    } else {
+                        statement.clone()
+                    }
+                }
+                Err(_) => {
+                    // If rewriting fails, continue with original query
+                    statement.clone()
+                }
+            }
+        } else {
+            statement.clone()
+        };
+
+        let result = match &final_statement {
             Statement::Select(select) => self.execute_select(select)?,
             Statement::Insert(insert) => self.execute_insert(insert)?,
             Statement::Update(update) => self.execute_update(update)?,
@@ -87,6 +118,29 @@ impl Executor {
             Statement::DropTable(drop) => self.execute_drop_table(drop)?,
             Statement::DropIndex(drop) => self.execute_drop_index(drop)?,
             Statement::AlterTable(alter) => self.execute_alter_table(alter)?,
+            Statement::CreateView(create) => self.execute_create_view(create)?,
+            Statement::DropView(drop) => self.execute_drop_view(drop)?,
+            Statement::RefreshMaterializedView(refresh) => self.execute_refresh_materialized_view(refresh)?,
+            // Stored procedure statements
+            Statement::CreateProcedure(proc) => self.execute_create_procedure(proc)?,
+            Statement::CreateFunction(func) => self.execute_create_function(func)?,
+            Statement::DropProcedure(drop) => self.execute_drop_procedure(drop)?,
+            Statement::DropFunction(drop) => self.execute_drop_function(drop)?,
+            Statement::CallProcedure(call) => self.execute_call_procedure(call)?,
+            Statement::Perform(perform) => self.execute_perform(perform)?,
+
+            // Control flow statements - these should only appear within procedures
+            Statement::Block(_) => Ok(QueryResult { rows: vec![], column_names: vec![] }),
+            Statement::Return(_) => Ok(QueryResult { rows: vec![], column_names: vec![] }),
+            Statement::IfStatement(_) => Ok(QueryResult { rows: vec![], column_names: vec![] }),
+            Statement::CaseStatement(_) => Ok(QueryResult { rows: vec![], column_names: vec![] }),
+            Statement::LoopStatement(_) => Ok(QueryResult { rows: vec![], column_names: vec![] }),
+            Statement::WhileStatement(_) => Ok(QueryResult { rows: vec![], column_names: vec![] }),
+            Statement::ForStatement(_) => Ok(QueryResult { rows: vec![], column_names: vec![] }),
+            Statement::Exit(_) => Ok(QueryResult { rows: vec![], column_names: vec![] }),
+            Statement::Continue(_) => Ok(QueryResult { rows: vec![], column_names: vec![] }),
+            Statement::Declare(_) => Ok(QueryResult { rows: vec![], column_names: vec![] }),
+            Statement::RaiseStatement(_) => Ok(QueryResult { rows: vec![], column_names: vec![] }),
         };
 
         let execution_time = start_time.elapsed().as_millis() as u64;
@@ -521,6 +575,110 @@ impl Executor {
         ddl_tx_manager.commit_transaction(transaction_id)?;
 
         self.context.log(&format!("Successfully dropped index: {}", index_name));
+
+        Ok(QueryResult {
+            rows: vec![],
+            column_names: vec![],
+        })
+    }
+
+    /// Execute CREATE VIEW statement
+    fn execute_create_view(&mut self, create: &CreateViewStatement) -> Result<QueryResult> {
+        use crate::catalog::get_catalog;
+        use crate::sql::ast::SelectStatement;
+
+        let catalog = get_catalog();
+        let view_name = &create.view_name;
+
+        self.context.log(&format!("Creating {}view: {}",
+            if create.materialized { "materialized " } else { "" },
+            view_name));
+
+        // Convert column aliases to view data types if provided
+        let view_columns = if create.columns.is_empty() {
+            // Infer column types from the query - for now use basic types
+            vec![]
+        } else {
+            create.columns.iter().map(|col| {
+                (col.clone(), crate::catalog::view::DataType::Text)
+            }).collect()
+        };
+
+        // Convert the SelectStatement to string for storage
+        let query_string = format!("{:?}", create.query);
+
+        // Create the view using the catalog manager
+        let view_id = catalog.create_view(
+            view_name,
+            "public", // Default to public schema for now
+            view_columns,
+            query_string,
+            create.materialized,
+        )?;
+
+        // Register materialized views with the query rewriter
+        if create.materialized {
+            if let Some(view_def) = catalog.view_manager.get_view(view_name)? {
+                self.register_materialized_view(view_def)?;
+                self.context.log(&format!("Registered materialized view '{}' for query rewriting", view_name));
+            }
+        }
+
+        self.context.log(&format!("Created {}view '{}' with ID {}",
+            if create.materialized { "materialized " } else { "" },
+            view_name, view_id));
+
+        Ok(QueryResult {
+            rows: vec![],
+            column_names: vec![],
+        })
+    }
+
+    /// Execute DROP VIEW statement
+    fn execute_drop_view(&mut self, drop: &DropViewStatement) -> Result<QueryResult> {
+        use crate::catalog::get_catalog;
+
+        let catalog = get_catalog();
+        let view_name = &drop.view_name;
+
+        self.context.log(&format!("Dropping {}view: {}",
+            if drop.materialized { "materialized " } else { "" },
+            view_name));
+
+        // Unregister materialized views from query rewriter before dropping
+        if drop.materialized {
+            self.unregister_materialized_view(view_name);
+            self.context.log(&format!("Unregistered materialized view '{}' from query rewriting", view_name));
+        }
+
+        // Drop the view using the catalog manager
+        catalog.drop_view(view_name, drop.cascade)?;
+
+        self.context.log(&format!("Dropped {}view '{}'",
+            if drop.materialized { "materialized " } else { "" },
+            view_name));
+
+        Ok(QueryResult {
+            rows: vec![],
+            column_names: vec![],
+        })
+    }
+
+    /// Execute REFRESH MATERIALIZED VIEW statement
+    fn execute_refresh_materialized_view(&mut self, refresh: &RefreshMaterializedViewStatement) -> Result<QueryResult> {
+        use crate::catalog::get_catalog;
+
+        let catalog = get_catalog();
+        let view_name = &refresh.view_name;
+
+        self.context.log(&format!("Refreshing materialized view: {} ({})",
+            view_name,
+            if refresh.concurrently { "concurrently" } else { "standardly" }));
+
+        // Refresh the materialized view using the catalog manager
+        catalog.refresh_materialized_view(view_name, refresh.with_data)?;
+
+        self.context.log(&format!("Refreshed materialized view '{}'", view_name));
 
         Ok(QueryResult {
             rows: vec![],
@@ -1890,6 +2048,157 @@ impl Executor {
         }
 
         Ok(table_schema)
+    }
+
+    /// Register a materialized view for query rewriting
+    pub fn register_materialized_view(&mut self, view: crate::catalog::view::ViewDef) -> Result<()> {
+        self.query_rewriter.register_materialized_view(view)
+    }
+
+    /// Unregister a materialized view from query rewriting
+    pub fn unregister_materialized_view(&mut self, view_name: &str) {
+        self.query_rewriter.unregister_materialized_view(view_name);
+    }
+
+    /// Get query rewriter statistics
+    pub fn get_rewriter_stats(&self) -> crate::executor::query_rewrite::RewriterStats {
+        self.query_rewriter.get_stats()
+    }
+
+    /// Initialize query rewriter with existing materialized views from catalog
+    pub fn initialize_query_rewriter(&mut self) -> Result<()> {
+        let materialized_views = self.catalog.view_manager.list_materialized_views()?;
+
+        for view in materialized_views {
+            self.register_materialized_view(view)?;
+        }
+
+        Ok(())
+    }
+
+    // ===== STORED PROCEDURE EXECUTION METHODS =====
+
+    /// Execute CREATE PROCEDURE statement
+    fn execute_create_procedure(&mut self, proc: &CreateProcedureStatement) -> Result<QueryResult> {
+        self.context.log(&format!("Creating procedure: {}", proc.procedure_name));
+
+        // Register the procedure with the procedure executor
+        self.procedure_executor.register_procedure(proc.clone())?;
+
+        // TODO: Store procedure in catalog for persistence
+        // For now, just keep it in memory
+
+        self.context.log(&format!("Procedure '{}' created successfully", proc.procedure_name));
+
+        Ok(QueryResult {
+            rows: vec![vec![Value::string(format!("Procedure '{}' created", proc.procedure_name))]],
+            column_names: vec!["result".to_string()],
+        })
+    }
+
+    /// Execute CREATE FUNCTION statement
+    fn execute_create_function(&mut self, func: &CreateFunctionStatement) -> Result<QueryResult> {
+        self.context.log(&format!("Creating function: {}", func.function_name));
+
+        // Register the function with the procedure executor
+        self.procedure_executor.register_function(func.clone())?;
+
+        // TODO: Store function in catalog for persistence
+        // For now, just keep it in memory
+
+        self.context.log(&format!("Function '{}' created successfully", func.function_name));
+
+        Ok(QueryResult {
+            rows: vec![vec![Value::string(format!("Function '{}' created", func.function_name))]],
+            column_names: vec!["result".to_string()],
+        })
+    }
+
+    /// Execute DROP PROCEDURE statement
+    fn execute_drop_procedure(&mut self, drop: &DropProcedureStatement) -> Result<QueryResult> {
+        self.context.log(&format!("Dropping procedure: {}", drop.procedure_name));
+
+        // TODO: Remove procedure from catalog
+        // For now, we can't easily remove from the in-memory procedure executor
+        // without modifying it to support removal
+
+        if drop.if_exists {
+            self.context.log(&format!("Procedure '{}' does not exist, ignoring", drop.procedure_name));
+        } else {
+            return Err(crate::error::RustgreSQLError::Procedure(format!("Procedure '{}' does not exist", drop.procedure_name)));
+        }
+
+        Ok(QueryResult {
+            rows: vec![vec![Value::string(format!("Procedure '{}' dropped", drop.procedure_name))]],
+            column_names: vec!["result".to_string()],
+        })
+    }
+
+    /// Execute DROP FUNCTION statement
+    fn execute_drop_function(&mut self, drop: &DropFunctionStatement) -> Result<QueryResult> {
+        self.context.log(&format!("Dropping function: {}", drop.function_name));
+
+        // TODO: Remove function from catalog
+        // For now, we can't easily remove from the in-memory procedure executor
+        // without modifying it to support removal
+
+        if drop.if_exists {
+            self.context.log(&format!("Function '{}' does not exist, ignoring", drop.function_name));
+        } else {
+            return Err(crate::error::RustgreSQLError::Procedure(format!("Function '{}' does not exist", drop.function_name)));
+        }
+
+        Ok(QueryResult {
+            rows: vec![vec![Value::string(format!("Function '{}' dropped", drop.function_name))]],
+            column_names: vec!["result".to_string()],
+        })
+    }
+
+    /// Execute CALL PROCEDURE statement
+    fn execute_call_procedure(&mut self, call: &CallProcedureStatement) -> Result<QueryResult> {
+        self.context.log(&format!("Calling procedure: {}", call.procedure_name));
+
+        // Evaluate arguments
+        let mut args = Vec::new();
+        for arg in &call.arguments {
+            let value = self.evaluate_expression_to_value(arg)?;
+            args.push(value);
+        }
+
+        // Execute the procedure
+        let result = self.procedure_executor.execute_procedure(
+            &call.procedure_name,
+            args,
+            &mut self.context
+        )?;
+
+        self.context.log(&format!("Procedure '{}' executed successfully", call.procedure_name));
+
+        Ok(result)
+    }
+
+    /// Execute PERFORM statement
+    fn execute_perform(&mut self, perform: &PerformStatement) -> Result<QueryResult> {
+        self.context.log("Executing PERFORM statement");
+
+        // Evaluate the expression and discard the result
+        let _value = self.evaluate_expression_to_value(&perform.expression)?;
+
+        self.context.log("PERFORM statement executed successfully");
+
+        Ok(QueryResult {
+            rows: vec![],
+            column_names: vec![],
+        })
+    }
+
+    /// Evaluate an expression to a Value (helper method for procedure execution)
+    fn evaluate_expression_to_value(&mut self, expr: &crate::sql::ast::Expression) -> Result<Value> {
+        use crate::executor::{ExpressionEvaluator, EvaluationContext};
+
+        let eval_context = EvaluationContext::new();
+        let evaluator = ExpressionEvaluator::new();
+        evaluator.evaluate_expression(expr, &eval_context, &mut self.context)
     }
 }
 

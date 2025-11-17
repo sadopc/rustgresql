@@ -47,6 +47,7 @@ impl Parser {
     /// Parse a single statement
     fn parse_statement(&mut self) -> Result<Statement> {
         match self.peek().token_type {
+            TokenType::With => self.parse_with_select(),
             TokenType::Select => self.parse_select(),
             TokenType::Insert => self.parse_insert(),
             TokenType::Update => self.parse_update(),
@@ -54,11 +55,113 @@ impl Parser {
             TokenType::Create => self.parse_create(),
             TokenType::Drop => self.parse_drop(),
             TokenType::Alter => self.parse_alter(),
+            TokenType::Refresh => self.parse_refresh_materialized_view(),
+            TokenType::Call => self.parse_call_procedure(),
+            TokenType::Perform => self.parse_perform_statement(),
             _ => Err(RustgreSQLError::Parse(
                 format!("Unexpected token '{}' at line {}, column {}",
                        self.peek().value, self.peek().line, self.peek().column)
             ))
         }
+    }
+
+    /// Parse WITH clause followed by SELECT
+    fn parse_with_select(&mut self) -> Result<Statement> {
+        self.consume_token(TokenType::With, "Expected WITH")?;
+
+        // Check for RECURSIVE keyword
+        let recursive = self.match_token(TokenType::Recursive);
+
+        // Parse CTE list
+        let mut ctes = Vec::new();
+        ctes.push(self.parse_cte()?);
+
+        while self.match_token(TokenType::Comma) {
+            ctes.push(self.parse_cte()?);
+        }
+
+        // Parse the main SELECT statement
+        let main_select = match self.peek().token_type {
+            TokenType::Select => self.parse_select()?,
+            _ => return Err(RustgreSQLError::Parse(
+                format!("Expected SELECT after WITH clause at line {}, column {}",
+                       self.peek().line, self.peek().column)
+            ))
+        };
+
+        // Extract the SelectStatement from the Statement and add the WITH clause
+        if let Statement::Select(mut select_statement) = main_select {
+            let with_clause_data = WithClause {
+                ctes,
+                recursive,
+            };
+
+            // Insert the WITH clause into the SelectStatement
+            match &mut select_statement {
+                SelectStatement::Simple { with_clause, .. } => {
+                    *with_clause = Some(with_clause_data);
+                }
+                SelectStatement::SetOperation(_) => {
+                    return Err(RustgreSQLError::Parse(
+                        "WITH clause not supported with set operations yet".to_string()
+                    ));
+                }
+            }
+
+            Ok(Statement::Select(select_statement))
+        } else {
+            Err(RustgreSQLError::Parse(
+                "Expected SELECT statement after WITH clause".to_string()
+            ))
+        }
+    }
+
+    /// Parse a single Common Table Expression
+    fn parse_cte(&mut self) -> Result<CommonTableExpression> {
+        // Parse CTE name
+        let name = self.consume_identifier()?;
+
+        // Parse optional column list
+        let column_names = if self.match_token(TokenType::LeftParen) {
+            let mut columns = Vec::new();
+            columns.push(self.consume_identifier()?);
+            while self.match_token(TokenType::Comma) {
+                columns.push(self.consume_identifier()?);
+            }
+            self.consume_token(TokenType::RightParen, "Expected ')' after CTE column list")?;
+            Some(columns)
+        } else {
+            None
+        };
+
+        self.consume_token(TokenType::As, "Expected AS after CTE name")?;
+        self.consume_token(TokenType::LeftParen, "Expected '(' before CTE query")?;
+
+        // Parse the CTE query (must be a SELECT statement)
+        let query = match self.peek().token_type {
+            TokenType::Select | TokenType::With => {
+                let stmt = self.parse_statement()?;
+                match stmt {
+                    Statement::Select(select) => select,
+                    _ => return Err(RustgreSQLError::Parse(
+                        "CTE must contain a SELECT statement".to_string()
+                    ))
+                }
+            }
+            _ => return Err(RustgreSQLError::Parse(
+                format!("Expected SELECT or WITH in CTE at line {}, column {}",
+                       self.peek().line, self.peek().column)
+            ))
+        };
+
+        self.consume_token(TokenType::RightParen, "Expected ')' after CTE query")?;
+
+        Ok(CommonTableExpression {
+            name,
+            column_names,
+            query: Box::new(query),
+            recursive: false, // Will be set to true if this is part of a recursive WITH
+        })
     }
 
     /// Parse SELECT statement (consumes SELECT token)
@@ -150,6 +253,7 @@ impl Parser {
 
         // Parse set operations (UNION, INTERSECT, EXCEPT) after the first SELECT
           let select_statement = self.parse_set_operations(SelectStatement::Simple {
+                with_clause: None,
                 distinct,
                 columns,
                 from,
@@ -160,6 +264,7 @@ impl Parser {
                 order_by,
                 limit,
                 offset,
+                named_windows: Vec::new(),
             })?;
 
         Ok(Statement::Select(select_statement))
@@ -283,7 +388,18 @@ impl Parser {
             None
         };
 
+        // Parse WINDOW clause
+        let mut named_windows = Vec::new();
+        if self.match_token(TokenType::Window) {
+            // Parse first named window
+            named_windows.push(self.parse_named_window()?);
+            while self.match_token(TokenType::Comma) {
+                named_windows.push(self.parse_named_window()?);
+            }
+        }
+
         Ok(SelectStatement::Simple {
+            with_clause: None, // Will be filled by parse_with_select if needed
             distinct,
             columns,
             from,
@@ -294,6 +410,7 @@ impl Parser {
             order_by,
             limit,
             offset,
+            named_windows,
         })
     }
 
@@ -396,8 +513,12 @@ impl Parser {
         match self.peek().token_type {
             TokenType::Table => self.parse_create_table(),
             TokenType::Index => self.parse_create_index(),
+            TokenType::View => self.parse_create_view(),
+            TokenType::Materialized => self.parse_create_materialized_view(),
+            TokenType::Procedure => self.parse_create_procedure(),
+            TokenType::Function => self.parse_create_function(),
             _ => Err(RustgreSQLError::Parse(
-                format!("Expected TABLE or INDEX after CREATE, got '{}' at line {}, column {}",
+                format!("Expected TABLE, INDEX, VIEW, PROCEDURE, or FUNCTION after CREATE, got '{}' at line {}, column {}",
                        self.peek().value, self.peek().line, self.peek().column)
             ))
         }
@@ -498,8 +619,12 @@ impl Parser {
         match self.peek().token_type {
             TokenType::Table => self.parse_drop_table(),
             TokenType::Index => self.parse_drop_index(),
+            TokenType::View => self.parse_drop_view(),
+            TokenType::Materialized => self.parse_drop_materialized_view(),
+            TokenType::Procedure => self.parse_drop_procedure(),
+            TokenType::Function => self.parse_drop_function(),
             _ => Err(RustgreSQLError::Parse(
-                format!("Expected TABLE or INDEX after DROP, got '{}'",
+                format!("Expected TABLE, INDEX, VIEW, PROCEDURE, or FUNCTION after DROP, got '{}'",
                        self.peek().value)
             ))
         }
@@ -1146,7 +1271,18 @@ impl Parser {
                         self.consume_token(TokenType::RightParen, "Expected ')' after function arguments")?;
                     }
 
-                    Ok(Expression::Function { name, args })
+                    // Check if this is a window function (has OVER clause)
+                    if self.match_token(TokenType::Over) {
+                        let window_clause = self.parse_window_clause()?;
+                        Ok(Expression::WindowFunction(WindowFunction {
+                            name,
+                            args,
+                            window_clause,
+                            window_name: None,
+                        }))
+                    } else {
+                        Ok(Expression::Function { name, args })
+                    }
                 } else {
                     Ok(Expression::Column {
                         table: None,
@@ -1323,6 +1459,688 @@ impl Parser {
             self.current += 1;
         }
         &self.tokens[self.current - 1]
+    }
+
+    /// Parse window clause for OVER ()
+    fn parse_window_clause(&mut self) -> Result<WindowClause> {
+        self.consume_token(TokenType::LeftParen, "Expected '(' after OVER")?;
+
+        let mut partition_by = Vec::new();
+        let mut order_by = Vec::new();
+        let mut window_frame = None;
+
+        // Parse PARTITION BY clause
+        if self.match_token(TokenType::Partition) {
+            self.consume_token(TokenType::By, "Expected BY after PARTITION")?;
+            partition_by.push(self.parse_expression()?);
+            while self.match_token(TokenType::Comma) {
+                partition_by.push(self.parse_expression()?);
+            }
+        }
+
+        // Parse ORDER BY clause
+        if self.match_token(TokenType::Order) {
+            self.consume_token(TokenType::By, "Expected BY after ORDER")?;
+            order_by.push(self.parse_order_by()?);
+            while self.match_token(TokenType::Comma) {
+                order_by.push(self.parse_order_by()?);
+            }
+        }
+
+        // Parse window frame clause
+        if self.match_token(TokenType::Rows) || self.match_token(TokenType::Range) {
+            let mode = if self.previous().token_type == TokenType::Rows {
+                WindowFrameMode::Rows
+            } else {
+                WindowFrameMode::Range
+            };
+
+            if self.match_token(TokenType::Between) {
+                let start = self.parse_window_frame_bound()?;
+                self.consume_token(TokenType::And, "Expected AND in window frame")?;
+                let end = Some(self.parse_window_frame_bound()?);
+                window_frame = Some(WindowFrame { mode, start, end });
+            } else {
+                // Simple frame: ROWS UNBOUNDED PRECEDING or similar
+                let start = self.parse_window_frame_bound()?;
+                window_frame = Some(WindowFrame { mode, start, end: None });
+            }
+        }
+
+        self.consume_token(TokenType::RightParen, "Expected ')' after window clause")?;
+
+        Ok(WindowClause {
+            partition_by,
+            order_by,
+            window_frame,
+        })
+    }
+
+    /// Parse window frame bound
+    fn parse_window_frame_bound(&mut self) -> Result<WindowFrameBound> {
+        if self.match_token(TokenType::Current) {
+            // Check for "ROW" identifier in "CURRENT ROW"
+            match &self.peek().token_type {
+                TokenType::Identifier(id) if id.to_uppercase() == "ROW" => {
+                    self.advance();
+                }
+                _ => {
+                    return Err(crate::error::RustgreSQLError::Parse(
+                        "Expected ROW after CURRENT".to_string(),
+                    ))
+                }
+            }
+            Ok(WindowFrameBound::CurrentRow)
+        } else if self.match_token(TokenType::Unbounded) {
+            // Check for PRECEDING or FOLLOWING identifier
+            match &self.peek().token_type {
+                TokenType::Identifier(id) if id.to_uppercase() == "PRECEDING" => {
+                    self.advance();
+                    Ok(WindowFrameBound::UnboundedPreceding)
+                }
+                TokenType::Identifier(id) if id.to_uppercase() == "FOLLOWING" => {
+                    self.advance();
+                    Ok(WindowFrameBound::UnboundedFollowing)
+                }
+                _ => {
+                    Err(crate::error::RustgreSQLError::Parse(
+                        "Expected PRECEDING or FOLLOWING after UNBOUNDED".to_string(),
+                    ))
+                }
+            }
+        } else {
+            // Expression bound: N PRECEDING or N FOLLOWING
+            let expr = self.parse_expression()?;
+            match &self.peek().token_type {
+                TokenType::Identifier(id) if id.to_uppercase() == "PRECEDING" => {
+                    self.advance();
+                    Ok(WindowFrameBound::Preceding(Box::new(expr)))
+                }
+                TokenType::Identifier(id) if id.to_uppercase() == "FOLLOWING" => {
+                    self.advance();
+                    Ok(WindowFrameBound::Following(Box::new(expr)))
+                }
+                _ => {
+                    Err(crate::error::RustgreSQLError::Parse(
+                        "Expected PRECEDING or FOLLOWING after expression".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Parse named window definition for WINDOW clause
+    fn parse_named_window(&mut self) -> Result<NamedWindow> {
+        // Parse window name (identifier)
+        let window_name = match &self.peek().token_type {
+            TokenType::Identifier(name) => {
+                let name = name.clone();
+                self.advance();
+                name
+            }
+            _ => {
+                return Err(crate::error::RustgreSQLError::Parse(
+                    "Expected window name".to_string(),
+                ))
+            }
+        };
+
+        self.consume_token(TokenType::As, "Expected AS after window name")?;
+        self.consume_token(TokenType::LeftParen, "Expected '(' after AS in WINDOW clause")?;
+
+        let window_clause = self.parse_window_clause_without_parens()?;
+
+        self.consume_token(TokenType::RightParen, "Expected ')' after window definition")?;
+
+        Ok(NamedWindow {
+            name: window_name,
+            window_clause,
+        })
+    }
+
+    /// Parse window clause contents without requiring outer parentheses
+    fn parse_window_clause_without_parens(&mut self) -> Result<WindowClause> {
+        let mut partition_by = Vec::new();
+        let mut order_by = Vec::new();
+        let mut window_frame = None;
+
+        // Parse PARTITION BY clause
+        if self.match_token(TokenType::Partition) {
+            self.consume_token(TokenType::By, "Expected BY after PARTITION")?;
+            partition_by.push(self.parse_expression()?);
+            while self.match_token(TokenType::Comma) {
+                partition_by.push(self.parse_expression()?);
+            }
+        }
+
+        // Parse ORDER BY clause
+        if self.match_token(TokenType::Order) {
+            self.consume_token(TokenType::By, "Expected BY after ORDER")?;
+            order_by.push(self.parse_order_by()?);
+            while self.match_token(TokenType::Comma) {
+                order_by.push(self.parse_order_by()?);
+            }
+        }
+
+        // Parse window frame clause
+        if self.match_token(TokenType::Rows) || self.match_token(TokenType::Range) {
+            let mode = if self.previous().token_type == TokenType::Rows {
+                WindowFrameMode::Rows
+            } else {
+                WindowFrameMode::Range
+            };
+
+            if self.match_token(TokenType::Between) {
+                let start = self.parse_window_frame_bound()?;
+                self.consume_token(TokenType::And, "Expected AND in window frame")?;
+                let end = Some(self.parse_window_frame_bound()?);
+                window_frame = Some(WindowFrame { mode, start, end });
+            } else {
+                // Simple frame: ROWS UNBOUNDED PRECEDING or similar
+                let start = self.parse_window_frame_bound()?;
+                window_frame = Some(WindowFrame { mode, start, end: None });
+            }
+        }
+
+        Ok(WindowClause {
+            partition_by,
+            order_by,
+            window_frame,
+        })
+    }
+
+    /// Parse CREATE VIEW statement
+    fn parse_create_view(&mut self) -> Result<Statement> {
+        self.consume_token(TokenType::View, "Expected VIEW")?;
+
+        let view_name = self.consume_identifier()?;
+
+        // Parse optional column list
+        let columns = if self.match_token(TokenType::LeftParen) {
+            let mut column_names = Vec::new();
+            column_names.push(self.consume_identifier()?);
+            while self.match_token(TokenType::Comma) {
+                column_names.push(self.consume_identifier()?);
+            }
+            self.consume_token(TokenType::RightParen, "Expected ')' after view column list")?;
+            column_names
+        } else {
+            Vec::new()
+        };
+
+        self.consume_token(TokenType::As, "Expected AS after view name")?;
+
+        // Parse the SELECT query
+        let query_statement = self.parse_select_statement()?;
+
+        Ok(Statement::CreateView(CreateViewStatement {
+            view_name,
+            columns,
+            query: query_statement,
+            materialized: false,
+            with_data: true, // Regular views don't use this field
+        }))
+    }
+
+    /// Parse CREATE MATERIALIZED VIEW statement
+    fn parse_create_materialized_view(&mut self) -> Result<Statement> {
+        self.consume_token(TokenType::Materialized, "Expected MATERIALIZED")?;
+        self.consume_token(TokenType::View, "Expected VIEW")?;
+
+        let view_name = self.consume_identifier()?;
+
+        // Parse optional column list
+        let columns = if self.match_token(TokenType::LeftParen) {
+            let mut column_names = Vec::new();
+            column_names.push(self.consume_identifier()?);
+            while self.match_token(TokenType::Comma) {
+                column_names.push(self.consume_identifier()?);
+            }
+            self.consume_token(TokenType::RightParen, "Expected ')' after view column list")?;
+            column_names
+        } else {
+            Vec::new()
+        };
+
+        self.consume_token(TokenType::As, "Expected AS after view name")?;
+
+        // Parse the SELECT query
+        let query_statement = self.parse_select_statement()?;
+
+        // Parse optional WITH [NO] DATA clause
+        let mut with_data = true; // Default is WITH DATA
+        if self.match_token(TokenType::With) {
+            if self.match_token(TokenType::Not) {
+                self.consume_token(TokenType::Data, "Expected DATA after NOT")?;
+                with_data = false;
+            } else {
+                self.consume_token(TokenType::Data, "Expected DATA after WITH")?;
+                with_data = true;
+            }
+        }
+
+        Ok(Statement::CreateView(CreateViewStatement {
+            view_name,
+            columns,
+            query: query_statement,
+            materialized: true,
+            with_data,
+        }))
+    }
+
+    /// Parse DROP VIEW statement
+    fn parse_drop_view(&mut self) -> Result<Statement> {
+        self.consume_token(TokenType::View, "Expected VIEW")?;
+
+        let if_exists = self.match_token(TokenType::If);
+        if if_exists {
+            self.consume_token(TokenType::Exists, "Expected EXISTS after IF")?;
+        }
+
+        let view_name = self.consume_identifier()?;
+
+        let cascade = self.match_token(TokenType::Cascade);
+
+        Ok(Statement::DropView(DropViewStatement {
+            view_name,
+            materialized: false,
+            cascade,
+        }))
+    }
+
+    /// Parse DROP MATERIALIZED VIEW statement
+    fn parse_drop_materialized_view(&mut self) -> Result<Statement> {
+        self.consume_token(TokenType::Materialized, "Expected MATERIALIZED")?;
+        self.consume_token(TokenType::View, "Expected VIEW")?;
+
+        let if_exists = self.match_token(TokenType::If);
+        if if_exists {
+            self.consume_token(TokenType::Exists, "Expected EXISTS after IF")?;
+        }
+
+        let view_name = self.consume_identifier()?;
+
+        let cascade = self.match_token(TokenType::Cascade);
+
+        Ok(Statement::DropView(DropViewStatement {
+            view_name,
+            materialized: true,
+            cascade,
+        }))
+    }
+
+    /// Parse REFRESH MATERIALIZED VIEW statement
+    fn parse_refresh_materialized_view(&mut self) -> Result<Statement> {
+        self.consume_token(TokenType::Refresh, "Expected REFRESH")?;
+        self.consume_token(TokenType::Materialized, "Expected MATERIALIZED")?;
+        self.consume_token(TokenType::View, "Expected VIEW")?;
+
+        let concurrently = self.match_token(TokenType::Concurrently);
+
+        let view_name = self.consume_identifier()?;
+
+        // Parse optional WITH [NO] DATA clause
+        let mut with_data = true; // Default is WITH DATA
+        if self.match_token(TokenType::With) {
+            if self.match_token(TokenType::Not) {
+                self.consume_token(TokenType::Data, "Expected DATA after NOT")?;
+                with_data = false;
+            } else {
+                self.consume_token(TokenType::Data, "Expected DATA after WITH")?;
+                with_data = true;
+            }
+        }
+
+        Ok(Statement::RefreshMaterializedView(RefreshMaterializedViewStatement {
+            view_name,
+            concurrently,
+            with_data,
+        }))
+    }
+
+    /// Parse SELECT statement (extracted from parse_select to avoid recursion issues)
+    fn parse_select_statement(&mut self) -> Result<SelectStatement> {
+        match self.parse_select()? {
+            Statement::Select(select) => Ok(select),
+            _ => Err(RustgreSQLError::Parse(
+                "Expected SELECT statement for view query".to_string()
+            ))
+        }
+    }
+
+    // ===== STORED PROCEDURE PARSING FUNCTIONS =====
+
+    /// Parse CREATE PROCEDURE statement
+    fn parse_create_procedure(&mut self) -> Result<Statement> {
+        self.consume_token(TokenType::Procedure, "Expected PROCEDURE")?;
+
+        let or_replace = self.match_token(TokenType::Or);
+        if or_replace {
+            self.consume_token(TokenType::Replace, "Expected REPLACE after OR")?;
+        }
+
+        let procedure_name = self.consume_identifier()?;
+
+        // Parse parameter list
+        let mut parameters = Vec::new();
+        if self.match_token(TokenType::LeftParen) {
+            if !self.match_token(TokenType::RightParen) {
+                parameters.push(self.parse_procedure_parameter()?);
+                while self.match_token(TokenType::Comma) {
+                    parameters.push(self.parse_procedure_parameter()?);
+                }
+                self.consume_token(TokenType::RightParen, "Expected ')' after parameter list")?;
+            }
+        }
+
+        // Parse LANGUAGE clause
+        self.consume_token(TokenType::Language, "Expected LANGUAGE")?;
+        let language = match self.consume_identifier()?.to_uppercase().as_str() {
+            "SQL" => ProcedureLanguage::SQL,
+            "PLPGSQL" => ProcedureLanguage::PLpgSQL,
+            _ => return Err(RustgreSQLError::Parse(
+                "Expected SQL or PLpgSQL as language".to_string()
+            ))
+        };
+
+        // Parse SECURITY clause
+        let security_definer = if self.match_token(TokenType::Security) {
+            self.consume_token(TokenType::Definer, "Expected DEFINER after SECURITY")?;
+            true
+        } else {
+            false
+        };
+
+        // Parse AS block
+        self.consume_token(TokenType::As, "Expected AS")?;
+        self.consume_token(TokenType::Begin, "Expected BEGIN")?;
+        let body = self.parse_block_statement()?;
+        self.consume_token(TokenType::End, "Expected END")?;
+
+        Ok(Statement::CreateProcedure(CreateProcedureStatement {
+            procedure_name,
+            parameters,
+            language,
+            body,
+            or_replace,
+            security_definer,
+        }))
+    }
+
+    /// Parse CREATE FUNCTION statement
+    fn parse_create_function(&mut self) -> Result<Statement> {
+        self.consume_token(TokenType::Function, "Expected FUNCTION")?;
+
+        let or_replace = self.match_token(TokenType::Or);
+        if or_replace {
+            self.consume_token(TokenType::Replace, "Expected REPLACE after OR")?;
+        }
+
+        let function_name = self.consume_identifier()?;
+
+        // Parse parameter list
+        let mut parameters = Vec::new();
+        if self.match_token(TokenType::LeftParen) {
+            if !self.match_token(TokenType::RightParen) {
+                parameters.push(self.parse_procedure_parameter()?);
+                while self.match_token(TokenType::Comma) {
+                    parameters.push(self.parse_procedure_parameter()?);
+                }
+                self.consume_token(TokenType::RightParen, "Expected ')' after parameter list")?;
+            }
+        }
+
+        // Parse RETURNS clause
+        self.consume_token(TokenType::Return, "Expected RETURN")?;
+        self.consume_token(TokenType::If, "Expected IF")?; // Part of RETURNS
+        self.consume_token(TokenType::Not, "Expected NOT")?; // For RETURNS SETOF
+        let returns_setof = self.match_token(TokenType::Set); // For RETURNS SETOF
+        if returns_setof {
+            self.consume_token(TokenType::Of, "Expected OF after SET")?;
+        }
+        let return_type = self.parse_data_type()?;
+
+        // Parse LANGUAGE clause
+        self.consume_token(TokenType::Language, "Expected LANGUAGE")?;
+        let language = match self.consume_identifier()?.to_uppercase().as_str() {
+            "SQL" => ProcedureLanguage::SQL,
+            "PLPGSQL" => ProcedureLanguage::PLpgSQL,
+            _ => return Err(RustgreSQLError::Parse(
+                "Expected SQL or PLpgSQL as language".to_string()
+            ))
+        };
+
+        // Parse SECURITY clause
+        let security_definer = if self.match_token(TokenType::Security) {
+            self.consume_token(TokenType::Definer, "Expected DEFINER after SECURITY")?;
+            true
+        } else {
+            false
+        };
+
+        // Parse AS block
+        self.consume_token(TokenType::As, "Expected AS")?;
+        self.consume_token(TokenType::Begin, "Expected BEGIN")?;
+        let body = self.parse_block_statement()?;
+        self.consume_token(TokenType::End, "Expected END")?;
+
+        Ok(Statement::CreateFunction(CreateFunctionStatement {
+            function_name,
+            parameters,
+            return_type,
+            language,
+            body,
+            or_replace,
+            security_definer,
+            returns_setof,
+        }))
+    }
+
+    /// Parse procedure parameter
+    fn parse_procedure_parameter(&mut self) -> Result<ProcedureParameter> {
+        let mut mode = ParameterMode::In;
+
+        // Parse parameter mode (IN, OUT, INOUT)
+        if self.match_identifier_token("IN")? {
+            mode = ParameterMode::In;
+        } else if self.match_identifier_token("OUT")? {
+            mode = ParameterMode::Out;
+        } else if self.match_identifier_token("INOUT")? {
+            mode = ParameterMode::InOut;
+        }
+
+        let name = self.consume_identifier()?;
+        let data_type = self.parse_data_type()?;
+
+        // Parse default value (only for IN and INOUT parameters)
+        let default_value = if mode != ParameterMode::Out && self.match_token(TokenType::Default) {
+            Some(self.parse_expression()?)
+        } else {
+            None
+        };
+
+        Ok(ProcedureParameter {
+            name,
+            data_type,
+            mode,
+            default_value,
+        })
+    }
+
+    /// Parse DROP PROCEDURE statement
+    fn parse_drop_procedure(&mut self) -> Result<Statement> {
+        self.consume_token(TokenType::Procedure, "Expected PROCEDURE")?;
+
+        let if_exists = self.match_token(TokenType::If);
+        if if_exists {
+            self.consume_token(TokenType::Exists, "Expected EXISTS after IF")?;
+        }
+
+        let procedure_name = self.consume_identifier()?;
+
+        // TODO: Parse parameter types for overloaded procedures
+        let parameters = Vec::new();
+
+        Ok(Statement::DropProcedure(DropProcedureStatement {
+            procedure_name,
+            if_exists,
+            parameters,
+        }))
+    }
+
+    /// Parse DROP FUNCTION statement
+    fn parse_drop_function(&mut self) -> Result<Statement> {
+        self.consume_token(TokenType::Function, "Expected FUNCTION")?;
+
+        let if_exists = self.match_token(TokenType::If);
+        if if_exists {
+            self.consume_token(TokenType::Exists, "Expected EXISTS after IF")?;
+        }
+
+        let function_name = self.consume_identifier()?;
+
+        // TODO: Parse parameter types for overloaded functions
+        let parameters = Vec::new();
+        let cascade = self.match_token(TokenType::Cascade);
+
+        Ok(Statement::DropFunction(DropFunctionStatement {
+            function_name,
+            if_exists,
+            parameters,
+            cascade,
+        }))
+    }
+
+    /// Parse CALL procedure statement
+    fn parse_call_procedure(&mut self) -> Result<Statement> {
+        self.consume_token(TokenType::Call, "Expected CALL")?;
+        let procedure_name = self.consume_identifier()?;
+
+        let mut arguments = Vec::new();
+        if self.match_token(TokenType::LeftParen) {
+            if !self.match_token(TokenType::RightParen) {
+                arguments.push(self.parse_expression()?);
+                while self.match_token(TokenType::Comma) {
+                    arguments.push(self.parse_expression()?);
+                }
+                self.consume_token(TokenType::RightParen, "Expected ')' after CALL arguments")?;
+            }
+        }
+
+        Ok(Statement::CallProcedure(CallProcedureStatement {
+            procedure_name,
+            arguments,
+        }))
+    }
+
+    /// Parse PERFORM statement
+    fn parse_perform_statement(&mut self) -> Result<Statement> {
+        self.consume_token(TokenType::Perform, "Expected PERFORM")?;
+        let expression = self.parse_expression()?;
+
+        Ok(Statement::Perform(PerformStatement { expression }))
+    }
+
+    /// Parse block statement (BEGIN...END)
+    fn parse_block_statement(&mut self) -> Result<BlockStatement> {
+        let mut declarations = Vec::new();
+        let mut statements = Vec::new();
+        let mut exception_handler = None;
+
+        // Parse declarations (DECLARE section)
+        if self.match_token(TokenType::Declare) {
+            declarations.push(self.parse_declaration()?);
+            while self.match_token(TokenType::Comma) {
+                declarations.push(self.parse_declaration()?);
+            }
+        }
+
+        // Parse statements
+        while !self.is_at_end() && !self.match_token(TokenType::End) {
+            // Check for EXCEPTION clause
+            if self.peek().token_type == TokenType::Exception {
+                exception_handler = Some(self.parse_exception_handler()?);
+                break;
+            }
+
+            // Parse individual statements within the block
+            match self.peek().token_type {
+                // Skip control flow tokens as they're handled separately
+                TokenType::Semicolon => { self.advance(); continue; }
+                _ => {
+                    let statement = self.parse_statement()?;
+                    statements.push(statement);
+                }
+            }
+        }
+
+        Ok(BlockStatement {
+            declarations,
+            statements,
+            exception_handler,
+        })
+    }
+
+    /// Parse variable declaration
+    fn parse_declaration(&mut self) -> Result<Declaration> {
+        let constant = self.match_identifier_token("CONSTANT")?;
+        let name = self.consume_identifier()?;
+        let data_type = self.parse_data_type()?;
+        let default_value = if self.match_token(TokenType::Default) {
+            Some(self.parse_expression()?)
+        } else {
+            None
+        };
+
+        Ok(Declaration {
+            name,
+            data_type,
+            default_value,
+            constant,
+        })
+    }
+
+    /// Parse exception handler
+    fn parse_exception_handler(&mut self) -> Result<ExceptionHandler> {
+        self.consume_token(TokenType::Exception, "Expected EXCEPTION")?;
+
+        let mut conditions = Vec::new();
+        let mut statements = Vec::new();
+
+        // Parse WHEN clauses
+        while self.match_token(TokenType::When) {
+            let mut exception_names = Vec::new();
+            exception_names.push(self.consume_identifier()?);
+            while self.match_token(TokenType::Or) {
+                exception_names.push(self.consume_identifier()?);
+            }
+            self.consume_token(TokenType::Then, "Expected THEN after WHEN clause")?;
+
+            // Parse handler statements
+            let mut handler_statements = Vec::new();
+            while !self.is_at_end() &&
+                  !self.match_token(TokenType::When) &&
+                  self.peek().token_type != TokenType::End {
+                if self.peek().token_type != TokenType::Semicolon {
+                    let statement = self.parse_statement()?;
+                    handler_statements.push(statement);
+                } else {
+                    self.advance(); // Skip semicolon
+                }
+            }
+
+            if exception_names.len() == 1 && exception_names[0].to_uppercase() == "OTHERS" {
+                conditions.push(ExceptionCondition::Others);
+            } else {
+                conditions.push(ExceptionCondition::When(exception_names));
+            }
+            statements.extend(handler_statements);
+        }
+
+        Ok(ExceptionHandler {
+            conditions,
+            statements,
+        })
     }
 }
 

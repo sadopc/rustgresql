@@ -40,6 +40,10 @@ impl EvaluationContext {
     pub fn get_column_value(&self, column_name: &str) -> Option<&Value> {
         self.columns.get(column_name)
     }
+
+    pub fn set_variable(&mut self, name: &str, value: Value) {
+        self.columns.insert(name.to_string(), value);
+    }
 }
 
 /// Three-valued logic result (SQL boolean logic with NULL)
@@ -365,6 +369,11 @@ impl ExpressionEvaluator {
             Expression::Subquery(subquery_stmt) => {
                 // Execute the subquery and return the result
                 self.evaluate_subquery(subquery_stmt.as_ref(), context)
+            }
+
+            Expression::WindowFunction(_) => {
+                // Window functions should be handled by WindowOperator, not in expression evaluator
+                Err(RustgreSQLError::InvalidOperation("Window functions must be evaluated by WindowOperator".to_string()))
             }
         }
     }
@@ -747,7 +756,7 @@ impl ExpressionEvaluator {
         if let crate::sql::ast::Statement::Select(select_stmt) = subquery_stmt {
             // Handle both Simple and SetOperation variants
             if let crate::sql::ast::SelectStatement::Simple {
-                from, columns, where_clause, having, ..
+                with_clause: _, from, columns, where_clause, having, ..
             } = select_stmt {
                 // Get all tables available in the subquery's FROM clause
                 let mut subquery_tables = std::collections::HashSet::new();

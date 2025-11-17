@@ -75,6 +75,12 @@ pub enum RustgreSQLError {
 
     #[error("Validation error: {0}")]
     Validation(String),
+
+    #[error("Dependent objects: {0}")]
+    DependentObjects(String),
+
+    #[error("Procedure error: {0}")]
+    Procedure(String),
 }
 
 pub type Result<T> = std::result::Result<T, RustgreSQLError>;

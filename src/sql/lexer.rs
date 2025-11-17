@@ -64,6 +64,50 @@ pub enum TokenType {
     Except,
     All,
     Unique,
+    Over,
+    Partition,
+    Window,
+    Rows,
+    Range,
+    Between,
+    Unbounded,
+    Preceding,
+    Following,
+    Current,
+    With,
+    Recursive,
+    View,
+    Materialized,
+    Refresh,
+    Concurrently,
+    Cascade,
+    Data,
+
+    // Stored Procedure and Control Flow Keywords
+    Procedure,
+    Function,
+    Language,
+    Begin,
+    End,
+    Declare,
+    Loop,
+    While,
+    For,
+    Then,
+    Else,
+    Case,
+    When,
+    Return,
+    Exit,
+    Continue,
+    Perform,
+    Raise,
+    Exception,
+    Replace,
+    Definer,
+    Of,
+    Call,
+    Security,
 
     // Operators
     Equals,
@@ -171,6 +215,38 @@ impl Token {
                 | TokenType::Default
                 | TokenType::Check
                 | TokenType::Unique
+                | TokenType::With
+                | TokenType::Recursive
+                | TokenType::View
+                | TokenType::Materialized
+                | TokenType::Refresh
+                | TokenType::Concurrently
+                | TokenType::Cascade
+                | TokenType::Data
+                | TokenType::Procedure
+                | TokenType::Function
+                | TokenType::Language
+                | TokenType::Begin
+                | TokenType::End
+                | TokenType::Declare
+                | TokenType::Loop
+                | TokenType::While
+                | TokenType::For
+                | TokenType::Then
+                | TokenType::Else
+                | TokenType::Case
+                | TokenType::When
+                | TokenType::Return
+                | TokenType::Exit
+                | TokenType::Continue
+                | TokenType::Perform
+                | TokenType::Raise
+                | TokenType::Exception
+                | TokenType::Replace
+                | TokenType::Definer
+                | TokenType::Of
+                | TokenType::Call
+                | TokenType::Security
         )
     }
 }
@@ -484,6 +560,49 @@ impl Lexer {
             "EXCEPT" => TokenType::Except,
             "ALL" => TokenType::All,
             "UNIQUE" => TokenType::Unique,
+            "OVER" => TokenType::Over,
+            "PARTITION" => TokenType::Partition,
+            "WINDOW" => TokenType::Window,
+            "ROWS" => TokenType::Rows,
+            "RANGE" => TokenType::Range,
+            "BETWEEN" => TokenType::Between,
+            "UNBOUNDED" => TokenType::Unbounded,
+            "PRECEDING" => TokenType::Preceding,
+            "FOLLOWING" => TokenType::Following,
+            "CURRENT" => TokenType::Current,
+            "WITH" => TokenType::With,
+            "RECURSIVE" => TokenType::Recursive,
+            "VIEW" => TokenType::View,
+            "MATERIALIZED" => TokenType::Materialized,
+            "REFRESH" => TokenType::Refresh,
+            "CONCURRENTLY" => TokenType::Concurrently,
+            "CASCADE" => TokenType::Cascade,
+            "DATA" => TokenType::Data,
+            // Stored procedure and control flow keywords
+            "PROCEDURE" => TokenType::Procedure,
+            "FUNCTION" => TokenType::Function,
+            "LANGUAGE" => TokenType::Language,
+            "BEGIN" => TokenType::Begin,
+            "END" => TokenType::End,
+            "DECLARE" => TokenType::Declare,
+            "LOOP" => TokenType::Loop,
+            "WHILE" => TokenType::While,
+            "FOR" => TokenType::For,
+            "THEN" => TokenType::Then,
+            "ELSE" => TokenType::Else,
+            "CASE" => TokenType::Case,
+            "WHEN" => TokenType::When,
+            "RETURN" => TokenType::Return,
+            "EXIT" => TokenType::Exit,
+            "CONTINUE" => TokenType::Continue,
+            "PERFORM" => TokenType::Perform,
+            "RAISE" => TokenType::Raise,
+            "EXCEPTION" => TokenType::Exception,
+            "REPLACE" => TokenType::Replace,
+            "DEFINER" => TokenType::Definer,
+            "OF" => TokenType::Of,
+            "CALL" => TokenType::Call,
+            "SECURITY" => TokenType::Security,
             _ => TokenType::Identifier(identifier.clone()),
         };
 

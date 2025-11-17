@@ -104,6 +104,16 @@ pub enum PlanNode {
         // For correlated subqueries, we need to track outer context
         correlated_columns: Vec<String>,
     },
+    /// Values operator for in-memory data
+    Values {
+        rows: Vec<Vec<crate::types::Value>>,
+        column_names: Vec<String>,
+    },
+    /// CTE (Common Table Expression) operator
+    CTE {
+        with_clause: crate::sql::ast::WithClause,
+        main_query: Box<crate::sql::ast::Statement>,
+    },
 }
 
 impl PlanNode {
@@ -251,6 +261,16 @@ impl PlanNode {
                 );
                 operator.execute(context)
             }
+            PlanNode::Values { rows, column_names } => {
+                Ok(QueryResult {
+                    rows: rows.clone(),
+                    column_names: column_names.clone(),
+                })
+            }
+            PlanNode::CTE { with_clause, main_query } => {
+                let cte_operator = CTEOperator::new(with_clause.clone(), *main_query.clone());
+                cte_operator.execute(context)
+            }
         }
     }
 }
@@ -271,6 +291,7 @@ impl QueryPlanner {
     pub fn plan_select(&self, select: &SelectStatement) -> Result<ExecutionPlan> {
         match select {
             SelectStatement::Simple {
+                with_clause,
                 from,
                 joins,
                 where_clause,
@@ -279,6 +300,10 @@ impl QueryPlanner {
                 having,
                 ..
             } => {
+                // Check if this is a CTE query first
+                if let Some(with_clause) = with_clause {
+                    return self.plan_cte_select(with_clause, select);
+                }
                 // Start with table scans
                 let mut plan = self.plan_from_clause(from)?;
 
@@ -621,5 +646,23 @@ impl QueryPlanner {
             }
             _ => false,
         }
+    }
+
+    /// Plan a CTE SELECT statement
+    fn plan_cte_select(&self, with_clause: &WithClause, select: &SelectStatement) -> Result<ExecutionPlan> {
+        // Create a CTE plan node that will handle the entire WITH clause
+        let plan_node = PlanNode::CTE {
+            with_clause: with_clause.clone(),
+            main_query: Box::new(crate::sql::ast::Statement::Select(select.clone())),
+        };
+
+        // For now, we'll use the column names from the main query
+        // In a full implementation, we'd need to derive the output schema from the main query
+        let output_schema = Vec::new();
+
+        Ok(ExecutionPlan {
+            root: plan_node,
+            output_schema,
+        })
     }
 }
