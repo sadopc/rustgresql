@@ -293,6 +293,12 @@ impl Lexer {
                 continue;
             }
 
+            // Handle dollar-quoted strings (PostgreSQL $$string$$)
+            if current_char == '$' && self.peek_char() == Some('$') {
+                self.consume_dollar_quoted_string()?;
+                continue;
+            }
+
             // Handle string literals
             if current_char == '\'' {
                 self.consume_string()?;
@@ -477,6 +483,47 @@ impl Lexer {
         if self.is_at_end() {
             return Err(crate::error::RustgreSQLError::Parse(
                 format!("Unterminated string starting at line {}, column {}",
+                       start_line, start_column)
+            ));
+        }
+
+        self.tokens.push(Token::new(
+            TokenType::String(string_value.clone()),
+            start_line,
+            start_column,
+            string_value,
+        ));
+
+        Ok(())
+    }
+
+    /// Consume dollar-quoted string (PostgreSQL $$string$$ syntax)
+    fn consume_dollar_quoted_string(&mut self) -> Result<()> {
+        let start_line = self.line;
+        let start_column = self.column;
+
+        // Skip opening $$
+        self.advance(2);
+
+        let mut string_value = String::new();
+
+        // Read until we find closing $$
+        while !self.is_at_end() {
+            let current = self.current_char();
+
+            // Check for closing $$
+            if current == '$' && self.peek_char() == Some('$') {
+                self.advance(2); // Skip closing $$
+                break;
+            }
+
+            string_value.push(current);
+            self.advance(1);
+        }
+
+        if self.is_at_end() && (self.position < 2 || self.input[self.position - 2] != '$' || self.input[self.position - 1] != '$') {
+            return Err(crate::error::RustgreSQLError::Parse(
+                format!("Unterminated dollar-quoted string starting at line {}, column {}",
                        start_line, start_column)
             ));
         }

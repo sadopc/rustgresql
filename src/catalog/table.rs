@@ -51,6 +51,7 @@ pub enum TableConstraint {
 pub struct SystemTable {
     pub def: TableDef,
     pub data: Arc<Mutex<Vec<Vec<crate::types::Value>>>>,
+    pub buffer_manager: Option<std::sync::Arc<crate::storage::BufferPoolManager>>,
 }
 
 /// System table manager
@@ -59,6 +60,7 @@ pub struct SystemTableManager {
     tables: Arc<Mutex<HashMap<String, SystemTable>>>,
     next_table_id: Arc<Mutex<u64>>,
     next_column_id: Arc<Mutex<u64>>,
+    buffer_manager: Arc<Mutex<Option<std::sync::Arc<crate::storage::BufferPoolManager>>>>,
 }
 
 impl SystemTableManager {
@@ -67,11 +69,17 @@ impl SystemTableManager {
             tables: Arc::new(Mutex::new(HashMap::new())),
             next_table_id: Arc::new(Mutex::new(1)),
             next_column_id: Arc::new(Mutex::new(1)),
+            buffer_manager: Arc::new(Mutex::new(None)),
         };
 
         // Initialize system tables
         manager.initialize_system_tables();
         manager
+    }
+
+    /// Set the buffer manager for persistence operations
+    pub fn set_buffer_manager(&self, buffer_manager: std::sync::Arc<crate::storage::BufferPoolManager>) {
+        *self.buffer_manager.lock().unwrap() = Some(buffer_manager);
     }
 
     /// Initialize core system catalog tables
@@ -125,6 +133,7 @@ impl SystemTableManager {
         tables.insert("pg_table".to_string(), SystemTable {
             def: pg_table_def,
             data: Arc::new(Mutex::new(vec![])),
+            buffer_manager: None,
         });
 
         // Create pg_column catalog table
@@ -174,6 +183,7 @@ impl SystemTableManager {
         tables.insert("pg_column".to_string(), SystemTable {
             def: pg_column_def,
             data: Arc::new(Mutex::new(vec![])),
+            buffer_manager: None,
         });
     }
 
@@ -202,6 +212,7 @@ impl SystemTableManager {
         tables.insert(name.to_string(), SystemTable {
             def: table_def.clone(),
             data: Arc::new(Mutex::new(vec![])),
+            buffer_manager: None,
         });
 
         // Update pg_table catalog
@@ -259,7 +270,6 @@ impl SystemTableManager {
     pub fn list_tables(&self) -> Result<Vec<TableDef>> {
         let tables = self.tables.lock().unwrap();
         let table_list = tables.values()
-            .filter(|t| t.def.table_id > 1) // Skip system tables
             .map(|t| t.def.clone())
             .collect();
         Ok(table_list)
@@ -270,8 +280,110 @@ impl SystemTableManager {
         let tables = self.tables.lock().unwrap();
         if let Some(table) = tables.get(table_name) {
             let mut data = table.data.lock().unwrap();
-            data.push(row);
+            data.push(row.clone());
+
+            // If we have a buffer manager, persist the data to disk
+            if let Some(ref buffer_manager) = *self.buffer_manager.lock().unwrap() {
+                self.persist_row_to_disk(buffer_manager, table, &row)?;
+            }
         }
+        Ok(())
+    }
+
+    /// Update a row in a table by row index
+    pub fn update_row(&self, table_name: &str, row_index: usize, new_row: Vec<crate::types::Value>) -> Result<()> {
+        let tables = self.tables.lock().unwrap();
+        if let Some(table) = tables.get(table_name) {
+            let mut data = table.data.lock().unwrap();
+
+            // Check if row index is valid
+            if row_index >= data.len() {
+                return Err(crate::error::RustgreSQLError::NotFound(
+                    format!("Row index {} not found in table '{}'", row_index, table_name)
+                ));
+            }
+
+            // Update the row in memory
+            data[row_index] = new_row.clone();
+
+            // If we have a buffer manager, persist the changes to disk
+            if let Some(ref buffer_manager) = *self.buffer_manager.lock().unwrap() {
+                // For simplicity, we persist the entire row again
+                // In a real implementation, this would update the specific page
+                self.persist_row_to_disk(buffer_manager, table, &new_row)?;
+            }
+        } else {
+            return Err(crate::error::RustgreSQLError::NotFound(
+                format!("Table '{}' not found", table_name)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Delete a row from a table by row index
+    pub fn delete_row(&self, table_name: &str, row_index: usize) -> Result<()> {
+        let tables = self.tables.lock().unwrap();
+        if let Some(table) = tables.get(table_name) {
+            let mut data = table.data.lock().unwrap();
+
+            // Check if row index is valid
+            if row_index >= data.len() {
+                return Err(crate::error::RustgreSQLError::NotFound(
+                    format!("Row index {} not found in table '{}'", row_index, table_name)
+                ));
+            }
+
+            // Remove the row from memory
+            data.remove(row_index);
+
+            // If we have a buffer manager, mark pages as dirty to persist the deletion
+            if let Some(ref buffer_manager) = *self.buffer_manager.lock().unwrap() {
+                // In a real implementation, this would mark the specific pages as dirty
+                // and potentially compact the page storage
+                // For now, we rely on the eventual flush of all pages
+                buffer_manager.flush_all_pages()?;
+            }
+        } else {
+            return Err(crate::error::RustgreSQLError::NotFound(
+                format!("Table '{}' not found", table_name)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Persist a row to disk pages
+    fn persist_row_to_disk(&self, buffer_manager: &std::sync::Arc<crate::storage::BufferPoolManager>,
+                          table: &SystemTable, row: &[crate::types::Value]) -> Result<()> {
+        // For now, serialize the row and store it in a data page
+        // In a full implementation, this would use proper page management
+        use bincode;
+
+        let row_bytes = bincode::serialize(row)
+            .map_err(|e| crate::error::RustgreSQLError::Serialization(e.to_string()))?;
+
+        // Allocate a new page for this row (simplified - should reuse pages)
+        let page_id = buffer_manager.new_page(crate::storage::PageType::Data)?;
+        let page = buffer_manager.fetch_page(page_id)?;
+
+        {
+            let mut page_guard = page.lock().unwrap();
+
+            // Ensure the row fits in the page
+            if row_bytes.len() > page_guard.data.len() {
+                return Err(crate::error::RustgreSQLError::Storage(
+                    format!("Row too large for page: {} bytes", row_bytes.len())
+                ));
+            }
+
+            // Store the row data
+            page_guard.data[..row_bytes.len()].copy_from_slice(&row_bytes);
+            page_guard.header.free_bytes = page_guard.data.len() - row_bytes.len();
+            page_guard.update_checksum();
+        }
+
+        // Mark page as dirty and unpin
+        buffer_manager.unpin_page(page_id, true)?;
+
         Ok(())
     }
 
@@ -284,6 +396,72 @@ impl SystemTableManager {
         } else {
             Err(crate::error::RustgreSQLError::NotFound(format!("Table '{}' not found", table_name)))
         }
+    }
+
+    /// Update the root page ID for a table
+    pub fn update_table_root_page(&self, table_name: &str, root_page_id: PageId) -> Result<()> {
+        let mut tables = self.tables.lock().unwrap();
+        if let Some(table) = tables.get_mut(table_name) {
+            table.def.root_page_id = Some(root_page_id);
+            Ok(())
+        } else {
+            Err(crate::error::RustgreSQLError::NotFound(format!("Table '{}' not found", table_name)))
+        }
+    }
+
+    /// Update the entire table definition (for ALTER TABLE operations)
+    pub fn update_table_definition(&self, table_name: &str, new_def: TableDef) -> Result<()> {
+        let mut tables = self.tables.lock().unwrap();
+
+        // First, check if the table exists and get its ID
+        let table_id = if let Some(table) = tables.get(table_name) {
+            table.def.table_id
+        } else {
+            return Err(crate::error::RustgreSQLError::NotFound(format!("Table '{}' not found", table_name)));
+        };
+
+        // Update the table definition
+        if let Some(table) = tables.get_mut(table_name) {
+            let root_page_id = table.def.root_page_id;
+            table.def = new_def;
+            table.def.table_id = table_id; // Preserve table_id
+            table.def.root_page_id = root_page_id; // Preserve root_page_id
+            table.def.modified_at = std::time::SystemTime::now();
+        }
+
+        // Collect the column information before releasing the table borrow
+        let columns_to_add: Vec<(usize, String)> = if let Some(table) = tables.get(table_name) {
+            table.def.columns.iter().enumerate()
+                .map(|(idx, col)| (idx, col.name.clone()))
+                .collect()
+        } else {
+            vec![]
+        };
+
+        // Update pg_column catalog table to reflect the new columns
+        if let Some(pg_column) = tables.get_mut("pg_column") {
+            let mut data = pg_column.data.lock().unwrap();
+
+            // Remove all existing column entries for this table
+            data.retain(|row| {
+                if let crate::types::ValueKind::Integer(tid) = &row[1].kind {
+                    *tid != table_id as i64
+                } else {
+                    true
+                }
+            });
+
+            // Add new column entries
+            for (idx, column_name) in columns_to_add {
+                data.push(vec![
+                    crate::types::Value { kind: crate::types::ValueKind::Integer(idx as i64) },
+                    crate::types::Value { kind: crate::types::ValueKind::Integer(table_id as i64) },
+                    crate::types::Value { kind: crate::types::ValueKind::String(column_name) },
+                ]);
+            }
+        }
+
+        Ok(())
     }
 
     /// Get column names for a table

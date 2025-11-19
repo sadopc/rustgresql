@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex, RwLock};
 /// Buffer pool frame containing a page and metadata
 #[derive(Debug)]
 struct BufferFrame {
-    /// The page data
-    page: Option<crate::storage::Page>,
+    /// The page data (shared via Arc for concurrent access)
+    page: Option<Arc<Mutex<crate::storage::Page>>>,
     /// Page ID if page is loaded
     page_id: Option<PageId>,
     /// Reference count for the page
@@ -176,7 +176,7 @@ impl BufferPoolManager {
                 self.buffer_pool.update_lru(page_id);
 
                 if let Some(ref page) = f.page {
-                    return Ok(Arc::new(Mutex::new(page.clone())));
+                    return Ok(Arc::clone(page));
                 }
             }
         }
@@ -192,7 +192,8 @@ impl BufferPoolManager {
             if f.dirty {
                 if let (Some(old_page_id), Some(ref old_page)) = (f.page_id, f.page.clone()) {
                     let fm = self.file_manager.lock().unwrap();
-                    fm.write_page(old_page_id, old_page.clone())?;
+                    let page_guard = old_page.lock().unwrap();
+                    fm.write_page(old_page_id, page_guard.clone())?;
                 }
             }
 
@@ -216,14 +217,15 @@ impl BufferPoolManager {
             let fm = self.file_manager.lock().unwrap();
             let page = fm.read_page(page_id)?;
 
-            f.page = Some(page.clone());
+            let page_arc = Arc::new(Mutex::new(page));
+            f.page = Some(Arc::clone(&page_arc));
             f.page_id = Some(page_id);
             f.pin();
             f.dirty = false;
 
             self.buffer_pool.update_lru(page_id);
 
-            Ok(Arc::new(Mutex::new(page)))
+            Ok(page_arc)
         }
     }
 
@@ -252,7 +254,9 @@ impl BufferPoolManager {
 
             if f.dirty && f.page.is_some() {
                 let fm = self.file_manager.lock().unwrap();
-                fm.write_page(page_id, f.page.as_ref().unwrap().clone())?;
+                let page_arc = f.page.as_ref().unwrap();
+                let page_guard = page_arc.lock().unwrap();
+                fm.write_page(page_id, page_guard.clone())?;
             }
         }
 
@@ -265,8 +269,13 @@ impl BufferPoolManager {
         let page_id = fm.allocate_page(page_type)?;
         drop(fm);
 
-        // Pin the newly created page
-        self.fetch_page(page_id)?;
+        // Pin the newly created page and ensure it's properly initialized
+        let page_arc = self.fetch_page(page_id)?;
+
+        // Note: Checksum verification is already done in file_manager.allocate_page()
+        // and fetch_page() reads from disk, so the page should be valid.
+        // Additional verification here is redundant and can cause false positives
+        // during page initialization.
 
         Ok(page_id)
     }

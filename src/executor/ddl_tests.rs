@@ -578,4 +578,41 @@ mod tests {
         assert!(!schema_manager.needs_migration(1, 1));
         assert!(!schema_manager.needs_migration(1, 3));
     }
+
+    #[test]
+    fn test_view_creation_and_expansion() {
+        let engine = create_test_engine();
+
+        // Create a table
+        let create_table_sql = "CREATE TABLE users (id INTEGER PRIMARY KEY, name VARCHAR(255) NOT NULL, email VARCHAR(255) UNIQUE, age INTEGER)";
+        let table_statements = parse_sql(create_table_sql).unwrap();
+        engine.execute_query(&table_statements[0]).unwrap();
+
+        // Insert data
+        let insert_sql1 = "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'alice@example.com', 25)";
+        let insert_statements1 = parse_sql(insert_sql1).unwrap();
+        engine.execute_query(&insert_statements1[0]).unwrap();
+
+        let insert_sql2 = "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'bob@example.com', 30)";
+        let insert_statements2 = parse_sql(insert_sql2).unwrap();
+        engine.execute_query(&insert_statements2[0]).unwrap();
+
+        // Create a view
+        let create_view_sql = "CREATE VIEW active_users AS SELECT id, name, email FROM users WHERE age > 18";
+        let view_statements = parse_sql(create_view_sql).unwrap();
+        let create_result = engine.execute_query(&view_statements[0]);
+        assert!(create_result.is_ok(), "CREATE VIEW execution failed: {:?}", create_result);
+
+        // Query the view
+        let select_view_sql = "SELECT * FROM active_users";
+        let select_statements = parse_sql(select_view_sql).unwrap();
+        let select_result = engine.execute_query(&select_statements[0]);
+
+        // The view query should succeed (not return "Table not found" error)
+        assert!(select_result.is_ok(), "SELECT FROM view failed: {:?}", select_result);
+
+        let (result, _stats) = select_result.unwrap();
+        // We should get 2 rows (both Alice and Bob have age > 18)
+        assert_eq!(result.rows.len(), 2, "Expected 2 rows from view query");
+    }
 }

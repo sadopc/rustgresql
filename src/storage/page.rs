@@ -4,7 +4,6 @@
 
 use crate::{error::Result, PageId};
 use serde::{Deserialize, Serialize};
-use std::mem;
 
 /// Default page size (8KB)
 pub const DEFAULT_PAGE_SIZE: usize = 8192;
@@ -63,7 +62,7 @@ impl Page {
                 page_type,
                 prev_page_id: None,
                 next_page_id: None,
-                free_bytes: DEFAULT_PAGE_SIZE - mem::size_of::<PageHeader>(),
+                free_bytes: DEFAULT_PAGE_SIZE, // All data space is initially free
                 checksum: 0,
             },
             data,
@@ -77,15 +76,20 @@ impl Page {
         let hasher = Crc::<u32>::new(&crc::CRC_32_ISCSI);
         let mut digest = hasher.digest();
 
-        // Update with header data (excluding checksum field)
-        let header_bytes = unsafe {
-            std::slice::from_raw_parts(
-                &self.header as *const PageHeader as *const u8,
-                mem::size_of::<PageHeader>() - mem::size_of::<u32>(),
-            )
-        };
-        digest.update(header_bytes);
-        digest.update(&self.data);
+        // Create a temporary header with checksum set to 0
+        let mut temp_header = self.header.clone();
+        temp_header.checksum = 0;
+
+        // Serialize the temporary header
+        let header_bytes = bincode::serialize(&temp_header).unwrap();
+
+        // Build the full page bytes exactly as in to_bytes
+        let mut page_bytes = header_bytes;
+        page_bytes.extend_from_slice(&self.data);
+        page_bytes.resize(DEFAULT_PAGE_SIZE, 0);
+
+        // Update digest with the full page bytes
+        digest.update(&page_bytes);
 
         digest.finalize()
     }
@@ -129,12 +133,6 @@ impl Page {
 
         page_bytes.extend_from_slice(&header_bytes);
 
-        // Pad header to fixed size
-        let header_size = mem::size_of::<PageHeader>();
-        if header_bytes.len() < header_size {
-            page_bytes.resize(header_size, 0);
-        }
-
         // Add data
         page_bytes.extend_from_slice(&self.data);
 
@@ -149,13 +147,23 @@ impl Page {
         if bytes.len() != DEFAULT_PAGE_SIZE {
             return Err(crate::error::RustgreSQLError::Storage(
                 format!("Invalid page size: expected {}, got {}",
-                       DEFAULT_PAGE_SIZE, bytes.len())
+                        DEFAULT_PAGE_SIZE, bytes.len())
             ));
         }
 
-        let header_size = mem::size_of::<PageHeader>();
-        let header_bytes = &bytes[..header_size];
+        // Determine header size by serializing a dummy header
+        let dummy_header = PageHeader {
+            page_id: 0,
+            page_type: PageType::Data,
+            prev_page_id: None,
+            next_page_id: None,
+            free_bytes: 0,
+            checksum: 0,
+        };
+        let header_size = bincode::serialize(&dummy_header)
+            .map_err(|e| crate::error::RustgreSQLError::Serialization(e.to_string()))?.len();
 
+        let header_bytes = &bytes[..header_size];
         let header: PageHeader = bincode::deserialize(header_bytes)
             .map_err(|e| crate::error::RustgreSQLError::Serialization(e.to_string()))?;
 

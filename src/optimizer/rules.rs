@@ -148,7 +148,19 @@ impl OptimizerRule for PredicatePushdownRule {
                     }
                 }
             }
-            PlanNode::Join { left, right, condition, join_type } => {
+            PlanNode::Join { left, right, condition, join_type, .. } => {
+                let optimized_left = self.apply(left.as_ref())?;
+                let optimized_right = self.apply(right.as_ref())?;
+                Ok(PlanNode::Join {
+                    left: Box::new(optimized_left),
+                    right: Box::new(optimized_right),
+                    condition: condition.clone(),
+                    join_type: join_type.clone(),
+                    left_alias: None,
+                    right_alias: None,
+                })
+            }
+            PlanNode::Join { left, right, condition, join_type, .. } => {
                 // Try to push conditions down to join inputs
                 let (left_condition, right_condition, remaining_condition) = self.classify_join_conditions(condition);
 
@@ -177,6 +189,8 @@ impl OptimizerRule for PredicatePushdownRule {
                     right: Box::new(optimized_right),
                     condition: remaining_condition.and_then(|expr| self.optimize_expression(&expr).ok()).flatten(),
                     join_type: join_type.clone(),
+                    left_alias: None,
+                    right_alias: None,
                 })
             }
             _ => self.apply_to_children(plan),
@@ -195,11 +209,12 @@ impl OptimizerRule for PredicatePushdownRule {
 impl PredicatePushdownRule {
     fn try_pushdown_filter(&self, input: &PlanNode, condition: Expression) -> Result<Option<PlanNode>> {
         match input {
-            PlanNode::Scan { table_name, columns } => {
+            PlanNode::Scan { table_name, columns, .. } => {
                 // Can always push filter to scan
                 Ok(Some(PlanNode::Scan {
                     table_name: table_name.clone(),
                     columns: columns.clone(),
+                    alias: None,
                 }))
             }
             PlanNode::IndexScan { table_name, index_name, columns, .. } => {
@@ -281,14 +296,17 @@ impl PredicatePushdownRule {
                     condition: self.optimize_expression(condition)?.unwrap_or_else(|| condition.clone()),
                 })
             }
-            PlanNode::Project { input, columns } => {
+            PlanNode::Project { input, columns, .. } => {
                 let optimized_input = self.apply(input.as_ref())?;
                 Ok(PlanNode::Project {
                     input: Box::new(optimized_input),
                     columns: columns.clone(),
+                    table_aliases: std::collections::HashMap::new(),
+                    left_columns: None,
+                    right_columns: None,
                 })
             }
-            PlanNode::Join { left, right, condition, join_type } => {
+            PlanNode::Join { left, right, condition, join_type, .. } => {
                 let optimized_left = self.apply(left.as_ref())?;
                 let optimized_right = self.apply(right.as_ref())?;
                 Ok(PlanNode::Join {
@@ -299,6 +317,56 @@ impl PredicatePushdownRule {
                 None => None,
             },
                     join_type: join_type.clone(),
+                    left_alias: None,
+                    right_alias: None,
+                })
+            }
+            PlanNode::Join { left, right, condition, join_type, .. } => {
+                let optimized_left = self.apply(left.as_ref())?;
+                let optimized_right = self.apply(right.as_ref())?;
+                Ok(PlanNode::Join {
+                    left: Box::new(optimized_left),
+                    right: Box::new(optimized_right),
+                    condition: condition.clone(),
+                    join_type: join_type.clone(),
+                    left_alias: None,
+                    right_alias: None,
+                })
+            }
+            PlanNode::Join { left, right, condition, join_type, .. } => {
+                let optimized_left = self.apply(left.as_ref())?;
+                let optimized_right = self.apply(right.as_ref())?;
+                Ok(PlanNode::Join {
+                    left: Box::new(optimized_left),
+                    right: Box::new(optimized_right),
+                    condition: condition.clone(),
+                    join_type: join_type.clone(),
+                    left_alias: None,
+                    right_alias: None,
+                })
+            }
+            PlanNode::Join { left, right, condition, join_type, .. } => {
+                let optimized_left = self.apply(left.as_ref())?;
+                let optimized_right = self.apply(right.as_ref())?;
+                Ok(PlanNode::Join {
+                    left: Box::new(optimized_left),
+                    right: Box::new(optimized_right),
+                    condition: condition.clone(),
+                    join_type: join_type.clone(),
+                    left_alias: None,
+                    right_alias: None,
+                })
+            }
+            PlanNode::Join { left, right, condition, join_type, .. } => {
+                let optimized_left = self.apply(left.as_ref())?;
+                let optimized_right = self.apply(right.as_ref())?;
+                Ok(PlanNode::Join {
+                    left: Box::new(optimized_left),
+                    right: Box::new(optimized_right),
+                    condition: condition.clone(),
+                    join_type: join_type.clone(),
+                    left_alias: None,
+                    right_alias: None,
                 })
             }
             _ => Ok(plan.clone()),
@@ -319,7 +387,7 @@ pub struct ProjectionPushdownRule;
 impl OptimizerRule for ProjectionPushdownRule {
     fn apply(&self, plan: &PlanNode) -> Result<PlanNode> {
         match plan {
-            PlanNode::Project { input, columns } => {
+            PlanNode::Project { input, columns, .. } => {
                 // Try to push projection down to the input
                 let required_columns: Vec<String> = columns.iter()
                     .filter_map(|(name, expr)| {
@@ -341,19 +409,25 @@ impl OptimizerRule for ProjectionPushdownRule {
                         None => {
                             // Cannot push down further
                             let optimized_input = self.apply(input.as_ref())?;
-                            Ok(PlanNode::Project {
-                                input: Box::new(optimized_input),
-                                columns: columns.clone(),
-                            })
+                Ok(PlanNode::Project {
+                    input: Box::new(optimized_input),
+                    columns: columns.clone(),
+                    table_aliases: std::collections::HashMap::new(),
+                    left_columns: None,
+                    right_columns: None,
+                })
                         }
                     }
                 } else {
                     // Cannot push down
                     let optimized_input = self.apply(input.as_ref())?;
-                    Ok(PlanNode::Project {
-                        input: Box::new(optimized_input),
-                        columns: columns.clone(),
-                    })
+                Ok(PlanNode::Project {
+                    input: Box::new(optimized_input),
+                    columns: columns.clone(),
+                    table_aliases: std::collections::HashMap::new(),
+                    left_columns: None,
+                    right_columns: None,
+                })
                 }
             }
             _ => self.apply_to_children(plan),
@@ -386,6 +460,7 @@ impl ProjectionPushdownRule {
                 Ok(Some(PlanNode::Scan {
                     table_name: table_name.clone(),
                     columns: required_columns.to_vec(),
+                    alias: None,
                 }))
             }
             PlanNode::IndexScan { table_name, index_name, index_condition, .. } => {
@@ -427,7 +502,7 @@ impl ProjectionPushdownRule {
                     condition: condition.clone(),
                 })
             }
-            PlanNode::Join { left, right, condition, join_type } => {
+            PlanNode::Join { left, right, condition, join_type, .. } => {
                 let optimized_left = self.apply(left.as_ref())?;
                 let optimized_right = self.apply(right.as_ref())?;
                 Ok(PlanNode::Join {
@@ -435,6 +510,8 @@ impl ProjectionPushdownRule {
                     right: Box::new(optimized_right),
                     condition: condition.clone(),
                     join_type: join_type.clone(),
+                    left_alias: None,
+                    right_alias: None,
                 })
             }
             _ => Ok(plan.clone()),
@@ -557,7 +634,7 @@ impl ConstantFoldingRule {
                     condition: optimized_condition,
                 })
             }
-            PlanNode::Project { input, columns } => {
+            PlanNode::Project { input, columns, .. } => {
                 let optimized_input = self.apply(input.as_ref())?;
                 let mut optimized_columns = Vec::new();
                 let mut changed = false;
@@ -571,12 +648,15 @@ impl ConstantFoldingRule {
                     }
                 }
 
-                Ok(PlanNode::Project {
-                    input: Box::new(optimized_input),
-                    columns: if changed { optimized_columns } else { columns.clone() },
-                })
+                    Ok(PlanNode::Project {
+                        input: Box::new(optimized_input),
+                        columns: columns.clone(),
+                        table_aliases: std::collections::HashMap::new(),
+                        left_columns: None,
+                        right_columns: None,
+                    })
             }
-            PlanNode::Join { left, right, condition, join_type } => {
+            PlanNode::Join { left, right, condition, join_type, .. } => {
                 let optimized_left = self.apply(left.as_ref())?;
                 let optimized_right = self.apply(right.as_ref())?;
                 let optimized_condition = condition.as_ref()
@@ -587,6 +667,8 @@ impl ConstantFoldingRule {
                     right: Box::new(optimized_right),
                     condition: optimized_condition,
                     join_type: join_type.clone(),
+                    left_alias: None,
+                    right_alias: None,
                 })
             }
             _ => Ok(plan.clone()),
@@ -675,7 +757,7 @@ impl OptimizerRule for AggregationPushdownRule {
     fn apply(&self, plan: &PlanNode) -> Result<PlanNode> {
         match plan {
             // Case 1: Join followed by Aggregation - try to push aggregation down
-            PlanNode::Join { left, right, condition, join_type } => {
+            PlanNode::Join { left, right, condition, join_type, .. } => {
                 if self.can_pushdown_aggregation_through_join(left.as_ref(), right.as_ref()) {
                     // Transform: Join -> Aggregate into Aggregate -> Join where possible
                     if let Some(optimized_plan) = self.optimize_join_aggregation(left.as_ref(), right.as_ref(), condition, join_type.clone())? {
@@ -691,20 +773,25 @@ impl OptimizerRule for AggregationPushdownRule {
                     right: Box::new(optimized_right),
                     condition: condition.clone(),
                     join_type: join_type.clone(),
+                    left_alias: None,
+                    right_alias: None,
                 })
             }
 
             // Case 2: Project followed by Aggregation - eliminate unnecessary projections
-            PlanNode::Project { input, columns } => {
+            PlanNode::Project { input, columns, .. } => {
                 if let PlanNode::Aggregate { .. } = input.as_ref() {
                     // Remove redundant projection before aggregation
                     self.apply(input.as_ref())
-                } else {
+                 } else {
                     // Apply to input and keep projection
                     let optimized_input = self.apply(input.as_ref())?;
                     Ok(PlanNode::Project {
                         input: Box::new(optimized_input),
                         columns: columns.clone(),
+                        table_aliases: std::collections::HashMap::new(),
+                        left_columns: None,
+                        right_columns: None,
                     })
                 }
             }
@@ -835,7 +922,7 @@ impl AggregationPushdownRule {
                     condition: condition.clone(),
                 })
             }
-            PlanNode::Join { left, right, condition, join_type } => {
+            PlanNode::Join { left, right, condition, join_type, .. } => {
                 let optimized_left = self.apply(left.as_ref())?;
                 let optimized_right = self.apply(right.as_ref())?;
                 Ok(PlanNode::Join {
@@ -843,13 +930,18 @@ impl AggregationPushdownRule {
                     right: Box::new(optimized_right),
                     condition: condition.clone(),
                     join_type: join_type.clone(),
+                    left_alias: None,
+                    right_alias: None,
                 })
             }
-            PlanNode::Project { input, columns } => {
+            PlanNode::Project { input, columns, .. } => {
                 let optimized_input = self.apply(input.as_ref())?;
                 Ok(PlanNode::Project {
                     input: Box::new(optimized_input),
                     columns: columns.clone(),
+                    table_aliases: std::collections::HashMap::new(),
+                    left_columns: None,
+                    right_columns: None,
                 })
             }
             PlanNode::Aggregate { input, group_by_columns, aggregate_functions, having_clause } => {
@@ -889,7 +981,7 @@ impl OptimizerRule for ParallelPlanSelectionRule {
 
         // Then consider parallel execution for this node
         match &optimized_plan {
-            PlanNode::Scan { table_name, columns: _ } => {
+            PlanNode::Scan { table_name, columns: _, .. } => {
                 // Get table statistics (simplified - in real implementation would query catalog)
                 let table_stats = self.get_table_statistics(table_name)?;
 
@@ -912,7 +1004,7 @@ impl OptimizerRule for ParallelPlanSelectionRule {
                 }
             }
 
-            PlanNode::Join { left, right, condition: _, join_type: _ } => {
+            PlanNode::Join { left, right, condition: _, join_type: _, .. } => {
                 // Consider parallel hash join
                 if self.can_use_parallel_hash_join(&**left, &**right) {
                     let left_stats = self.estimate_plan_statistics(&**left)?;
@@ -1005,7 +1097,7 @@ impl ParallelPlanSelectionRule {
                     condition: condition.clone(),
                 })
             }
-            PlanNode::Join { left, right, condition, join_type } => {
+            PlanNode::Join { left, right, condition, join_type, .. } => {
                 let optimized_left = self.apply(left.as_ref())?;
                 let optimized_right = self.apply(right.as_ref())?;
                 Ok(PlanNode::Join {
@@ -1013,6 +1105,8 @@ impl ParallelPlanSelectionRule {
                     right: Box::new(optimized_right),
                     condition: condition.clone(),
                     join_type: join_type.clone(),
+                    left_alias: None,
+                    right_alias: None,
                 })
             }
             PlanNode::Aggregate { input, group_by_columns, aggregate_functions, having_clause } => {
@@ -1118,7 +1212,7 @@ impl ParallelJoinOrderingRule {
 impl OptimizerRule for ParallelJoinOrderingRule {
     fn apply(&self, plan: &PlanNode) -> Result<PlanNode> {
         match plan {
-            PlanNode::Join { left, right, condition, join_type } => {
+            PlanNode::Join { left, right, condition, join_type, .. } => {
                 // Try to optimize join order based on parallel execution costs
                 if let Some(optimized_join) = self.optimize_join_order(left.as_ref(), right.as_ref(), condition, *join_type)? {
                     Ok(optimized_join)
@@ -1126,12 +1220,14 @@ impl OptimizerRule for ParallelJoinOrderingRule {
                     // Apply to children and keep current order
                     let optimized_left = self.apply(left.as_ref())?;
                     let optimized_right = self.apply(right.as_ref())?;
-                    Ok(PlanNode::Join {
-                        left: Box::new(optimized_left),
-                        right: Box::new(optimized_right),
-                        condition: condition.clone(),
-                        join_type: join_type.clone(),
-                    })
+                Ok(PlanNode::Join {
+                    left: Box::new(optimized_left),
+                    right: Box::new(optimized_right),
+                    condition: condition.clone(),
+                    join_type: join_type.clone(),
+                    left_alias: None,
+                    right_alias: None,
+                })
                 }
             }
             _ => self.apply_to_children(plan),
@@ -1157,7 +1253,7 @@ impl ParallelJoinOrderingRule {
                     condition: condition.clone(),
                 })
             }
-            PlanNode::Join { left, right, condition, join_type } => {
+            PlanNode::Join { left, right, condition, join_type, .. } => {
                 let optimized_left = self.apply(left.as_ref())?;
                 let optimized_right = self.apply(right.as_ref())?;
                 Ok(PlanNode::Join {
@@ -1165,6 +1261,8 @@ impl ParallelJoinOrderingRule {
                     right: Box::new(optimized_right),
                     condition: condition.clone(),
                     join_type: join_type.clone(),
+                    left_alias: None,
+                    right_alias: None,
                 })
             }
             _ => Ok(plan.clone()),
@@ -1218,6 +1316,8 @@ impl ParallelJoinOrderingRule {
                 right: Box::new(left.clone()),
                 condition: condition.clone(),
                 join_type,
+                left_alias: None,
+                right_alias: None,
             }));
         }
 
@@ -1321,7 +1421,7 @@ impl ParallelAggregationOptimizationRule {
                     condition: condition.clone(),
                 })
             }
-            PlanNode::Join { left, right, condition, join_type } => {
+            PlanNode::Join { left, right, condition, join_type, .. } => {
                 let optimized_left = self.apply(left.as_ref())?;
                 let optimized_right = self.apply(right.as_ref())?;
                 Ok(PlanNode::Join {
@@ -1329,6 +1429,8 @@ impl ParallelAggregationOptimizationRule {
                     right: Box::new(optimized_right),
                     condition: condition.clone(),
                     join_type: join_type.clone(),
+                    left_alias: None,
+                    right_alias: None,
                 })
             }
             _ => Ok(plan.clone()),

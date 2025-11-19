@@ -24,6 +24,7 @@ pub struct CatalogManager {
     pub schema_manager: Arc<SchemaManager>,
     pub index_manager: Arc<IndexManager>,
     pub view_manager: Arc<ViewManager>,
+    buffer_manager: Option<std::sync::Arc<crate::storage::BufferPoolManager>>,
 }
 
 impl CatalogManager {
@@ -34,7 +35,15 @@ impl CatalogManager {
             schema_manager: Arc::new(SchemaManager::new()),
             index_manager: Arc::new(IndexManager::new()),
             view_manager: Arc::new(ViewManager::new()),
+            buffer_manager: None,
         }
+    }
+
+    /// Set the buffer manager for persistence operations
+    pub fn set_buffer_manager(&mut self, buffer_manager: std::sync::Arc<crate::storage::BufferPoolManager>) {
+        self.buffer_manager = Some(buffer_manager.clone());
+        // Also set it in the table manager
+        self.table_manager.set_buffer_manager(buffer_manager);
     }
 
     /// Initialize the catalog system
@@ -96,6 +105,11 @@ impl CatalogManager {
     /// Get table definition with resolved schema information
     pub fn get_table(&self, name: &str) -> Result<Option<TableDef>> {
         self.table_manager.get_table(name)
+    }
+
+    /// Update table definition (for ALTER TABLE operations)
+    pub fn update_table_definition(&self, table_name: &str, new_def: TableDef) -> Result<()> {
+        self.table_manager.update_table_definition(table_name, new_def)
     }
 
     /// List tables in a specific schema

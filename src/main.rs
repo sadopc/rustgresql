@@ -31,8 +31,8 @@ fn main() -> rustgresql::Result<()> {
         db
     };
 
-    // Initialize execution engine
-    let execution_engine = ExecutionEngine::new();
+    // Initialize execution engine with database's catalog and buffer manager
+    let execution_engine = ExecutionEngine::with_catalog_and_buffer(db.get_catalog(), db.get_buffer_manager());
 
     println!("RustgreSQL v0.1.0 - Phase 1.1 Query Execution Engine");
     println!("Type 'help' for commands, SQL queries, or 'exit' to quit.");
@@ -44,11 +44,27 @@ fn main() -> rustgresql::Result<()> {
         io::stdout().flush()?;
 
         let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
+        let mut line = String::new();
 
-        let command = input.trim();
+        // Read first line
+        io::stdin().read_line(&mut line)?;
+        input.push_str(&line);
 
-        match command {
+        // Continue reading lines until we find a semicolon
+        while !input.trim_end().ends_with(';') && !input.trim().is_empty() {
+            line.clear();
+            io::stdin().read_line(&mut line)?;
+            input.push_str(&line);
+        }
+
+        let command = input.lines()
+            .filter(|line| !line.trim().starts_with("rustgresql>") && !line.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string();
+
+        match command.as_str() {
             "exit" | "quit" => break,
             "help" => {
                 print_help();
@@ -64,6 +80,10 @@ fn main() -> rustgresql::Result<()> {
                 match execute_sql(&execution_engine, cmd) {
                     Ok((result, stats)) => {
                         print_query_result(&result, &stats);
+                        // Flush changes to disk
+                        if let Err(e) = db.get_buffer_manager().flush_all_pages() {
+                            eprintln!("Flush error: {}", e);
+                        }
                     }
                     Err(e) => {
                         // Check if it's a special command first
@@ -86,7 +106,11 @@ fn execute_sql(engine: &ExecutionEngine, sql: &str) -> rustgresql::Result<(rustg
     let statements = parse_sql(sql)?;
 
     if statements.is_empty() {
-        return Err(rustgresql::error::RustgreSQLError::Parse("No SQL statement found".to_string()));
+        // No statements found (e.g., just comments), return success
+        return Ok((rustgresql::executor::QueryResult {
+            rows: vec![],
+            column_names: vec![],
+        }, rustgresql::executor::ExecutionStats::default()));
     }
 
     // Execute the first statement (for now, we'll support single statements)
@@ -131,11 +155,11 @@ fn print_query_result(result: &rustgresql::executor::QueryResult, stats: &rustgr
 fn format_value(value: &rustgresql::types::Value) -> String {
     match &value.kind {
         rustgresql::types::ValueKind::Null(_) => "NULL".to_string(),
-        rustgresql::types::ValueKind::String(s) => format!("'{}'", s),
+        rustgresql::types::ValueKind::String(s) => s.clone(),
         rustgresql::types::ValueKind::Integer(i) => i.to_string(),
         rustgresql::types::ValueKind::Float(f) => f.to_string(),
         rustgresql::types::ValueKind::Boolean(b) => b.to_string(),
-        rustgresql::types::ValueKind::Timestamp(ts) => format!("'{}'", ts.format("%Y-%m-%d %H:%M:%S")),
+        rustgresql::types::ValueKind::Timestamp(ts) => ts.format("%Y-%m-%d %H:%M:%S").to_string(),
     }
 }
 
@@ -197,7 +221,7 @@ fn print_examples() {
     println!("SELECT COALESCE(phone, 'N/A') FROM customers;");
 }
 
-fn handle_special_command(cmd: &str, db: &Database) -> bool {
+fn handle_special_command(cmd: &str, _db: &Database) -> bool {
     match cmd {
         "test" => {
             println!("Running basic functionality test...");

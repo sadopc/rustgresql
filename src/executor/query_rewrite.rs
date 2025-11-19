@@ -32,7 +32,7 @@ struct QueryPattern {
     /// Aggregate functions
     aggregates: Vec<AggregateFunction>,
     /// Projected columns
-    projections: Vec<Expression>,
+    projections: Vec<ColumnSpec>,
 }
 
 /// Join condition for pattern matching
@@ -209,8 +209,8 @@ impl QueryRewriter {
 
                 // Extract aggregates
                 let mut aggregates = Vec::new();
-                for column in columns {
-                    self.extract_aggregates(column, &mut aggregates);
+                for col_spec in columns {
+                    self.extract_aggregates(&col_spec.expr, &mut aggregates);
                 }
 
                 Ok(QueryPattern {

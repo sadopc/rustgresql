@@ -23,6 +23,8 @@ pub use catalog::{CatalogManager, TableDef, ColumnDef, IndexDef, get_catalog};
 pub use types::{DataType, DataTypeKind, Value, ValueKind};
 pub use optimizer::{CostModel, StatisticsManager, IndexSelector, OptimizedQueryPlanner as QueryOptimizer};
 
+use std::sync::Arc;
+
 #[cfg(feature = "parallel")]
 pub use executor::parallel::{ParallelExecutor, ParallelExecutorConfig, ParallelExecutionResult};
 
@@ -76,8 +78,10 @@ impl Database {
         );
 
         // Initialize catalog manager
-        let catalog_manager = get_catalog();
+        let mut catalog_manager = catalog::CatalogManager::new();
+        catalog_manager.set_buffer_manager(buffer_manager.clone());
         catalog_manager.initialize()?;
+        let catalog_manager = Arc::new(catalog_manager);
 
         Ok(Self {
             config,
@@ -111,8 +115,10 @@ impl Database {
         );
 
         // Initialize catalog manager
-        let catalog_manager = get_catalog();
+        let mut catalog_manager = catalog::CatalogManager::new();
+        catalog_manager.set_buffer_manager(buffer_manager.clone());
         catalog_manager.initialize()?;
+        let catalog_manager = Arc::new(catalog_manager);
 
         Ok(Self {
             config,

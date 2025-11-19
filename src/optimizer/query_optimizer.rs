@@ -73,6 +73,8 @@ impl OptimizedQueryPlanner {
                         right: Box::new(right_plan),
                         condition: join.condition.clone(),
                         join_type: join.join_type.clone(),
+                        left_alias: None,
+                        right_alias: join.table.alias.clone(),
                     };
                 }
 
@@ -82,37 +84,42 @@ impl OptimizedQueryPlanner {
                 }
 
                 // Apply GROUP BY and aggregation if present
-                if !group_by.is_empty() || self.has_aggregate_functions(columns) {
+                if !group_by.is_empty() || self.has_aggregate_functions(&columns.iter().map(|c| c.expr.clone()).collect::<Vec<_>>()) {
                     plan = self.plan_aggregation_optimized(plan, select)?;
                 }
 
-                // Apply column projection (if not already handled by aggregation)
-                if !self.has_aggregate_functions(columns) {
-                    if columns.len() == 1 && matches!(columns[0], Expression::Star) {
-                        // SELECT * - no explicit projection needed
-                    } else {
+                // Apply column projection
+                if columns.len() == 1 && matches!(columns[0].expr, Expression::Star) {
+                    // SELECT * - no explicit projection needed
+                } else {
                         let projections: Vec<(String, Expression)> = columns
                             .iter()
                             .enumerate()
-                            .map(|(i, expr)| {
-                                let column_name = match expr {
-                                    Expression::Column { name, .. } => name.clone(),
-                                    Expression::Star => "*".to_string(),
-                                    _ => format!("col{}", i),
+                            .map(|(i, col_spec)| {
+                                let column_name = if let Some(alias) = &col_spec.alias {
+                                    alias.clone()
+                                } else {
+                                    match &col_spec.expr {
+                                        Expression::Column { name, .. } => name.clone(),
+                                        Expression::Star => "*".to_string(),
+                                        _ => format!("col{}", i),
+                                    }
                                 };
-                                (column_name, expr.clone())
+                                (column_name, col_spec.expr.clone())
                             })
                             .collect();
 
                         plan = PlanNode::Project {
                             input: Box::new(plan),
                             columns: projections,
+                            table_aliases: std::collections::HashMap::new(),
+                            left_columns: None,
+                            right_columns: None,
                         };
-                    }
                 }
 
                 // Apply optimization rules to the final plan
-                plan = self.rule_engine.optimize(&plan)?;
+                // plan = self.rule_engine.optimize(&plan)?; // Disabled for now
 
                 // Create output schema (simplified)
                 let output_schema = self.create_output_schema(&plan, columns);
@@ -152,6 +159,8 @@ impl OptimizedQueryPlanner {
                         right: Box::new(right_plan),
                         condition: None,
                         join_type: JoinType::Inner,
+                        left_alias: None,
+                        right_alias: None,
                     };
                 }
                 Ok(plan)
@@ -177,6 +186,7 @@ impl OptimizedQueryPlanner {
         Ok(PlanNode::Scan {
             table_name: table_name.to_string(),
             columns: required_columns.to_vec(),
+            alias: None,
         })
     }
 
@@ -192,7 +202,7 @@ impl OptimizedQueryPlanner {
         let (table_conditions, remaining_condition) = self.extract_table_conditions(where_clause);
 
         // If the input is a simple table scan, we can optimize with indexes
-        if let PlanNode::Scan { table_name, columns } = &input_plan {
+        if let PlanNode::Scan { table_name, columns, .. } = &input_plan {
             if let Some(conditions) = table_conditions.get(table_name) {
                 if let Some(indexes) = table_indexes.iter().find(|(name, _)| name == table_name) {
                     // Try to select best index for these conditions
@@ -373,14 +383,14 @@ impl OptimizedQueryPlanner {
     pub fn extract_required_columns(&self, select: &SelectStatement) -> Vec<String> {
         match select {
             SelectStatement::Simple { columns, .. } => {
-                if columns.len() == 1 && matches!(columns[0], Expression::Star) {
+                if columns.len() == 1 && matches!(columns[0].expr, Expression::Star) {
                     // SELECT * - we can't determine exact columns without schema info
                     Vec::new() // Empty means all columns
                 } else {
                     // Extract column names from expressions
                     let mut required_columns = Vec::new();
-                    for expr in columns {
-                        self.extract_columns_from_expression(expr, &mut required_columns);
+                    for col_spec in columns {
+                        self.extract_columns_from_expression(&col_spec.expr, &mut required_columns);
                     }
                     required_columns.sort();
                     required_columns.dedup();
@@ -425,10 +435,10 @@ impl OptimizedQueryPlanner {
     }
 
     /// Create output schema for execution plan
-    fn create_output_schema(&self, plan: &PlanNode, select_columns: &[Expression]) -> Vec<(String, crate::types::DataType)> {
+    fn create_output_schema(&self, plan: &PlanNode, select_columns: &[ColumnSpec]) -> Vec<(String, crate::types::DataType)> {
         // Simplified schema creation - in a real implementation, this would
         // query the catalog for actual column types
-        if select_columns.len() == 1 && matches!(select_columns[0], Expression::Star) {
+        if select_columns.len() == 1 && matches!(select_columns[0].expr, Expression::Star) {
             match plan {
                 PlanNode::Scan { table_name, .. } => {
                     vec![("column1".to_string(), crate::types::DataType::new(crate::types::DataTypeKind::Text))]
@@ -445,10 +455,14 @@ impl OptimizedQueryPlanner {
             select_columns
                 .iter()
                 .enumerate()
-                .map(|(i, expr)| {
-                    let column_name = match expr {
-                        Expression::Column { name, .. } => name.clone(),
-                        _ => format!("col{}", i),
+                .map(|(i, col_spec)| {
+                    let column_name = if let Some(alias) = &col_spec.alias {
+                        alias.clone()
+                    } else {
+                        match &col_spec.expr {
+                            Expression::Column { name, .. } => name.clone(),
+                            _ => format!("col{}", i),
+                        }
                     };
                     (column_name, crate::types::DataType::new(crate::types::DataTypeKind::Text))
                 })
@@ -533,7 +547,8 @@ impl OptimizedQueryPlanner {
                 let mut group_by_columns = group_by.clone();
 
                 // Add GROUP BY columns from SELECT list that aren't aggregate functions
-                for expr in columns {
+                for col_spec in columns {
+                    let expr = &col_spec.expr;
                     if !self.is_aggregate_function(expr) && !matches!(expr, Expression::Star) {
                         // Check if this column is already in GROUP BY
                         if !group_by.iter().any(|g_expr| self.expressions_equal(g_expr, expr)) {
@@ -545,13 +560,18 @@ impl OptimizedQueryPlanner {
                 }
 
                 // Extract aggregate functions with their aliases
-                for (i, expr) in columns.iter().enumerate() {
+                for (i, col_spec) in columns.iter().enumerate() {
+                    let expr = &col_spec.expr;
                     if self.is_aggregate_function(expr) {
-                        let alias = match expr {
-                            Expression::Function { name, .. } => {
-                                format!("{}_{}", name.to_lowercase(), i)
+                        let alias = if let Some(alias) = &col_spec.alias {
+                            alias.clone()
+                        } else {
+                            match expr {
+                                Expression::Function { name, .. } => {
+                                    format!("{}_{}", name.to_lowercase(), i)
+                                }
+                                _ => format!("aggregate{}", i),
                             }
-                            _ => format!("aggregate{}", i),
                         };
                         aggregate_functions.push((alias, expr.clone()));
                     } else if matches!(expr, Expression::Star) && !group_by.is_empty() {
@@ -560,13 +580,17 @@ impl OptimizedQueryPlanner {
                             name: "COUNT".to_string(),
                             args: vec![Expression::Star],
                         };
-                        let alias = format!("count_star_{}", i);
+                        let alias = if let Some(alias) = &col_spec.alias {
+                            alias.clone()
+                        } else {
+                            format!("count_star_{}", i)
+                        };
                         aggregate_functions.push((alias, count_star));
                     }
                 }
 
                 // Handle COUNT(*) case
-                if columns.len() == 1 && matches!(&columns[0], Expression::Star) {
+                if columns.len() == 1 && matches!(&columns[0].expr, Expression::Star) {
                     let count_star = Expression::Function {
                         name: "COUNT".to_string(),
                         args: vec![Expression::Star],

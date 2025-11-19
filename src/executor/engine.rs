@@ -2,7 +2,8 @@
 //!
 //! Coordinates query execution and manages executor state
 
-use crate::{Result, sql::{Statement, SelectStatement, InsertStatement, UpdateStatement, DeleteStatement, CreateTableStatement}, sql::ast::{CreateIndexStatement, DropTableStatement, DropIndexStatement, AlterTableStatement, CreateViewStatement, DropViewStatement, RefreshMaterializedViewStatement, CreateProcedureStatement, CreateFunctionStatement, DropProcedureStatement, DropFunctionStatement, CallProcedureStatement, PerformStatement}, executor::planner::{QueryPlanner, PlanNode}, executor::operators::{QueryResult, ExecutionContext}};
+use crate::{Result, sql::{Statement, SelectStatement, InsertStatement, UpdateStatement, DeleteStatement, CreateTableStatement}, sql::ast::{CreateIndexStatement, DropTableStatement, DropIndexStatement, AlterTableStatement, CreateViewStatement, DropViewStatement, RefreshMaterializedViewStatement, CreateProcedureStatement, CreateFunctionStatement, DropProcedureStatement, DropFunctionStatement, CallProcedureStatement, PerformStatement, Expression}, executor::planner::{QueryPlanner, PlanNode}, executor::operators::{QueryResult, ExecutionContext}};
+use std::sync::Arc;
 use crate::executor::ddl_error::{DdlError, DdlOperation};
 use crate::executor::query_rewrite::QueryRewriter;
 use crate::executor::procedure::ProcedureExecutor;
@@ -14,6 +15,7 @@ use crate::storage::schema_evolution::{TableSchema, ColumnSchema, ConstraintSche
 
 /// Execution statistics
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct ExecutionStats {
     pub rows_scanned: usize,
     pub rows_filtered: usize,
@@ -44,7 +46,29 @@ impl Executor {
 
         Self {
             context,
-            planner: QueryPlanner::new(),
+            planner: QueryPlanner::with_catalog(catalog.clone()),
+            stats: ExecutionStats {
+                rows_scanned: 0,
+                rows_filtered: 0,
+                rows_produced: 0,
+                execution_time_ms: 0,
+            },
+            catalog,
+            buffer_manager,
+            query_rewriter: QueryRewriter::new(),
+            procedure_executor: ProcedureExecutor::new(),
+        }
+    }
+
+    /// Create executor with specific catalog and buffer manager
+    pub fn with_catalog_and_buffer(catalog: std::sync::Arc<crate::catalog::CatalogManager>, buffer_manager: std::sync::Arc<crate::storage::BufferPoolManager>) -> Self {
+        let mut context = ExecutionContext::new();
+        context.set_catalog(catalog.clone());
+        context.set_buffer_manager(buffer_manager.clone());
+
+        Self {
+            context,
+            planner: QueryPlanner::with_catalog(catalog.clone()),
             stats: ExecutionStats {
                 rows_scanned: 0,
                 rows_filtered: 0,
@@ -367,12 +391,10 @@ impl Executor {
 
     /// Execute CREATE INDEX statement
     fn execute_create_index(&mut self, create: &CreateIndexStatement) -> Result<QueryResult> {
-        use crate::catalog::{get_catalog, IndexType};
-
-        let catalog = get_catalog();
+        use crate::catalog::IndexType;
 
         // Check if index already exists
-        if let Some(_) = catalog.index_manager.get_index(&create.index_name)? {
+        if let Some(_) = self.catalog.index_manager.get_index(&create.index_name)? {
             if create.if_not_exists {
                 self.context.log(&format!("Index '{}' already exists, skipping", create.index_name));
                 return Ok(QueryResult {
@@ -385,13 +407,13 @@ impl Executor {
         }
 
         // Get table
-        let table_def = match catalog.get_table(&create.table_name)? {
+        let table_def = match self.catalog.get_table(&create.table_name)? {
             Some(table) => table,
             None => return Err(crate::executor::ddl_error::DdlError::table_not_found(&create.table_name, crate::executor::ddl_error::DdlOperation::Create).into()),
         };
 
         // Create the index
-        let index_id = catalog.index_manager.create_index(
+        let index_id = self.catalog.index_manager.create_index(
             &create.index_name,
             table_def.table_id,
             create.columns.clone(),
@@ -409,20 +431,18 @@ impl Executor {
 
     /// Execute DROP TABLE statement
     fn execute_drop_table(&mut self, drop: &DropTableStatement) -> Result<QueryResult> {
-        use crate::catalog::get_catalog;
         use crate::executor::ddl_error::{DdlError, DdlOperation, DdlObjectType};
         use crate::transaction::ddl_transaction::{get_ddl_transaction_manager, DdlOperationType, RollbackInfo};
 
-        let catalog = get_catalog();
         let table_name = &drop.table_name;
 
         // Resolve table reference (schema.table or just table)
-        let (schema_name, resolved_table_name) = catalog.resolve_table_reference(table_name)?;
+        let (schema_name, resolved_table_name) = self.catalog.resolve_table_reference(table_name)?;
 
         self.context.log(&format!("Dropping table: {}.{}", schema_name, resolved_table_name));
 
         // Check if table exists
-        let table_def = match catalog.get_table(&resolved_table_name)? {
+        let table_def = match self.catalog.get_table(&resolved_table_name)? {
             Some(table) => table,
             None => {
                 if drop.if_exists {
@@ -438,7 +458,7 @@ impl Executor {
         };
 
         // Verify table is in the correct schema
-        if catalog.validate_table_in_schema(&resolved_table_name, &schema_name)? {
+        if self.catalog.validate_table_in_schema(&resolved_table_name, &schema_name)? {
             // Begin DDL transaction for safety
             let ddl_tx_manager = get_ddl_transaction_manager();
             let transaction_id = 1; // Simplified transaction ID
@@ -458,7 +478,7 @@ impl Executor {
             ddl_tx_manager.acquire_global_lock(&lock_object_name, transaction_id)?;
 
             // Check for dependent objects (foreign key references from other tables)
-            let dependents = self.find_table_dependents(&resolved_table_name, &catalog)?;
+            let dependents = self.find_table_dependents(&resolved_table_name, &self.catalog)?;
 
             if !dependents.is_empty() {
                 // If there are dependents, we need to either use CASCADE or fail
@@ -490,7 +510,8 @@ impl Executor {
             ddl_context.start_operation(operation_id)?;
 
             // Execute the actual table drop
-            self.drop_table_with_dependencies(&resolved_table_name, &catalog)?;
+            let catalog_clone = self.catalog.clone();
+            self.drop_table_with_dependencies(&resolved_table_name, &catalog_clone)?;
 
             // Mark operation as completed
             ddl_context.complete_operation(operation_id)?;
@@ -511,11 +532,10 @@ impl Executor {
 
     /// Execute DROP INDEX statement
     fn execute_drop_index(&mut self, drop: &DropIndexStatement) -> Result<QueryResult> {
-        use crate::catalog::get_catalog;
         use crate::executor::ddl_error::{DdlError, DdlOperation, DdlObjectType};
         use crate::transaction::ddl_transaction::{get_ddl_transaction_manager, DdlOperationType, RollbackInfo};
 
-        let catalog = get_catalog();
+        let catalog = self.catalog.clone();
         let index_name = &drop.index_name;
 
         self.context.log(&format!("Dropping index: {}", index_name));
@@ -614,12 +634,185 @@ impl Executor {
         })
     }
 
-    /// Execute CREATE VIEW statement
-    fn execute_create_view(&mut self, create: &CreateViewStatement) -> Result<QueryResult> {
-        use crate::catalog::get_catalog;
+    /// Convert SelectStatement to SQL string for storage
+    fn select_to_sql(select: &SelectStatement) -> String {
         use crate::sql::ast::SelectStatement;
 
-        let catalog = get_catalog();
+        match select {
+            SelectStatement::Simple {
+                distinct,
+                columns,
+                from,
+                where_clause,
+                group_by,
+                having,
+                order_by,
+                limit,
+                offset,
+                ..
+            } => {
+                let mut sql = String::from("SELECT ");
+
+                if *distinct {
+                    sql.push_str("DISTINCT ");
+                }
+
+                // Columns
+                if columns.is_empty() {
+                    sql.push('*');
+                } else {
+                    let col_strs: Vec<String> = columns.iter().map(|col| {
+                        let expr_str = Self::expression_to_sql(&col.expr);
+                        if let Some(alias) = &col.alias {
+                            format!("{} AS {}", expr_str, alias)
+                        } else {
+                            expr_str
+                        }
+                    }).collect();
+                    sql.push_str(&col_strs.join(", "));
+                }
+
+                // FROM clause
+                if !from.is_empty() {
+                    sql.push_str(" FROM ");
+                    let from_strs: Vec<String> = from.iter().map(|table_ref| {
+                        if let Some(alias) = &table_ref.alias {
+                            format!("{} AS {}", table_ref.name, alias)
+                        } else {
+                            table_ref.name.clone()
+                        }
+                    }).collect();
+                    sql.push_str(&from_strs.join(", "));
+                }
+
+                // WHERE clause
+                if let Some(where_expr) = where_clause {
+                    sql.push_str(" WHERE ");
+                    sql.push_str(&Self::expression_to_sql(where_expr));
+                }
+
+                // GROUP BY
+                if !group_by.is_empty() {
+                    sql.push_str(" GROUP BY ");
+                    let group_strs: Vec<String> = group_by.iter().map(|expr| Self::expression_to_sql(expr)).collect();
+                    sql.push_str(&group_strs.join(", "));
+                }
+
+                // HAVING
+                if let Some(having_expr) = having {
+                    sql.push_str(" HAVING ");
+                    sql.push_str(&Self::expression_to_sql(having_expr));
+                }
+
+                // ORDER BY
+                if !order_by.is_empty() {
+                    sql.push_str(" ORDER BY ");
+                    let order_strs: Vec<String> = order_by.iter().map(|order| {
+                        use crate::sql::ast::SortDirection;
+                        let expr_str = Self::expression_to_sql(&order.expr);
+                        match order.direction {
+                            SortDirection::Desc => format!("{} DESC", expr_str),
+                            SortDirection::Asc => expr_str,
+                        }
+                    }).collect();
+                    sql.push_str(&order_strs.join(", "));
+                }
+
+                // LIMIT
+                if let Some(limit_val) = limit {
+                    sql.push_str(&format!(" LIMIT {}", limit_val));
+                }
+
+                // OFFSET
+                if let Some(offset_val) = offset {
+                    sql.push_str(&format!(" OFFSET {}", offset_val));
+                }
+
+                sql
+            }
+            SelectStatement::SetOperation(_) => {
+                // For set operations, fall back to debug format for now
+                format!("{:?}", select)
+            }
+        }
+    }
+
+    /// Convert Expression to SQL string
+    fn expression_to_sql(expr: &Expression) -> String {
+        use crate::sql::ast::{BinaryOperator, UnaryOperator};
+        use crate::types::ValueKind;
+
+        match expr {
+            Expression::Column { name, table } => {
+                if let Some(table_name) = table {
+                    format!("{}.{}", table_name, name)
+                } else {
+                    name.clone()
+                }
+            }
+            Expression::Value(val) | Expression::Literal(val) => match &val.kind {
+                ValueKind::Integer(i) => i.to_string(),
+                ValueKind::Float(f) => f.to_string(),
+                ValueKind::String(s) => format!("'{}'", s.replace('\'', "''")),
+                ValueKind::Boolean(b) => b.to_string().to_uppercase(),
+                ValueKind::Null(_) => "NULL".to_string(),
+                _ => format!("{:?}", val),
+            }
+            Expression::BinaryOp { left, op, right } => {
+                let op_str = Self::binary_op_to_sql(op);
+                format!("{} {} {}", Self::expression_to_sql(left), op_str, Self::expression_to_sql(right))
+            }
+            Expression::UnaryOp { op, expr } => {
+                let op_str = Self::unary_op_to_sql(op);
+                format!("{} {}", op_str, Self::expression_to_sql(expr))
+            }
+            Expression::Function { name, args } => {
+                let arg_strs: Vec<String> = args.iter().map(|arg| Self::expression_to_sql(arg)).collect();
+                format!("{}({})", name, arg_strs.join(", "))
+            }
+            Expression::Star => "*".to_string(),
+            _ => format!("{:?}", expr), // Fallback for complex expressions
+        }
+    }
+
+    /// Convert BinaryOperator to SQL string
+    fn binary_op_to_sql(op: &crate::sql::ast::BinaryOperator) -> &'static str {
+        use crate::sql::ast::BinaryOperator;
+        match op {
+            BinaryOperator::Equals => "=",
+            BinaryOperator::NotEquals => "!=",
+            BinaryOperator::LessThan => "<",
+            BinaryOperator::LessThanOrEquals => "<=",
+            BinaryOperator::GreaterThan => ">",
+            BinaryOperator::GreaterThanOrEquals => ">=",
+            BinaryOperator::Like => "LIKE",
+            BinaryOperator::ILike => "ILIKE",
+            BinaryOperator::In => "IN",
+            BinaryOperator::And => "AND",
+            BinaryOperator::Or => "OR",
+            BinaryOperator::Is => "IS",
+            BinaryOperator::Add => "+",
+            BinaryOperator::Subtract => "-",
+            BinaryOperator::Multiply => "*",
+            BinaryOperator::Divide => "/",
+        }
+    }
+
+    /// Convert UnaryOperator to SQL string
+    fn unary_op_to_sql(op: &crate::sql::ast::UnaryOperator) -> &'static str {
+        use crate::sql::ast::UnaryOperator;
+        match op {
+            UnaryOperator::Not => "NOT",
+            UnaryOperator::Minus => "-",
+            UnaryOperator::Plus => "+",
+        }
+    }
+
+    /// Execute CREATE VIEW statement
+    fn execute_create_view(&mut self, create: &CreateViewStatement) -> Result<QueryResult> {
+        use crate::sql::ast::SelectStatement;
+
+        let catalog = &self.catalog;
         let view_name = &create.view_name;
 
         self.context.log(&format!("Creating {}view: {}",
@@ -636,8 +829,8 @@ impl Executor {
             }).collect()
         };
 
-        // Convert the SelectStatement to string for storage
-        let query_string = format!("{:?}", create.query);
+        // Convert the SelectStatement to SQL string for storage
+        let query_string = Self::select_to_sql(&create.query);
 
         // Create the view using the catalog manager
         let view_id = catalog.create_view(
@@ -668,9 +861,7 @@ impl Executor {
 
     /// Execute DROP VIEW statement
     fn execute_drop_view(&mut self, drop: &DropViewStatement) -> Result<QueryResult> {
-        use crate::catalog::get_catalog;
-
-        let catalog = get_catalog();
+        let catalog = self.catalog.clone();
         let view_name = &drop.view_name;
 
         self.context.log(&format!("Dropping {}view: {}",
@@ -698,9 +889,7 @@ impl Executor {
 
     /// Execute REFRESH MATERIALIZED VIEW statement
     fn execute_refresh_materialized_view(&mut self, refresh: &RefreshMaterializedViewStatement) -> Result<QueryResult> {
-        use crate::catalog::get_catalog;
-
-        let catalog = get_catalog();
+        let catalog = &self.catalog;
         let view_name = &refresh.view_name;
 
         self.context.log(&format!("Refreshing materialized view: {} ({})",
@@ -720,20 +909,18 @@ impl Executor {
 
     /// Execute ALTER TABLE statement
     fn execute_alter_table(&mut self, alter: &AlterTableStatement) -> Result<QueryResult> {
-        use crate::catalog::get_catalog;
         use crate::executor::ddl_error::{DdlError, DdlOperation, DdlObjectType};
         use crate::transaction::ddl_transaction::{get_ddl_transaction_manager, DdlOperationType, RollbackInfo};
 
-        let catalog = get_catalog();
         let table_name = &alter.table_name;
 
         // Resolve table reference (schema.table or just table)
-        let (schema_name, resolved_table_name) = catalog.resolve_table_reference(table_name)?;
+        let (schema_name, resolved_table_name) = self.catalog.resolve_table_reference(table_name)?;
 
         self.context.log(&format!("Altering table: {}.{}", schema_name, resolved_table_name));
 
         // Check if table exists
-        let table_def = match catalog.get_table(&resolved_table_name)? {
+        let table_def = match self.catalog.get_table(&resolved_table_name)? {
             Some(table) => table,
             None => {
                 return Err(DdlError::table_not_found(&resolved_table_name, DdlOperation::Alter).into());
@@ -741,7 +928,7 @@ impl Executor {
         };
 
         // Verify table is in the correct schema
-        if !catalog.validate_table_in_schema(&resolved_table_name, &schema_name)? {
+        if !self.catalog.validate_table_in_schema(&resolved_table_name, &schema_name)? {
             return Err(DdlError::table_not_found(&format!("{}.{}", schema_name, resolved_table_name), DdlOperation::Alter).into());
         }
 
@@ -764,7 +951,8 @@ impl Executor {
         ddl_tx_manager.acquire_global_lock(&lock_object_name, transaction_id)?;
 
         // Validate the specific ALTER operation
-        self.validate_alter_table_operation(&alter.operation, &table_def, &catalog)?;
+        let catalog_clone = self.catalog.clone();
+        self.validate_alter_table_operation(&alter.operation, &table_def, &catalog_clone)?;
 
         // Create rollback information based on operation type
         let rollback_info = self.create_alter_table_rollback_info(&alter.operation, &table_def)?;
@@ -784,7 +972,8 @@ impl Executor {
         ddl_context.start_operation(operation_id)?;
 
         // Execute the specific ALTER TABLE operation
-        let result = self.execute_alter_table_operation(&alter.operation, &resolved_table_name, &schema_name, &catalog)?;
+        let catalog_clone = self.catalog.clone();
+        let result = self.execute_alter_table_operation(&alter.operation, &resolved_table_name, &schema_name, &catalog_clone)?;
 
         // Mark operation as completed
         ddl_context.complete_operation(operation_id)?;
@@ -1398,7 +1587,7 @@ impl Executor {
         println!("Executing ADD COLUMN {} to table {}", column.name, table_name);
 
         // Get catalog and table definition
-        let catalog = crate::catalog::get_catalog();
+        let catalog = &self.catalog;
         let mut table_def = catalog.get_table(table_name)?
             .ok_or_else(|| DdlError::table_not_found(table_name, DdlOperation::Alter))?;
 
@@ -1414,9 +1603,8 @@ impl Executor {
         table_def.columns.push(new_column);
         table_def.modified_at = std::time::SystemTime::now();
 
-        // Update table in catalog
-        // Note: In a real implementation, this would be done through catalog.update_table()
-        // For now, this is a placeholder for the actual catalog update
+        // Update table in catalog - persist the changes
+        catalog.update_table_definition(table_name, table_def)?;
         println!("Successfully added column {} to table {}", column.name, table_name);
 
         Ok(())
@@ -1426,7 +1614,7 @@ impl Executor {
         println!("Executing DROP COLUMN {} from table {}", column_name, table_name);
 
         // Get catalog and table definition
-        let catalog = crate::catalog::get_catalog();
+        let catalog = &self.catalog;
         let mut table_def = catalog.get_table(table_name)?
             .ok_or_else(|| DdlError::table_not_found(table_name, DdlOperation::Alter))?;
 
@@ -1450,7 +1638,8 @@ impl Executor {
             }
         });
 
-        // Update table in catalog
+        // Update table in catalog - persist the changes
+        catalog.update_table_definition(table_name, table_def)?;
         println!("Successfully dropped column {} from table {}", column_name, table_name);
 
         Ok(())
@@ -1460,7 +1649,7 @@ impl Executor {
         println!("Executing RENAME COLUMN {} to {} in table {}", old_name, new_name, table_name);
 
         // Get catalog and table definition
-        let catalog = crate::catalog::get_catalog();
+        let catalog = &self.catalog;
         let mut table_def = catalog.get_table(table_name)?
             .ok_or_else(|| DdlError::table_not_found(table_name, DdlOperation::Alter))?;
 
@@ -1503,6 +1692,8 @@ impl Executor {
             }
         }
 
+        // Update table in catalog - persist the changes
+        catalog.update_table_definition(table_name, table_def)?;
         println!("Successfully renamed column {} to {} in table {}", old_name, new_name, table_name);
 
         Ok(())
@@ -1512,7 +1703,7 @@ impl Executor {
         println!("Executing ADD CONSTRAINT on table {}", table_name);
 
         // Get catalog and table definition
-        let catalog = crate::catalog::get_catalog();
+        let catalog = &self.catalog;
         let mut table_def = catalog.get_table(table_name)?
             .ok_or_else(|| DdlError::table_not_found(table_name, DdlOperation::Alter))?;
 
@@ -1625,7 +1816,7 @@ impl Executor {
         println!("Executing DROP CONSTRAINT {} on table {}", constraint_name, table_name);
 
         // Get catalog and table definition
-        let catalog = crate::catalog::get_catalog();
+        let catalog = &self.catalog;
         let mut table_def = catalog.get_table(table_name)?
             .ok_or_else(|| DdlError::table_not_found(table_name, DdlOperation::Alter))?;
 
@@ -1754,7 +1945,7 @@ impl Executor {
                 }
 
                 // Check if referenced table exists
-                let catalog = crate::catalog::get_catalog();
+                let catalog = &self.catalog;
                 if catalog.get_table(ref_table)?.is_none() {
                     return Err(DdlError::table_not_found(ref_table, DdlOperation::Create).into());
                 }
@@ -1846,7 +2037,7 @@ impl Executor {
         }
 
         // Check data type compatibility
-        let catalog = crate::catalog::get_catalog();
+        let catalog = &self.catalog;
         let table_def = catalog.get_table(table_name)?
             .ok_or_else(|| DdlError::table_not_found(table_name, DdlOperation::Alter))?;
         let ref_table_def = catalog.get_table(referenced_table)?
@@ -1889,7 +2080,7 @@ impl Executor {
         match constraint {
             crate::catalog::TableConstraint::PrimaryKey { .. } => {
                 // Check if any foreign keys reference this primary key
-                let catalog = crate::catalog::get_catalog();
+                let catalog = &self.catalog;
                 let table_list = catalog.table_manager.list_tables()?;
                 for table_info in table_list {
                     if let Ok(table_def) = catalog.get_table(&table_info.name) {
@@ -1936,7 +2127,7 @@ impl Executor {
         println!("Executing RENAME TABLE {} to {}", old_name, new_name);
 
         // Get catalog
-        let catalog = crate::catalog::get_catalog();
+        let catalog = &self.catalog;
 
         // Check if new table name already exists
         if catalog.get_table(new_name)?.is_some() {
@@ -2240,17 +2431,44 @@ impl Executor {
 /// Execution engine
 #[derive(Debug)]
 pub struct ExecutionEngine {
-    // In a real implementation, this would manage multiple executors, connection pooling, etc.
+    catalog: std::sync::Arc<CatalogManager>,
+    buffer_manager: std::sync::Arc<crate::storage::BufferPoolManager>,
 }
 
 impl ExecutionEngine {
     pub fn new() -> Self {
-        Self { }
+        let catalog = get_catalog();
+        let buffer_manager = Self::create_buffer_manager();
+        Self { catalog, buffer_manager }
+    }
+
+    pub fn with_catalog_and_buffer(catalog: std::sync::Arc<CatalogManager>, buffer_manager: std::sync::Arc<crate::storage::BufferPoolManager>) -> Self {
+        Self { catalog, buffer_manager }
+    }
+
+    fn create_buffer_manager() -> std::sync::Arc<crate::storage::BufferPoolManager> {
+        use crate::storage::file_manager::DefaultFileManager;
+
+        let file_path = "rustgresql.db";
+        let file_manager = if std::path::Path::new(file_path).exists() {
+            DefaultFileManager::open(file_path).unwrap_or_else(|_| {
+                DefaultFileManager::create(file_path, 8192).unwrap()
+            })
+        } else {
+            DefaultFileManager::create(file_path, 8192).unwrap()
+        };
+
+        std::sync::Arc::new(
+            crate::storage::BufferPoolManager::new(
+                1000,
+                std::sync::Arc::new(std::sync::Mutex::new(file_manager))
+            )
+        )
     }
 
     /// Create a new executor
     pub fn create_executor(&self) -> Executor {
-        Executor::new()
+        Executor::with_catalog_and_buffer(self.catalog.clone(), self.buffer_manager.clone())
     }
 
     /// Execute a query with a new executor

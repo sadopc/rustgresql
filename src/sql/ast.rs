@@ -45,6 +45,13 @@ pub struct ColumnDef {
     pub constraints: Vec<ColumnConstraint>,
 }
 
+/// Column specification for SELECT (expression with optional alias)
+#[derive(Debug, Clone)]
+pub struct ColumnSpec {
+    pub expr: Expression,
+    pub alias: Option<String>,
+}
+
 /// Table reference
 #[derive(Debug, Clone)]
 pub struct TableRef {
@@ -244,7 +251,7 @@ pub enum SelectStatement {
     Simple {
         with_clause: Option<WithClause>,
         distinct: bool,
-        columns: Vec<Expression>,
+        columns: Vec<ColumnSpec>,
         from: Vec<TableRef>,
         joins: Vec<JoinCondition>,
         where_clause: Option<Expression>,

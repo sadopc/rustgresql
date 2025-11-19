@@ -13,6 +13,14 @@ pub struct EvaluationContext {
     pub columns: HashMap<String, Value>,
     /// Row data as a list for indexed access
     pub row_data: Option<Vec<Value>>,
+    /// For joins: left row data
+    pub left_row: Option<Vec<Value>>,
+    /// For joins: right row data
+    pub right_row: Option<Vec<Value>>,
+    /// For joins: left columns
+    pub left_columns: Option<Vec<String>>,
+    /// For joins: right columns
+    pub right_columns: Option<Vec<String>>,
 }
 
 impl EvaluationContext {
@@ -20,13 +28,10 @@ impl EvaluationContext {
         Self {
             columns: HashMap::new(),
             row_data: None,
-        }
-    }
-
-    pub fn with_row_data(row_data: Vec<Value>) -> Self {
-        Self {
-            columns: HashMap::new(),
-            row_data: Some(row_data),
+            left_row: None,
+            right_row: None,
+            left_columns: None,
+            right_columns: None,
         }
     }
 
@@ -34,6 +39,32 @@ impl EvaluationContext {
         Self {
             columns,
             row_data: None,
+            left_row: None,
+            right_row: None,
+            left_columns: None,
+            right_columns: None,
+        }
+    }
+
+    pub fn with_row_data(row_data: Vec<Value>) -> Self {
+        Self {
+            columns: HashMap::new(),
+            row_data: Some(row_data),
+            left_row: None,
+            right_row: None,
+            left_columns: None,
+            right_columns: None,
+        }
+    }
+
+    pub fn with_join_data(left_row: Vec<Value>, right_row: Vec<Value>, left_columns: Vec<String>, right_columns: Vec<String>) -> Self {
+        Self {
+            columns: HashMap::new(),
+            row_data: None,
+            left_row: Some(left_row),
+            right_row: Some(right_row),
+            left_columns: Some(left_columns),
+            right_columns: Some(right_columns),
         }
     }
 
@@ -328,15 +359,39 @@ impl ExpressionEvaluator {
             Expression::Value(value) => Ok(value.clone()),
             Expression::Literal(value) => Ok(value.clone()),
 
-            Expression::Column { table: _, name } => {
-                if let Some(column_value) = context.get_column_value(name) {
-                    Ok(column_value.clone())
-                } else if let Some(row_data) = &context.row_data {
-                    // For now, assume simple sequential access
-                    // In a real implementation, we'd need column metadata
-                    Ok(row_data.get(0).cloned().unwrap_or(Value { kind: ValueKind::Null(NullValue) }))
+            Expression::Column { table, name } => {
+                if let Some(_table_alias) = table {
+                    // Qualified column: search left columns first, then right
+                    if let (Some(left_row), Some(left_columns)) = (&context.left_row, &context.left_columns) {
+                        if let Some(idx) = left_columns.iter().position(|c| c == name) {
+                            return Ok(left_row[idx].clone());
+                        }
+                    }
+                    if let (Some(right_row), Some(right_columns)) = (&context.right_row, &context.right_columns) {
+                        if let Some(idx) = right_columns.iter().position(|c| c == name) {
+                            return Ok(right_row[idx].clone());
+                        }
+                    }
+                    // Fallback to columns map for joined contexts
+                    if let Some(value) = context.get_column_value(name) {
+                        Ok(value.clone())
+                    } else {
+                        Ok(Value { kind: ValueKind::Null(NullValue) })
+                    }
                 } else {
-                    Ok(Value { kind: ValueKind::Null(NullValue) })
+                    // Unqualified column: check columns map first
+                    if let Some(value) = context.get_column_value(name) {
+                        Ok(value.clone())
+                    } else if let Some(row_data) = &context.row_data {
+                        // Fallback to row_data if available
+                        if let Some(idx) = context.columns.keys().position(|k| k == name) {
+                            Ok(row_data[idx].clone())
+                        } else {
+                            Ok(Value { kind: ValueKind::Null(NullValue) })
+                        }
+                    } else {
+                        Ok(Value { kind: ValueKind::Null(NullValue) })
+                    }
                 }
             }
 
@@ -777,8 +832,8 @@ impl ExpressionEvaluator {
                 let mut all_columns = Vec::new();
 
                 // Check columns in SELECT list
-                for expr in columns {
-                    self.collect_column_references(expr, &mut all_columns);
+                for col_spec in columns {
+                    self.collect_column_references(&col_spec.expr, &mut all_columns);
                 }
 
                 // Check columns in WHERE clause

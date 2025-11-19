@@ -13,8 +13,8 @@ mod tests {
         match &statements[0] {
             Statement::Select(select) => {
                 assert_eq!(select.columns.len(), 2);
-                assert!(matches!(select.columns[0], Expression::Column { name, .. } if name == "id"));
-                assert!(matches!(select.columns[1], Expression::Column { name, .. } if name == "name"));
+                assert!(matches!(select.columns[0].expr, Expression::Column { name, .. } if name == "id"));
+                assert!(matches!(select.columns[1].expr, Expression::Column { name, .. } if name == "name"));
                 assert_eq!(select.from.len(), 1);
                 assert_eq!(select.from[0].name, "users");
             }
@@ -29,7 +29,7 @@ mod tests {
 
         match &statements[0] {
             Statement::Select(select) => {
-                assert!(matches!(select.columns[0], Expression::Star));
+                assert!(matches!(select.columns[0].expr, Expression::Star));
                 assert!(select.where_clause.is_some());
             }
             _ => panic!("Expected SELECT statement"),
@@ -477,7 +477,7 @@ mod tests {
         match &statements[0] {
             Statement::Select(select) => {
                 // Check arithmetic expression in SELECT clause
-                match &select.columns[0] {
+                match &select.columns[0].expr {
                     Expression::BinaryOp { left, op, right } => {
                         assert!(matches!(op, BinaryOperator::Plus));
                         assert!(matches!(left.as_ref(), Expression::Column { name, .. } if name == "a"));
@@ -552,7 +552,7 @@ mod tests {
                 assert_eq!(select.columns.len(), 5);
 
                 // Integer literal
-                match &select.columns[0] {
+                match &select.columns[0].expr {
                     Expression::Value(value) => {
                         assert!(matches!(value.kind, ValueKind::Integer(42)));
                     }
@@ -560,7 +560,7 @@ mod tests {
                 }
 
                 // Float literal
-                match &select.columns[1] {
+                match &select.columns[1].expr {
                     Expression::Value(value) => {
                         assert!(matches!(value.kind, ValueKind::Float(3.14)));
                     }
@@ -568,7 +568,7 @@ mod tests {
                 }
 
                 // String literal
-                match &select.columns[2] {
+                match &select.columns[2].expr {
                     Expression::Value(value) => {
                         assert!(matches!(value.kind, ValueKind::String(s) if s == "hello"));
                     }
@@ -576,7 +576,7 @@ mod tests {
                 }
 
                 // Boolean literal
-                match &select.columns[3] {
+                match &select.columns[3].expr {
                     Expression::Value(value) => {
                         assert!(matches!(value.kind, ValueKind::Boolean(true)));
                     }
@@ -584,7 +584,7 @@ mod tests {
                 }
 
                 // NULL literal
-                match &select.columns[4] {
+                match &select.columns[4].expr {
                     Expression::Value(value) => {
                         assert!(matches!(value.kind, ValueKind::Null(_)));
                     }

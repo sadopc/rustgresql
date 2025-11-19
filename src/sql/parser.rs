@@ -139,7 +139,7 @@ impl Parser {
 
         // Parse the CTE query (must be a SELECT statement)
         let query = match self.peek().token_type {
-            TokenType::Select | TokenType::With => {
+            TokenType::Select => {
                 let stmt = self.parse_statement()?;
                 match stmt {
                     Statement::Select(select) => select,
@@ -148,8 +148,14 @@ impl Parser {
                     ))
                 }
             }
+            TokenType::With => {
+                // Handle nested WITH clauses in CTEs
+                return Err(RustgreSQLError::Parse(
+                    "Nested WITH clauses not supported in CTE queries at this time".to_string()
+                ))
+            }
             _ => return Err(RustgreSQLError::Parse(
-                format!("Expected SELECT or WITH in CTE at line {}, column {}",
+                format!("Expected SELECT in CTE at line {}, column {}",
                        self.peek().line, self.peek().column)
             ))
         };
@@ -178,12 +184,21 @@ impl Parser {
         // Parse columns
         let mut columns = Vec::new();
         if self.match_token(TokenType::Asterisk) {
-            columns.push(Expression::Star);
+            columns.push(crate::sql::ast::ColumnSpec {
+                expr: Expression::Star,
+                alias: None,
+            });
         } else {
-            columns.push(self.parse_expression()?);
+            columns.push(crate::sql::ast::ColumnSpec {
+                expr: self.parse_expression()?,
+                alias: None,
+            });
 
             while self.match_token(TokenType::Comma) {
-                columns.push(self.parse_expression()?);
+                columns.push(crate::sql::ast::ColumnSpec {
+                    expr: self.parse_expression()?,
+                    alias: None,
+                });
             }
         }
 
@@ -199,7 +214,7 @@ impl Parser {
 
         // Parse joins
         let mut joins = Vec::new();
-        while let TokenType::Join | TokenType::Left | TokenType::Right | TokenType::Inner = self.peek().token_type {
+        while let TokenType::Join | TokenType::Left | TokenType::Right | TokenType::Inner | TokenType::Full = self.peek().token_type {
             joins.push(self.parse_join()?);
         }
 
@@ -316,12 +331,21 @@ impl Parser {
         // Parse columns
         let mut columns = Vec::new();
         if self.match_token(TokenType::Asterisk) {
-            columns.push(Expression::Star);
+            columns.push(crate::sql::ast::ColumnSpec {
+                expr: Expression::Star,
+                alias: None,
+            });
         } else {
-            columns.push(self.parse_expression()?);
+            columns.push(crate::sql::ast::ColumnSpec {
+                expr: self.parse_expression()?,
+                alias: None,
+            });
 
             while self.match_token(TokenType::Comma) {
-                columns.push(self.parse_expression()?);
+                columns.push(crate::sql::ast::ColumnSpec {
+                    expr: self.parse_expression()?,
+                    alias: None,
+                });
             }
         }
 
@@ -336,7 +360,7 @@ impl Parser {
 
         // Parse joins
         let mut joins = Vec::new();
-        while let TokenType::Join | TokenType::Left | TokenType::Right | TokenType::Inner = self.peek().token_type {
+        while let TokenType::Join | TokenType::Left | TokenType::Right | TokenType::Inner | TokenType::Full = self.peek().token_type {
             joins.push(self.parse_join()?);
         }
 
@@ -1072,7 +1096,6 @@ impl Parser {
                 JoinType::Full
             }
         } else {
-            self.consume_token(TokenType::Join, "Expected JOIN")?;
             JoinType::Inner
         };
 

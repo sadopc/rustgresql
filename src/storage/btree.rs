@@ -161,6 +161,11 @@ pub struct BTree {
 }
 
 impl BTree {
+    /// Get the root page ID
+    pub fn root_page_id(&self) -> PageId {
+        self.root_page_id
+    }
+
     /// Create a new B-Tree
     pub fn new(buffer_manager: std::sync::Arc<crate::storage::BufferPoolManager>) -> Result<Self> {
         // Create root node
@@ -195,21 +200,36 @@ impl BTree {
         }
     }
 
-    /// Get the root page ID
-    pub fn root_page_id(&self) -> PageId {
-        self.root_page_id
-    }
-
     /// Load a B-Tree node from disk
     fn load_node(&self, page_id: PageId) -> Result<(PageId, BTreeNode)> {
         let page = self.buffer_manager.fetch_page(page_id)?;
         let page_guard = page.lock().unwrap();
 
+        // Calculate the actual size of serialized data
         let node_size = page_guard.data.len() - page_guard.header.free_bytes;
+
+        // If node_size is 0 or invalid, this might be an uninitialized page
+        if node_size == 0 || node_size > page_guard.data.len() {
+            // Return a new empty leaf node for uninitialized pages
+            let node = BTreeNode::new(BTreeNodeType::Leaf);
+            return Ok((page_id, node));
+        }
+
         let node_bytes = &page_guard.data[..node_size];
 
+        // Additional validation: check if the data looks like valid serialized data
+        if node_bytes.is_empty() || node_bytes.iter().all(|&b| b == 0) {
+            // Return a new empty leaf node for pages with no valid data
+            let node = BTreeNode::new(BTreeNodeType::Leaf);
+            return Ok((page_id, node));
+        }
+
         let node: BTreeNode = bincode::deserialize(node_bytes)
-            .map_err(|e| crate::error::RustgreSQLError::Serialization(e.to_string()))?;
+            .map_err(|e| {
+                // If deserialization fails, log the error and return a new node
+                eprintln!("Failed to deserialize B-Tree node from page {}: {}. Creating new node.", page_id, e);
+                crate::error::RustgreSQLError::Serialization(e.to_string())
+            })?;
 
         Ok((page_id, node))
     }
@@ -222,8 +242,25 @@ impl BTree {
         let node_bytes = bincode::serialize(node)
             .map_err(|e| crate::error::RustgreSQLError::Serialization(e.to_string()))?;
 
+        // Ensure we don't exceed the page data capacity
+        if node_bytes.len() > page_guard.data.len() {
+            return Err(crate::error::RustgreSQLError::Storage(
+                format!("B-Tree node too large for page: {} bytes, max {} bytes",
+                       node_bytes.len(), page_guard.data.len())
+            ));
+        }
+
+        // Clear the data area first
+        page_guard.data.fill(0);
+
+        // Write the serialized node data
         page_guard.data[..node_bytes.len()].copy_from_slice(&node_bytes);
+
+        // Update free bytes (remaining space in data area)
         page_guard.header.free_bytes = page_guard.data.len() - node_bytes.len();
+
+        // Update checksum
+        page_guard.update_checksum();
 
         drop(page_guard);
         self.buffer_manager.unpin_page(page_id, true)?;

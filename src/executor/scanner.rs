@@ -83,9 +83,10 @@ impl TableScanner {
         // Read rows from the catalog
         let rows = self.catalog_manager.table_manager.select(&self.table_def.name)?;
 
-        // Convert Value vectors to RowData objects
+        // Convert Value vectors to RowData objects with row indices
         let row_data_list: Vec<RowData> = rows.into_iter()
-            .map(|values| RowData::new(values))
+            .enumerate()
+            .map(|(index, values)| RowData::with_id(values, index as u64))
             .collect();
 
         SimpleRowIterator::from_rows(
@@ -115,20 +116,27 @@ impl TableScanner {
 
     /// Insert a new row into the table
     pub fn insert_row(&mut self, row_data: RowData) -> Result<()> {
+        // Insert into table manager
+        self.catalog_manager.table_manager.insert(&self.table_def.name, row_data.values.clone())?;
+
         let key = self.generate_row_key(&row_data)?;
 
         // Create B-Tree if it doesn't exist
         if self.btree.is_none() {
             let btree = BTree::new(self.buffer_manager.clone())?;
+            let root_page_id = btree.root_page_id();
             self.btree = Some(btree);
 
             // Update table definition with root page ID
-            // Note: In a real implementation, this would update the catalog
+            self.catalog_manager.table_manager.update_table_root_page(&self.table_def.name, root_page_id)?;
         }
 
         if let Some(ref mut btree) = self.btree {
             // For now, insert with a dummy page value since we don't have actual row storage
             btree.insert(key, 1)?; // Page ID 1 as placeholder
+
+            // Update table definition with current root page ID in case it changed
+            self.catalog_manager.table_manager.update_table_root_page(&self.table_def.name, btree.root_page_id())?;
         }
 
         Ok(())
@@ -146,6 +154,11 @@ impl TableScanner {
     /// Get table metadata
     pub fn get_table_def(&self) -> &TableDef {
         &self.table_def
+    }
+
+    /// Get catalog manager
+    pub fn get_catalog_manager(&self) -> &Arc<CatalogManager> {
+        &self.catalog_manager
     }
 
     /// Get column index by name
@@ -179,20 +192,44 @@ impl TableScanner {
 
     /// Generate a key for row storage
     fn generate_row_key(&self, row_data: &RowData) -> Result<Vec<u8>> {
-        // For now, use a simple auto-increment key
-        // In a real implementation, this would use primary key values
-        let key = match row_data.row_id {
-            Some(id) => id.to_le_bytes().to_vec(),
-            None => {
-                // Generate a timestamp-based key for now
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                timestamp.to_le_bytes().to_vec()
+        // Use primary key values for indexing
+        let mut key_parts = Vec::new();
+
+        // Find primary key columns
+        let primary_key_columns: Vec<usize> = self.table_def.columns.iter()
+            .enumerate()
+            .filter(|(_, col)| col.primary_key)
+            .map(|(idx, _)| idx)
+            .collect();
+
+        if !primary_key_columns.is_empty() {
+            // Use primary key values
+            for &col_idx in &primary_key_columns {
+                if col_idx < row_data.values.len() {
+                    // Serialize the primary key value
+                    let key_bytes = bincode::serialize(&row_data.values[col_idx])
+                        .map_err(|e| crate::error::RustgreSQLError::Serialization(e.to_string()))?;
+                    key_parts.extend(key_bytes);
+                }
             }
-        };
-        Ok(key)
+        } else {
+            // Fallback: use row_id if available, otherwise timestamp
+            match row_data.row_id {
+                Some(id) => {
+                    key_parts.extend(id.to_le_bytes().to_vec());
+                }
+                None => {
+                    // Generate a timestamp-based key as last resort
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos();
+                    key_parts.extend(timestamp.to_le_bytes().to_vec());
+                }
+            }
+        }
+
+        Ok(key_parts)
     }
 
     /// Validate row data against table schema

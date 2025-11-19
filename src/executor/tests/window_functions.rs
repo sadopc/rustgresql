@@ -31,7 +31,7 @@ mod tests {
             if let crate::sql::ast::SelectStatement::Simple { columns, .. } = select {
                 assert!(!columns.is_empty());
                 // Check that first column contains a window function
-                if let crate::sql::ast::Expression::WindowFunction(_) = &columns[0] {
+                if let crate::sql::ast::Expression::WindowFunction(_) = &columns[0].expr {
                     // Success - window function detected
                 } else {
                     panic!("Expected window function in first column");

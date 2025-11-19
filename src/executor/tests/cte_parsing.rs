@@ -120,6 +120,42 @@ mod tests {
     }
 
     #[test]
+    fn test_stack_overflow_cte_parsing() {
+        // Test the exact query that was causing stack overflow
+        let sql = "WITH user_stats AS (SELECT COUNT(*) as count FROM users) SELECT * FROM user_stats;";
+
+        let mut lexer = Lexer::new(sql);
+        let tokens = lexer.tokenize().unwrap();
+
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+
+        assert!(result.is_ok(), "Failed to parse stack overflow CTE query: {:?}", result.err());
+
+        let statements = result.unwrap();
+        assert!(!statements.is_empty());
+
+        if let crate::sql::ast::Statement::Select(select) = &statements[0] {
+            if let crate::sql::ast::SelectStatement::Simple { with_clause, columns, from, .. } = select {
+                assert!(with_clause.is_some(), "Expected WITH clause to be present");
+
+                let with_clause = with_clause.as_ref().unwrap();
+                assert_eq!(with_clause.ctes.len(), 1, "Expected 1 CTE");
+                assert_eq!(with_clause.ctes[0].name, "user_stats");
+                assert!(!with_clause.recursive, "Expected non-recursive CTE");
+
+                assert_eq!(columns.len(), 1, "Expected 1 column in main query");
+                assert_eq!(from.len(), 1, "Expected 1 table in main query");
+                assert_eq!(from[0].name, "user_stats");
+            } else {
+                panic!("Expected Simple SelectStatement");
+            }
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
     fn test_recursive_cte_parsing() {
         // Very simple recursive CTE test to isolate parsing issues
         let sql = "WITH RECURSIVE test_cte AS (

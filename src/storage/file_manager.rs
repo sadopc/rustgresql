@@ -221,7 +221,7 @@ impl DefaultFileManager {
         let header_size = bincode::serialize(&*header).unwrap().len();
         let header_pages = (header_size + self.page_size - 1) / self.page_size;
 
-        Ok((header_pages + (page_id - 1) as usize * self.page_size) as u64)
+        Ok(((header_pages + (page_id - 1) as usize) * self.page_size) as u64)
     }
 }
 
@@ -233,19 +233,85 @@ impl FileManager for DefaultFileManager {
         file.seek(SeekFrom::Start(offset))?;
 
         let mut page_bytes = vec![0u8; self.page_size];
-        file.read_exact(&mut page_bytes)?;
+        let bytes_read = file.read(&mut page_bytes)
+            .map_err(|e| crate::error::RustgreSQLError::Storage(
+                format!("Failed to read page {}: {}", page_id, e)
+            ))?;
 
-        Page::from_bytes(&page_bytes)
+        // Check if we read the complete page
+        if bytes_read != self.page_size {
+            return Err(crate::error::RustgreSQLError::Storage(
+                format!("Incomplete read for page {}: expected {} bytes, got {}",
+                       page_id, self.page_size, bytes_read)
+            ));
+        }
+
+        // Attempt to deserialize the page
+        match Page::from_bytes(&page_bytes) {
+            Ok(page) => {
+                // Verify page integrity
+                if page.verify() {
+                    Ok(page)
+                } else {
+                    // If checksum fails, this indicates data corruption
+                    // For now, return an error instead of silently continuing
+                    Err(crate::error::RustgreSQLError::Corruption(
+                        format!("Page {} failed checksum verification - data corruption detected", page_id)
+                    ))
+                }
+            }
+            Err(e) => {
+                // If deserialization fails, this also indicates corruption
+                Err(crate::error::RustgreSQLError::Corruption(
+                    format!("Failed to deserialize page {}: {}", page_id, e)
+                ))
+            }
+        }
     }
 
-    fn write_page(&self, page_id: PageId, page: Page) -> Result<()> {
+    fn write_page(&self, page_id: PageId, mut page: Page) -> Result<()> {
         let offset = self.page_offset(page_id)?;
         let mut file = self.file.lock().unwrap();
 
-        file.seek(SeekFrom::Start(offset))?;
+        // Update checksum before writing
+        page.update_checksum();
 
-        let page_bytes = page.to_bytes()?;
-        file.write_all(&page_bytes)?;
+        // Seek to the page offset
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| crate::error::RustgreSQLError::Storage(
+                format!("Failed to seek to page {} offset: {}", page_id, e)
+            ))?;
+
+        // Serialize the page
+        let page_bytes = page.to_bytes()
+            .map_err(|e| crate::error::RustgreSQLError::Storage(
+                format!("Failed to serialize page {}: {}", page_id, e)
+            ))?;
+
+        // Verify the serialized data size
+        if page_bytes.len() != self.page_size {
+            return Err(crate::error::RustgreSQLError::Storage(
+                format!("Page {} serialization produced wrong size: expected {}, got {}",
+                       page_id, self.page_size, page_bytes.len())
+            ));
+        }
+
+        // Write the page data
+        file.write_all(&page_bytes)
+            .map_err(|e| crate::error::RustgreSQLError::Storage(
+                format!("Failed to write page {}: {}", page_id, e)
+            ))?;
+
+        // Force write to disk for durability
+        file.flush()
+            .map_err(|e| crate::error::RustgreSQLError::Storage(
+                format!("Failed to flush page {}: {}", page_id, e)
+            ))?;
+
+        file.sync_all()
+            .map_err(|e| crate::error::RustgreSQLError::Storage(
+                format!("Failed to sync page {}: {}", page_id, e)
+            ))?;
 
         Ok(())
     }
@@ -253,26 +319,40 @@ impl FileManager for DefaultFileManager {
     fn allocate_page(&self, page_type: PageType) -> Result<PageId> {
         let mut header = self.header.lock().unwrap();
 
-        // Check if we have free pages
-        if let Some(free_page_id) = header.first_free_page {
+        let allocated_page_id = if let Some(free_page_id) = header.first_free_page {
             // Use page from free list
-            let page = self.read_page(free_page_id)?;
+            match self.read_page(free_page_id) {
+                Ok(page) => {
+                    // Update free list
+                    header.first_free_page = page.header.next_page_id;
+                    header.free_pages -= 1;
 
-            // Update free list
-            header.first_free_page = page.header.next_page_id;
-            header.free_pages -= 1;
+                    drop(header);
 
-            drop(header);
+                    // Mark page as allocated
+                    let mut allocated_page = page;
+                    allocated_page.header.page_type = page_type;
+                    allocated_page.header.next_page_id = None;
 
-            // Mark page as allocated
-            let mut allocated_page = page;
-            allocated_page.header.page_type = page_type;
-            allocated_page.header.next_page_id = None;
+                    // Write the updated page
+                    if let Err(e) = self.write_page(free_page_id, allocated_page) {
+                        // If write fails, we need to rollback the header change
+                        let mut header = self.header.lock().unwrap();
+                        header.first_free_page = Some(free_page_id);
+                        header.free_pages += 1;
+                        return Err(e);
+                    }
 
-            self.write_page(free_page_id, allocated_page)?;
-            self.write_header()?;
-
-            Ok(free_page_id)
+                    free_page_id
+                }
+                Err(e) => {
+                    // If reading the free page fails, remove it from free list and try again
+                    eprintln!("Warning: Failed to read free page {}, removing from free list: {}", free_page_id, e);
+                    header.first_free_page = header.first_free_page.filter(|&id| id != free_page_id);
+                    drop(header);
+                    return self.allocate_page(page_type); // Recursive call to try again
+                }
+            }
         } else {
             // Allocate new page at end of file
             let new_page_id = header.total_pages;
@@ -280,19 +360,48 @@ impl FileManager for DefaultFileManager {
 
             drop(header);
 
-            let new_page = Page::new(new_page_id, page_type);
-            self.write_page(new_page_id, new_page)?;
-            self.write_header()?;
+            // Create page with proper initialization order
+            let mut new_page = Page::new(new_page_id, page_type);
+            // Update checksum AFTER page is fully initialized
+            new_page.update_checksum();
 
-            Ok(new_page_id)
-        }
+            // Write the new page
+            self.write_page(new_page_id, new_page)
+                .map_err(|e| {
+                    // If write fails, rollback the header change
+                    let mut header = self.header.lock().unwrap();
+                    header.total_pages -= 1;
+                    e
+                })?;
+
+            new_page_id
+        };
+
+        // Update header on disk
+        self.write_header()?;
+
+        Ok(allocated_page_id)
     }
 
     fn deallocate_page(&self, page_id: PageId) -> Result<()> {
         let mut header = self.header.lock().unwrap();
 
+        // Validate page_id is within valid range
+        if page_id >= header.total_pages {
+            return Err(crate::error::RustgreSQLError::Storage(
+                format!("Invalid page ID {} for deallocation (max: {})", page_id, header.total_pages - 1)
+            ));
+        }
+
         // Read the page to get its current state
-        let mut page = self.read_page(page_id)?;
+        let mut page = match self.read_page(page_id) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Warning: Failed to read page {} for deallocation: {}", page_id, e);
+                // Create a new free page as fallback
+                Page::new(page_id, PageType::Free)
+            }
+        };
 
         // Add to free list
         page.header.page_type = PageType::Free;
@@ -302,7 +411,17 @@ impl FileManager for DefaultFileManager {
 
         drop(header);
 
-        self.write_page(page_id, page)?;
+        // Write the updated page
+        self.write_page(page_id, page)
+            .map_err(|e| {
+                // If write fails, rollback the header change
+                let mut header = self.header.lock().unwrap();
+                header.first_free_page = header.first_free_page.filter(|&id| id != page_id);
+                header.free_pages -= 1;
+                e
+            })?;
+
+        // Update header on disk
         self.write_header()?;
 
         Ok(())

@@ -539,7 +539,7 @@ impl CostModel {
         // Aggregation parallel efficiency depends on number of groups
         let mut parallel_estimate = sequential_cost.to_parallel(optimal_workers, parallel_overhead);
         let group_factor = (num_groups as f64 / 1000.0).min(1.0); // More groups = better parallelism
-        parallel_estimate.efficiency *= (0.5 + group_factor * 0.5); // Scale efficiency based on groups
+        parallel_estimate.efficiency *= 0.5 + group_factor * 0.5; // Scale efficiency based on groups
         parallel_estimate.efficiency = parallel_estimate.efficiency.min(1.0);
 
         parallel_estimate
