@@ -242,7 +242,7 @@ impl Parser {
 
         // Parse joins
         let mut joins = Vec::new();
-        while let TokenType::Join | TokenType::Left | TokenType::Right | TokenType::Inner | TokenType::Full = self.peek().token_type {
+        while let TokenType::Join | TokenType::Left | TokenType::Right | TokenType::Inner | TokenType::Full | TokenType::Cross = self.peek().token_type {
             joins.push(self.parse_join()?);
         }
 
@@ -416,7 +416,7 @@ impl Parser {
 
         // Parse joins
         let mut joins = Vec::new();
-        while let TokenType::Join | TokenType::Left | TokenType::Right | TokenType::Inner | TokenType::Full = self.peek().token_type {
+        while let TokenType::Join | TokenType::Left | TokenType::Right | TokenType::Inner | TokenType::Full | TokenType::Cross = self.peek().token_type {
             joins.push(self.parse_join()?);
         }
 
@@ -1419,7 +1419,7 @@ impl Parser {
                             window_name: None,
                         }))
                     } else {
-                        Ok(Expression::Function { name, args })
+                        Ok(Expression::Function { name, args, distinct: false })
                     }
                 } else {
                     Ok(Expression::Column {
@@ -1475,7 +1475,14 @@ impl Parser {
                 // Parse function arguments if there's a left paren
                 if self.match_token(TokenType::LeftParen) {
                     let mut args = Vec::new();
+                    let mut distinct = false;
+
                     if !self.match_token(TokenType::RightParen) {
+                        // Check for DISTINCT keyword
+                        if self.match_token(TokenType::Distinct) {
+                            distinct = true;
+                        }
+
                         args.push(self.parse_expression()?);
                         while self.match_token(TokenType::Comma) {
                             args.push(self.parse_expression()?);
@@ -1485,12 +1492,14 @@ impl Parser {
                     Ok(Expression::Function {
                         name: function_name.to_string(),
                         args,
+                        distinct,
                     })
                 } else {
                     // Function without parentheses, default to star for COUNT
                     Ok(Expression::Function {
                         name: function_name.to_string(),
                         args: vec![Expression::Star],
+                        distinct: false,
                     })
                 }
             }

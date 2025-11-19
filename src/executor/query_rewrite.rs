@@ -264,7 +264,7 @@ impl QueryRewriter {
     /// Extract aggregate functions from an expression
     fn extract_aggregates(&self, expr: &Expression, aggregates: &mut Vec<AggregateFunction>) {
         match expr {
-            Expression::Function { name, args } => {
+            Expression::Function { name, args, distinct: _ } => {
                 let upper_name = name.to_uppercase();
                 match upper_name.as_str() {
                     "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" => {
@@ -355,7 +355,7 @@ impl QueryRewriter {
             (Expression::Value(val_a), Expression::Value(val_b)) => {
                 format!("{:?}", val_a) == format!("{:?}", val_b)
             }
-            (Expression::Function { name: name_a, args: args_a }, Expression::Function { name: name_b, args: args_b }) => {
+            (Expression::Function { name: name_a, args: args_a, .. }, Expression::Function { name: name_b, args: args_b, .. }) => {
                 name_a.to_lowercase() == name_b.to_lowercase() &&
                 args_a.len() == args_b.len() &&
                 args_a.iter().zip(args_b.iter()).all(|(a_arg, b_arg)| self.expressions_equivalent(a_arg, b_arg))
@@ -553,6 +553,7 @@ mod tests {
         let count_expr = Expression::Function {
             name: "COUNT".to_string(),
             args: vec![Expression::Star],
+            distinct: false,
         };
 
         rewriter.extract_aggregates(&count_expr, &mut aggregates);

@@ -780,7 +780,7 @@ impl Executor {
                 let op_str = Self::unary_op_to_sql(op);
                 format!("{} {}", op_str, Self::expression_to_sql(expr))
             }
-            Expression::Function { name, args } => {
+            Expression::Function { name, args, distinct: _ } => {
                 let arg_strs: Vec<String> = args.iter().map(|arg| Self::expression_to_sql(arg)).collect();
                 format!("{}({})", name, arg_strs.join(", "))
             }

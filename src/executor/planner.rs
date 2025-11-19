@@ -873,6 +873,7 @@ impl QueryPlanner {
                         let count_star = Expression::Function {
                             name: "COUNT".to_string(),
                             args: vec![Expression::Star],
+                            distinct: false,
                         };
                         let alias = if let Some(alias) = &col_spec.alias {
                             alias.clone()
@@ -888,6 +889,7 @@ impl QueryPlanner {
                     let count_star = Expression::Function {
                         name: "COUNT".to_string(),
                         args: vec![Expression::Star],
+                        distinct: false,
                     };
                     aggregate_functions.push(("count".to_string(), count_star));
                 }
@@ -917,7 +919,7 @@ impl QueryPlanner {
             (Expression::Value(val_a), Expression::Value(val_b)) => {
                 format!("{:?}", val_a) == format!("{:?}", val_b)
             }
-            (Expression::Function { name: name_a, args: args_a }, Expression::Function { name: name_b, args: args_b }) => {
+            (Expression::Function { name: name_a, args: args_a, .. }, Expression::Function { name: name_b, args: args_b, .. }) => {
                 name_a == name_b && args_a.len() == args_b.len()
             }
             _ => false,
@@ -941,7 +943,7 @@ impl QueryPlanner {
                     right: Box::new(right_planned),
                 })
             }
-            Expression::Function { name, args } => {
+            Expression::Function { name, args, distinct } => {
                 let planned_args: Result<Vec<Expression>> = args
                     .iter()
                     .map(|arg| self.plan_subqueries_in_expression(arg))
@@ -949,6 +951,7 @@ impl QueryPlanner {
                 Ok(Expression::Function {
                     name: name.clone(),
                     args: planned_args?,
+                    distinct: *distinct,
                 })
             }
             Expression::UnaryOp { op, expr } => {

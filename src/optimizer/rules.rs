@@ -578,7 +578,7 @@ impl ConstantFoldingRule {
                     expr: optimized_expr.map(Box::new).unwrap_or_else(|| expr.clone()),
                 }))
             }
-            Expression::Function { args, .. } => {
+            Expression::Function { name, args, distinct } => {
                 let mut optimized_args = Vec::new();
                 let mut changed = false;
 
@@ -593,8 +593,9 @@ impl ConstantFoldingRule {
 
                 if changed {
                     Ok(Some(Expression::Function {
-                        name: "temp".to_string(), // Placeholder
+                        name: name.clone(),
                         args: optimized_args,
+                        distinct: *distinct,
                     }))
                 } else {
                     Ok(None)
@@ -905,7 +906,7 @@ impl AggregationPushdownRule {
             (Expression::Value(val_a), Expression::Value(val_b)) => {
                 format!("{:?}", val_a) == format!("{:?}", val_b)
             }
-            (Expression::Function { name: name_a, args: args_a }, Expression::Function { name: name_b, args: args_b }) => {
+            (Expression::Function { name: name_a, args: args_a, .. }, Expression::Function { name: name_b, args: args_b, .. }) => {
                 name_a == name_b && args_a.len() == args_b.len()
             }
             _ => false,

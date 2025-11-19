@@ -437,7 +437,7 @@ impl ExpressionEvaluator {
                 Self::evaluate_unary_operation(*op, &inner_val)
             }
 
-            Expression::Function { name, args } => {
+            Expression::Function { name, args, distinct: _ } => {
                 self.evaluate_function(name, args, context)
             }
 

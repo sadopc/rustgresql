@@ -1921,27 +1921,38 @@ impl AggregateOperator {
             };
 
             for (i, (_, aggregate_expr)) in self.aggregate_functions.iter().enumerate() {
+                let evaluator = ExpressionEvaluator;
                 let value = match aggregate_expr {
-                    Expression::Function { name, args } => {
+                    Expression::Function { name, args, distinct: _ } => {
                         match name.to_uppercase().as_str() {
                             "COUNT" => {
                                 // Handle COUNT(*) special case
                                 if args.len() == 1 && matches!(&args[0], Expression::Star) {
                                     Value { kind: ValueKind::Integer(1) } // Count this row
                                 } else {
-                                    // COUNT(expression)
-                                    { let evaluator = ExpressionEvaluator; evaluator.evaluate(aggregate_expr, &eval_context) }
-                                        .unwrap_or(Value { kind: ValueKind::Null(crate::types::NullValue) })
+                                    // COUNT(expression) - evaluate the expression argument
+                                    if let Some(arg) = args.first() {
+                                        evaluator.evaluate(arg, &eval_context)
+                                            .unwrap_or(Value { kind: ValueKind::Null(crate::types::NullValue) })
+                                    } else {
+                                        Value { kind: ValueKind::Null(crate::types::NullValue) }
+                                    }
                                 }
                             }
                             _ => {
-                                { let evaluator = ExpressionEvaluator; evaluator.evaluate(aggregate_expr, &eval_context) }
-                                    .unwrap_or(Value { kind: ValueKind::Null(crate::types::NullValue) })
+                                // For other aggregate functions (SUM, AVG, MIN, MAX), evaluate the function argument
+                                if let Some(arg) = args.first() {
+                                    evaluator.evaluate(arg, &eval_context)
+                                        .unwrap_or(Value { kind: ValueKind::Null(crate::types::NullValue) })
+                                } else {
+                                    Value { kind: ValueKind::Null(crate::types::NullValue) }
+                                }
                             }
                         }
                     }
                     _ => {
-                        { let evaluator = ExpressionEvaluator; evaluator.evaluate(aggregate_expr, &eval_context) }
+                        // Non-function expressions - evaluate as-is
+                        evaluator.evaluate(aggregate_expr, &eval_context)
                             .unwrap_or(Value { kind: ValueKind::Null(crate::types::NullValue) })
                     }
                 };
@@ -2075,23 +2086,17 @@ impl AggregateOperator {
     /// Create initial aggregate state for an expression
     fn create_aggregate_state(&self, expr: &Expression) -> AggregateState {
         match expr {
-            Expression::Function { name, args } => {
+            Expression::Function { name, distinct, .. } => {
                 match name.to_uppercase().as_str() {
                     "COUNT" => {
-                        // Check if this is COUNT(*) or COUNT(column)
-                        let distinct = args.len() > 1 &&
-                            args.iter().any(|arg| matches!(arg, Expression::Value(Value { kind: ValueKind::String(s), .. }) if s.to_uppercase() == "DISTINCT"));
-                        AggregateState::new_count(distinct)
+                        // Use the distinct flag from the parsed expression
+                        AggregateState::new_count(*distinct)
                     }
                     "SUM" => {
-                        let distinct = args.len() > 1 &&
-                            args.iter().any(|arg| matches!(arg, Expression::Value(Value { kind: ValueKind::String(s), .. }) if s.to_uppercase() == "DISTINCT"));
-                        AggregateState::new_sum(distinct)
+                        AggregateState::new_sum(*distinct)
                     }
                     "AVG" => {
-                        let distinct = args.len() > 1 &&
-                            args.iter().any(|arg| matches!(arg, Expression::Value(Value { kind: ValueKind::String(s), .. }) if s.to_uppercase() == "DISTINCT"));
-                        AggregateState::new_avg(distinct)
+                        AggregateState::new_avg(*distinct)
                     }
                     "MIN" => AggregateState::new_min(),
                     "MAX" => AggregateState::new_max(),

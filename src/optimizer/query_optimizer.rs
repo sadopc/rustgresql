@@ -649,6 +649,7 @@ impl OptimizedQueryPlanner {
                         let count_star = Expression::Function {
                             name: "COUNT".to_string(),
                             args: vec![Expression::Star],
+                            distinct: false,
                         };
                         let alias = if let Some(alias) = &col_spec.alias {
                             alias.clone()
@@ -664,6 +665,7 @@ impl OptimizedQueryPlanner {
                     let count_star = Expression::Function {
                         name: "COUNT".to_string(),
                         args: vec![Expression::Star],
+                        distinct: false,
                     };
                     aggregate_functions.push(("count".to_string(), count_star));
                 }
@@ -693,7 +695,7 @@ impl OptimizedQueryPlanner {
             (Expression::Value(val_a), Expression::Value(val_b)) => {
                 format!("{:?}", val_a) == format!("{:?}", val_b)
             }
-            (Expression::Function { name: name_a, args: args_a }, Expression::Function { name: name_b, args: args_b }) => {
+            (Expression::Function { name: name_a, args: args_a, .. }, Expression::Function { name: name_b, args: args_b, .. }) => {
                 name_a == name_b && args_a.len() == args_b.len()
             }
             _ => false,

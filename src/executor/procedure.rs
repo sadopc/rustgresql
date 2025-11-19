@@ -792,7 +792,7 @@ impl ProcedureExecutor {
                 self.evaluate_unary_op(*op, &val)
             }
 
-            Expression::Function { name, args } => {
+            Expression::Function { name, args, distinct: _ } => {
                 let mut arg_values = Vec::new();
                 for arg in args {
                     arg_values.push(self.evaluate_expression(arg, proc_context, context)?);

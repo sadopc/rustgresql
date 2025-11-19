@@ -117,6 +117,7 @@ pub enum Expression {
     Function {
         name: String,
         args: Vec<Expression>,
+        distinct: bool,
     },
     /// Window function call
     WindowFunction(WindowFunction),
