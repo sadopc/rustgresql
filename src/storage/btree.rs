@@ -260,7 +260,7 @@ impl BTree {
         page_guard.header.free_bytes = page_guard.data.len() - node_bytes.len();
 
         // Update checksum
-        page_guard.update_checksum();
+        page_guard.update_checksum(self.buffer_manager.page_size());
 
         drop(page_guard);
         self.buffer_manager.unpin_page(page_id, true)?;
@@ -452,7 +452,7 @@ impl BTree {
     /// Handle underflow in a child node
     fn handle_underflow(
         &mut self,
-        node_id: PageId,
+        _node_id: PageId,
         node: &mut BTreeNode,
         child_idx: usize,
     ) -> Result<bool> {
@@ -559,7 +559,7 @@ impl Iterator for BTreeIterator {
     type Item = Result<(BTreeKey, BTreeValue)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some((page_id, mut node, entry_idx)) = self.stack.pop_back() {
+        while let Some((page_id, node, entry_idx)) = self.stack.pop_back() {
             if entry_idx < node.entry_count {
                 // Return current entry
                 let entry = node.entries[entry_idx].clone();

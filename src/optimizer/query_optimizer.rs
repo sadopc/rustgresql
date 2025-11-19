@@ -58,7 +58,19 @@ impl OptimizedQueryPlanner {
     /// Create optimized execution plan for SELECT statement
     pub fn plan_select(&self, select: &SelectStatement, table_indexes: &[(String, Vec<IndexDef>)]) -> Result<ExecutionPlan> {
         match select {
-            SelectStatement::Simple { with_clause: _, from, joins, where_clause, columns, group_by, having, .. } => {
+            SelectStatement::Simple {
+                with_clause: _,
+                from,
+                joins,
+                where_clause,
+                columns,
+                group_by,
+                having,
+                order_by,
+                limit,
+                offset,
+                ..
+            } => {
                 // Extract required columns for the query
                 let required_columns = self.extract_required_columns(select);
 
@@ -92,20 +104,52 @@ impl OptimizedQueryPlanner {
                 if columns.len() == 1 && matches!(columns[0].expr, Expression::Star) {
                     // SELECT * - no explicit projection needed
                 } else {
+                        // Check if we have aggregation
+                        let has_aggregation = !group_by.is_empty() || self.has_aggregate_functions(&columns.iter().map(|c| c.expr.clone()).collect::<Vec<_>>());
+
                         let projections: Vec<(String, Expression)> = columns
                             .iter()
                             .enumerate()
                             .map(|(i, col_spec)| {
+                                let expr = &col_spec.expr;
+
+                                let final_expr = if has_aggregation {
+                                    if self.is_aggregate_function(expr) {
+                                         let alias = if let Some(alias) = &col_spec.alias {
+                                            alias.clone()
+                                        } else {
+                                            match expr {
+                                                Expression::Function { name, .. } => {
+                                                    format!("{}_{}", name.to_lowercase(), i)
+                                                }
+                                                _ => format!("aggregate{}", i),
+                                            }
+                                        };
+                                        Expression::Column { table: None, name: alias }
+                                    } else if matches!(expr, Expression::Star) && !group_by.is_empty() {
+                                         let alias = if let Some(alias) = &col_spec.alias {
+                                            alias.clone()
+                                        } else {
+                                            format!("count_star_{}", i)
+                                        };
+                                        Expression::Column { table: None, name: alias }
+                                    } else {
+                                        expr.clone()
+                                    }
+                                } else {
+                                    expr.clone()
+                                };
+
                                 let column_name = if let Some(alias) = &col_spec.alias {
                                     alias.clone()
                                 } else {
-                                    match &col_spec.expr {
+                                    match expr {
                                         Expression::Column { name, .. } => name.clone(),
                                         Expression::Star => "*".to_string(),
                                         _ => format!("col{}", i),
                                     }
                                 };
-                                (column_name, col_spec.expr.clone())
+                                (column_name, final_expr)
                             })
                             .collect();
 
@@ -116,6 +160,24 @@ impl OptimizedQueryPlanner {
                             left_columns: None,
                             right_columns: None,
                         };
+                }
+
+
+                // Apply ORDER BY clause if present
+                if !order_by.is_empty() {
+                    plan = PlanNode::Sort {
+                        input: Box::new(plan),
+                        order_by: order_by.clone(),
+                    };
+                }
+
+                // Apply LIMIT clause if present
+                if let Some(limit_val) = limit {
+                    plan = PlanNode::Limit {
+                        input: Box::new(plan),
+                        limit: *limit_val,
+                        offset: offset.clone(),
+                    };
                 }
 
                 // Apply optimization rules to the final plan

@@ -378,7 +378,7 @@ impl SystemTableManager {
             // Store the row data
             page_guard.data[..row_bytes.len()].copy_from_slice(&row_bytes);
             page_guard.header.free_bytes = page_guard.data.len() - row_bytes.len();
-            page_guard.update_checksum();
+            page_guard.update_checksum(buffer_manager.page_size());
         }
 
         // Mark page as dirty and unpin

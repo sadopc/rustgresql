@@ -102,6 +102,9 @@ impl ThreeValuedLogic {
                 if !s.is_empty() { ThreeValuedLogic::True } else { ThreeValuedLogic::False }
             }
             ValueKind::Timestamp(_) => ThreeValuedLogic::True,
+            ValueKind::List(list) => {
+                if !list.is_empty() { ThreeValuedLogic::True } else { ThreeValuedLogic::False }
+            }
         }
     }
 
@@ -339,6 +342,9 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         (ValueKind::String(_), ValueKind::Integer(_)) => std::cmp::Ordering::Greater,
         (ValueKind::Float(_), ValueKind::String(_)) => std::cmp::Ordering::Less,
         (ValueKind::String(_), ValueKind::Float(_)) => std::cmp::Ordering::Greater,
+        (ValueKind::List(_), ValueKind::List(_)) => std::cmp::Ordering::Equal,
+        (ValueKind::List(_), _) => std::cmp::Ordering::Less,
+        (_, ValueKind::List(_)) => std::cmp::Ordering::Greater,
         (ValueKind::Timestamp(_), _) => std::cmp::Ordering::Less,
         (_, ValueKind::Timestamp(_)) => std::cmp::Ordering::Greater,
     }
@@ -360,8 +366,16 @@ impl ExpressionEvaluator {
             Expression::Literal(value) => Ok(value.clone()),
 
             Expression::Column { table, name } => {
-                if let Some(_table_alias) = table {
-                    // Qualified column: search left columns first, then right
+                if let Some(table_alias) = table {
+                    // Qualified column: construct qualified name and look for it
+                    let qualified_name = format!("{}.{}", table_alias, name);
+
+                    // First try the columns map with qualified name
+                    if let Some(value) = context.get_column_value(&qualified_name) {
+                        return Ok(value.clone());
+                    }
+
+                    // Fallback: search left columns first, then right (for backwards compatibility)
                     if let (Some(left_row), Some(left_columns)) = (&context.left_row, &context.left_columns) {
                         if let Some(idx) = left_columns.iter().position(|c| c == name) {
                             return Ok(left_row[idx].clone());
@@ -372,12 +386,9 @@ impl ExpressionEvaluator {
                             return Ok(right_row[idx].clone());
                         }
                     }
-                    // Fallback to columns map for joined contexts
-                    if let Some(value) = context.get_column_value(name) {
-                        Ok(value.clone())
-                    } else {
-                        Ok(Value { kind: ValueKind::Null(NullValue) })
-                    }
+
+                    // Not found
+                    Ok(Value { kind: ValueKind::Null(NullValue) })
                 } else {
                     // Unqualified column: check columns map first
                     if let Some(value) = context.get_column_value(name) {
@@ -411,13 +422,11 @@ impl ExpressionEvaluator {
             }
 
             Expression::List(values) => {
-                // For now, just return the first value in the list
-                // In a real implementation, this would depend on context
-                if let Some(first) = values.first() {
-                    self.evaluate(first, context)
-                } else {
-                    Ok(Value { kind: ValueKind::Null(NullValue) })
+                let mut evaluated_values = Vec::new();
+                for value in values {
+                    evaluated_values.push(self.evaluate(value, context)?);
                 }
+                Ok(Value::list(evaluated_values))
             }
 
             Expression::Star => {
@@ -445,7 +454,9 @@ impl ExpressionEvaluator {
     /// Evaluate a binary operation with proper type checking and NULL handling
     fn evaluate_binary_operation(op: BinaryOperator, left: &Value, right: &Value) -> Result<Value> {
         // Handle NULL values in three-valued logic
-        if matches!(&left.kind, ValueKind::Null(_)) || matches!(&right.kind, ValueKind::Null(_)) {
+        // IS and IS NOT operators handle NULLs specifically, so skip this check for them
+        if op != BinaryOperator::Is && op != BinaryOperator::IsNot && 
+           (matches!(&left.kind, ValueKind::Null(_)) || matches!(&right.kind, ValueKind::Null(_))) {
             return Self::handle_null_in_binary_operation(op);
         }
 
@@ -481,6 +492,7 @@ impl ExpressionEvaluator {
             BinaryOperator::ILike => Self::evaluate_ilike(left, right),
             BinaryOperator::In => Self::evaluate_in(left, right),
             BinaryOperator::Is => Self::evaluate_is(left, right),
+            BinaryOperator::IsNot => Self::evaluate_is_not(left, right),
         }
     }
 
@@ -731,9 +743,16 @@ impl ExpressionEvaluator {
     }
 
     fn evaluate_in(left: &Value, right: &Value) -> Result<Value> {
-        // For now, only handle basic IN operations
-        // In a real implementation, this would handle list expressions and subqueries
         match &right.kind {
+            ValueKind::List(values) => {
+                for value in values {
+                    let equals_result = Self::evaluate_equals(left, value)?;
+                    if let ValueKind::Boolean(true) = equals_result.kind {
+                        return Ok(Value { kind: ValueKind::Boolean(true) });
+                    }
+                }
+                Ok(Value { kind: ValueKind::Boolean(false) })
+            }
             ValueKind::String(right_str) => {
                 if let ValueKind::String(left_str) = &left.kind {
                     let result = left_str == right_str;
@@ -742,7 +761,7 @@ impl ExpressionEvaluator {
                     Ok(Value { kind: ValueKind::Boolean(false) })
                 }
             }
-            _ => Err(RustgreSQLError::NotImplemented("IN operation not fully implemented".to_string())),
+            _ => Err(RustgreSQLError::Type("IN operation requires a list or subquery result".to_string())),
         }
     }
 
@@ -761,6 +780,15 @@ impl ExpressionEvaluator {
                 // For non-NULL values, use equality
                 Self::evaluate_equals(left, right)
             }
+        }
+    }
+
+    fn evaluate_is_not(left: &Value, right: &Value) -> Result<Value> {
+        let is_result = Self::evaluate_is(left, right)?;
+        if let ValueKind::Boolean(result) = is_result.kind {
+            Ok(Value { kind: ValueKind::Boolean(!result) })
+        } else {
+            Err(RustgreSQLError::Execution("IS operation failed".to_string()))
         }
     }
 

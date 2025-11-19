@@ -15,6 +15,7 @@ pub enum ValueKind {
     Boolean(bool),
     Float(f64),
     Timestamp(chrono::DateTime<chrono::Utc>),
+    List(Vec<Value>),
     Null(NullValue),
 }
 
@@ -43,6 +44,10 @@ impl Value {
 
     pub fn timestamp(value: DateTime<Utc>) -> Self {
         Self { kind: ValueKind::Timestamp(value) }
+    }
+
+    pub fn list(values: Vec<Value>) -> Self {
+        Self { kind: ValueKind::List(values) }
     }
 
     pub fn null() -> Self {

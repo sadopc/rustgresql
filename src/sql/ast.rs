@@ -156,6 +156,7 @@ pub enum BinaryOperator {
     And,
     Or,
     Is,
+    IsNot,
     Add,
     Subtract,
     Multiply,

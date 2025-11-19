@@ -74,6 +74,26 @@ pub enum PlanNode {
         join_type: JoinType,
         sort_columns: Vec<String>,
     },
+    /// Parallel Scan operation
+    ParallelScan {
+        table_name: String,
+        columns: Vec<String>,
+    },
+    /// Parallel Hash Join operation
+    ParallelHashJoin {
+        left: Box<PlanNode>,
+        right: Box<PlanNode>,
+        condition: Option<Expression>,
+        join_type: JoinType,
+        hash_key_columns: Vec<String>,
+    },
+    /// Parallel Aggregate operation
+    ParallelAggregate {
+        input: Box<PlanNode>,
+        group_by_columns: Vec<Expression>,
+        aggregate_functions: Vec<(String, Expression)>,
+        having_clause: Option<Expression>,
+    },
     /// Insert operation
     Insert {
         table_name: String,
@@ -131,6 +151,17 @@ pub enum PlanNode {
         cte_name: String,
         materialized_result: QueryResult,
     },
+    /// Sort operation
+    Sort {
+        input: Box<PlanNode>,
+        order_by: Vec<OrderBy>,
+    },
+    /// Limit operation
+    Limit {
+        input: Box<PlanNode>,
+        limit: i64,
+        offset: Option<i64>,
+    },
 }
 
 impl PlanNode {
@@ -184,10 +215,10 @@ impl PlanNode {
                 let operator = ProjectOperator::new(input_plan, columns.clone());
                 operator.execute(context)
             }
-            PlanNode::Join { left, right, condition, join_type, .. } => {
+            PlanNode::Join { left, right, condition, join_type, left_alias, right_alias } => {
                 let left_plan = left.as_ref().clone();
                 let right_plan = right.as_ref().clone();
-                let operator = JoinOperator::new(left_plan, right_plan, condition.clone(), join_type.clone(), None, None);
+                let operator = JoinOperator::new(left_plan, right_plan, condition.clone(), join_type.clone(), left_alias.clone(), right_alias.clone());
                 operator.execute(context)
             }
             PlanNode::HashJoin { left, right, condition, join_type, hash_key_columns } => {
@@ -201,6 +232,52 @@ impl PlanNode {
                 let right_plan = right.as_ref().clone();
                 let operator = MergeJoinOperator::new(left_plan, right_plan, condition.clone(), join_type.clone(), sort_columns.clone());
                 operator.execute(context)
+            }
+            PlanNode::ParallelScan { table_name, columns } => {
+                #[cfg(feature = "parallel")]
+                {
+                    // For now, fall back to serial execution until ParallelExecutor is fully integrated
+                    // In a real implementation, this would delegate to ParallelExecutor
+                    let operator = ScanOperator::new(table_name.clone());
+                    operator.execute(context)
+                }
+                #[cfg(not(feature = "parallel"))]
+                {
+                    let operator = ScanOperator::new(table_name.clone());
+                    operator.execute(context)
+                }
+            }
+            PlanNode::ParallelHashJoin { left, right, condition, join_type, hash_key_columns } => {
+                 #[cfg(feature = "parallel")]
+                {
+                    // Fallback to serial hash join
+                    let left_plan = left.as_ref().clone();
+                    let right_plan = right.as_ref().clone();
+                    let operator = HashJoinOperator::new(left_plan, right_plan, condition.clone(), join_type.clone(), hash_key_columns.clone());
+                    operator.execute(context)
+                }
+                #[cfg(not(feature = "parallel"))]
+                {
+                    let left_plan = left.as_ref().clone();
+                    let right_plan = right.as_ref().clone();
+                    let operator = HashJoinOperator::new(left_plan, right_plan, condition.clone(), join_type.clone(), hash_key_columns.clone());
+                    operator.execute(context)
+                }
+            }
+            PlanNode::ParallelAggregate { input, group_by_columns, aggregate_functions, having_clause } => {
+                #[cfg(feature = "parallel")]
+                {
+                    // Fallback to serial aggregation
+                    let input_plan = input.as_ref().clone();
+                    let operator = AggregateOperator::new(input_plan, group_by_columns.clone(), aggregate_functions.clone(), having_clause.clone());
+                    operator.execute(context)
+                }
+                 #[cfg(not(feature = "parallel"))]
+                {
+                    let input_plan = input.as_ref().clone();
+                    let operator = AggregateOperator::new(input_plan, group_by_columns.clone(), aggregate_functions.clone(), having_clause.clone());
+                    operator.execute(context)
+                }
             }
             PlanNode::Insert { table_name, columns, values } => {
                 // Create TableScanner with catalog and buffer manager from context
@@ -319,6 +396,16 @@ impl PlanNode {
                 );
                 cte_scan_operator.execute(context)
             }
+            PlanNode::Sort { input, order_by } => {
+                let input_plan = input.as_ref().clone();
+                let operator = crate::executor::operators::SortOperator::new(input_plan, order_by.clone());
+                operator.execute(context)
+            }
+            PlanNode::Limit { input, limit, offset } => {
+                let input_plan = input.as_ref().clone();
+                let operator = crate::executor::operators::LimitOperator::new(input_plan, *limit, offset.clone());
+                operator.execute(context)
+            }
         }
     }
 }
@@ -356,6 +443,7 @@ impl QueryPlanner {
     pub fn plan_select(&self, select: &SelectStatement) -> Result<ExecutionPlan> {
         match select {
             SelectStatement::Simple {
+
                 with_clause,
                 from,
                 joins,
@@ -363,6 +451,9 @@ impl QueryPlanner {
                 columns,
                 group_by,
                 having,
+                order_by,
+                limit,
+                offset,
                 ..
             } => {
                 // Check if this is a CTE query first
@@ -375,12 +466,16 @@ impl QueryPlanner {
                 // Apply joins
                 for join in joins {
                     let right_plan = self.plan_table_scan(&join.table.name, join.table.alias.as_ref())?;
+
+                    // Extract left alias from the current plan
+                    let left_alias = self.extract_alias_from_plan(&plan);
+
                     plan = PlanNode::Join {
                         left: Box::new(plan),
                         right: Box::new(right_plan),
                         condition: join.condition.clone(),
                         join_type: join.join_type,
-                        left_alias: None, // TODO: get from left plan
+                        left_alias,
                         right_alias: join.table.alias.clone(),
                     };
                 }
@@ -403,11 +498,47 @@ impl QueryPlanner {
                 if columns.len() == 1 && matches!(columns[0].expr, Expression::Star) {
                     // SELECT * - no explicit projection needed
                 } else {
+                    // Check if we have aggregation
+                    let has_aggregation = !group_by.is_empty() || self.has_aggregate_functions(&columns.iter().map(|c| c.expr.clone()).collect::<Vec<_>>());
+
                     let projections: Result<Vec<(String, Expression)>> = columns
                         .iter()
                         .enumerate()
                         .map(|(i, col_spec)| {
                             let planned_expr = self.plan_subqueries_in_expression(&col_spec.expr)?;
+
+                            if has_aggregation {
+                                println!("DEBUG: Checking expression for rewrite: {:?}", planned_expr);
+                                println!("DEBUG: is_aggregate: {}", self.is_aggregate_function(&planned_expr));
+                            }
+
+                            let final_expr = if has_aggregation {
+                                if self.is_aggregate_function(&planned_expr) {
+                                     let alias = if let Some(alias) = &col_spec.alias {
+                                        alias.clone()
+                                    } else {
+                                        match &planned_expr {
+                                            Expression::Function { name, .. } => {
+                                                format!("{}_{}", name.to_lowercase(), i)
+                                            }
+                                            _ => format!("aggregate{}", i),
+                                        }
+                                    };
+                                    Expression::Column { table: None, name: alias }
+                                } else if matches!(planned_expr, Expression::Star) && !group_by.is_empty() {
+                                     let alias = if let Some(alias) = &col_spec.alias {
+                                        alias.clone()
+                                    } else {
+                                        format!("count_star_{}", i)
+                                    };
+                                    Expression::Column { table: None, name: alias }
+                                } else {
+                                    planned_expr
+                                }
+                            } else {
+                                planned_expr
+                            };
+
                             let column_name = if let Some(alias) = &col_spec.alias {
                                 alias.clone()
                             } else {
@@ -418,7 +549,7 @@ impl QueryPlanner {
                                     _ => format!("col{}", i),
                                 }
                             };
-                            Ok((column_name, planned_expr))
+                            Ok((column_name, final_expr))
                         })
                         .collect();
 
@@ -427,21 +558,14 @@ impl QueryPlanner {
                     // Separate window functions from regular projections
                     let (window_funcs, regular_projections) = self.separate_window_functions(&all_projections);
 
-                    // For the test, hardcode aliases and columns
-                    let mut table_aliases = std::collections::HashMap::new();
-                    table_aliases.insert("p".to_string(), "left".to_string());
-                    table_aliases.insert("o".to_string(), "right".to_string());
-                    let left_columns = vec!["product_id".to_string(), "name".to_string(), "price".to_string(), "category".to_string(), "in_stock".to_string()];
-                    let right_columns = vec!["order_id".to_string(), "user_id".to_string(), "product_id".to_string(), "quantity".to_string(), "order_date".to_string()];
-
                     // Apply regular projections if any
                     if !regular_projections.is_empty() || window_funcs.is_empty() {
                         plan = PlanNode::Project {
                             input: Box::new(plan),
                             columns: if window_funcs.is_empty() { all_projections } else { regular_projections },
-                            table_aliases: table_aliases.clone(),
-                            left_columns: Some(left_columns.clone()),
-                            right_columns: Some(right_columns.clone()),
+                            table_aliases: std::collections::HashMap::new(),
+                            left_columns: None,
+                            right_columns: None,
                         };
                     }
 
@@ -454,12 +578,30 @@ impl QueryPlanner {
                     }
                 }
 
+
                 // Apply HAVING clause if present
                 if let Some(ref having_clause) = having {
                     let planned_having = self.plan_subqueries_in_expression(having_clause)?;
                     plan = PlanNode::Filter {
                         input: Box::new(plan),
                         condition: planned_having,
+                    };
+                }
+
+                // Apply ORDER BY clause if present
+                if !order_by.is_empty() {
+                    plan = PlanNode::Sort {
+                        input: Box::new(plan),
+                        order_by: order_by.clone(),
+                    };
+                }
+
+                // Apply LIMIT clause if present
+                if let Some(limit_val) = limit {
+                    plan = PlanNode::Limit {
+                        input: Box::new(plan),
+                        limit: *limit_val,
+                        offset: offset.clone(),
                     };
                 }
 
@@ -548,17 +690,37 @@ impl QueryPlanner {
                 let mut plan = self.plan_table_scan(&tables[0].name, tables[0].alias.as_ref())?;
                 for table in &tables[1..] {
                     let right_plan = self.plan_table_scan(&table.name, table.alias.as_ref())?;
+
+                    // Extract left alias from the current plan
+                    let left_alias = self.extract_alias_from_plan(&plan);
+
                     plan = PlanNode::Join {
                         left: Box::new(plan),
                         right: Box::new(right_plan),
                         condition: None,
                         join_type: JoinType::Inner,
-                        left_alias: None,
-                        right_alias: None,
+                        left_alias,
+                        right_alias: table.alias.clone(),
                     };
                 }
                 Ok(plan)
             }
+        }
+    }
+
+    /// Extract table alias from a plan node
+    fn extract_alias_from_plan(&self, plan: &PlanNode) -> Option<String> {
+        match plan {
+            PlanNode::Scan { alias, .. } => alias.clone(),
+            PlanNode::CTEScan { cte_name, .. } => Some(cte_name.clone()),
+            PlanNode::Join { left_alias, .. } => left_alias.clone(),
+            PlanNode::Filter { input, .. } => self.extract_alias_from_plan(input),
+            PlanNode::Aggregate { input, .. } => self.extract_alias_from_plan(input),
+            PlanNode::Sort { input, .. } => self.extract_alias_from_plan(input),
+            PlanNode::Limit { input, .. } => self.extract_alias_from_plan(input),
+            PlanNode::Project { input, .. } => self.extract_alias_from_plan(input),
+            // For other plan nodes, we might need more complex handling
+            _ => None,
         }
     }
 

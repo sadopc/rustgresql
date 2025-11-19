@@ -2,7 +2,7 @@
 
 use crate::error::Result;
 use crate::{PageId, storage::{Page, PageType}};
-use byteorder::{ReadBytesExt, WriteBytesExt, LittleEndian};
+// use byteorder::{ReadBytesExt, WriteBytesExt, LittleEndian};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write, Seek, SeekFrom};
@@ -92,6 +92,9 @@ pub trait FileManager: Send + Sync {
 
     /// Get database statistics
     fn get_stats(&self) -> Result<DatabaseStats>;
+
+    /// Get the page size
+    fn page_size(&self) -> usize;
 }
 
 /// Database statistics
@@ -250,7 +253,7 @@ impl FileManager for DefaultFileManager {
         match Page::from_bytes(&page_bytes) {
             Ok(page) => {
                 // Verify page integrity
-                if page.verify() {
+                if page.verify(self.page_size) {
                     Ok(page)
                 } else {
                     // If checksum fails, this indicates data corruption
@@ -274,7 +277,7 @@ impl FileManager for DefaultFileManager {
         let mut file = self.file.lock().unwrap();
 
         // Update checksum before writing
-        page.update_checksum();
+        page.update_checksum(self.page_size);
 
         // Seek to the page offset
         file.seek(SeekFrom::Start(offset))
@@ -283,7 +286,7 @@ impl FileManager for DefaultFileManager {
             ))?;
 
         // Serialize the page
-        let page_bytes = page.to_bytes()
+        let page_bytes = page.to_bytes(self.page_size)
             .map_err(|e| crate::error::RustgreSQLError::Storage(
                 format!("Failed to serialize page {}: {}", page_id, e)
             ))?;
@@ -361,9 +364,9 @@ impl FileManager for DefaultFileManager {
             drop(header);
 
             // Create page with proper initialization order
-            let mut new_page = Page::new(new_page_id, page_type);
+            let mut new_page = Page::new(new_page_id, page_type, self.page_size);
             // Update checksum AFTER page is fully initialized
-            new_page.update_checksum();
+            new_page.update_checksum(self.page_size);
 
             // Write the new page
             self.write_page(new_page_id, new_page)
@@ -399,7 +402,7 @@ impl FileManager for DefaultFileManager {
             Err(e) => {
                 eprintln!("Warning: Failed to read page {} for deallocation: {}", page_id, e);
                 // Create a new free page as fallback
-                Page::new(page_id, PageType::Free)
+                Page::new(page_id, PageType::Free, self.page_size)
             }
         };
 
@@ -441,6 +444,10 @@ impl FileManager for DefaultFileManager {
             free_pages: header.free_pages,
             used_pages: header.total_pages - header.free_pages,
         })
+    }
+
+    fn page_size(&self) -> usize {
+        self.page_size
     }
 }
 
@@ -498,7 +505,7 @@ mod tests {
         assert_eq!(stats.free_pages, 0);
 
         // Write and read page
-        let page = Page::new(page_id, PageType::Data);
+        let page = Page::new(page_id, PageType::Data, 8192);
         fm.write_page(page_id, page.clone()).unwrap();
 
         let read_page = fm.read_page(page_id).unwrap();

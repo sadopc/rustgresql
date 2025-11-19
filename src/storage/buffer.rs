@@ -245,7 +245,7 @@ impl BufferPoolManager {
 
     /// Flush all dirty pages to disk
     pub fn flush_all_pages(&self) -> Result<()> {
-        let page_to_frame = self.buffer_pool.page_to_frame.read().unwrap();
+        let _page_to_frame = self.buffer_pool.page_to_frame.read().unwrap();
         let frame_to_page = self.buffer_pool.frame_to_page.read().unwrap();
 
         for (&frame_idx, &page_id) in frame_to_page.iter() {
@@ -307,6 +307,11 @@ impl BufferPoolManager {
         }
 
         Ok(())
+    }
+
+    /// Get the page size
+    pub fn page_size(&self) -> usize {
+        self.file_manager.lock().unwrap().page_size()
     }
 }
 

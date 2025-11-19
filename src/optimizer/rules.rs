@@ -993,9 +993,15 @@ impl OptimizerRule for ParallelPlanSelectionRule {
                     );
 
                     if self.cost_model.should_use_parallel(&parallel_cost) {
-                        // Create parallel scan node - would need to extend PlanNode enum
-                        // For now, return the original plan
-                        Ok(optimized_plan)
+                        // Create parallel scan node
+                        if let PlanNode::Scan { table_name, columns, .. } = optimized_plan {
+                            Ok(PlanNode::ParallelScan {
+                                table_name,
+                                columns,
+                            })
+                        } else {
+                            Ok(optimized_plan)
+                        }
                     } else {
                         Ok(optimized_plan)
                     }
@@ -1031,9 +1037,20 @@ impl OptimizerRule for ParallelPlanSelectionRule {
                     );
 
                     if self.cost_model.should_use_parallel(&parallel_cost) {
-                        // Create parallel hash join node - would need to extend PlanNode enum
-                        // For now, return the original plan
-                        Ok(optimized_plan)
+                        // Create parallel hash join node
+                        if let PlanNode::Join { left, right, condition, join_type, .. } = optimized_plan {
+                            // Extract hash keys from condition (simplified)
+                            let hash_key_columns = vec![]; 
+                            Ok(PlanNode::ParallelHashJoin {
+                                left,
+                                right,
+                                condition,
+                                join_type,
+                                hash_key_columns,
+                            })
+                        } else {
+                             Ok(optimized_plan)
+                        }
                     } else {
                         Ok(optimized_plan)
                     }
@@ -1063,9 +1080,17 @@ impl OptimizerRule for ParallelPlanSelectionRule {
                     );
 
                     if self.cost_model.should_use_parallel(&parallel_cost) {
-                        // Create parallel aggregate node - would need to extend PlanNode enum
-                        // For now, return the original plan
-                        Ok(optimized_plan)
+                        // Create parallel aggregate node
+                        if let PlanNode::Aggregate { input, group_by_columns, aggregate_functions, having_clause } = optimized_plan {
+                            Ok(PlanNode::ParallelAggregate {
+                                input,
+                                group_by_columns,
+                                aggregate_functions,
+                                having_clause,
+                            })
+                        } else {
+                            Ok(optimized_plan)
+                        }
                     } else {
                         Ok(optimized_plan)
                     }

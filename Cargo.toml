@@ -24,12 +24,14 @@ lazy_static = "1.4"
 regex = "1.10"
 chrono = { version = "0.4", features = ["serde"] }
 num_cpus = "1.16"
+rustyline = "17.0.2"
+comfy-table = "7.2.1"
 
 [dev-dependencies]
 quickcheck = "1.0"
 criterion = "0.5"
 
 # Benchmarks - temporarily disabled until full implementation
-# [[bench]]
-# name = "btree_bench"
-# harness = false
+[[bench]]
+name = "btree_bench"
+harness = false

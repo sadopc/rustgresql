@@ -189,15 +189,43 @@ impl Parser {
                 alias: None,
             });
         } else {
+            let mut expr = self.parse_expression()?;
+            let mut alias = None;
+            
+            // Check for alias (AS identifier or just identifier)
+            if self.match_token(TokenType::As) {
+                alias = Some(self.consume_identifier()?);
+            } else if let TokenType::Identifier(_) = self.peek().token_type {
+                // Check if next token is an alias (not a keyword)
+                let next_token = self.peek();
+                if !next_token.is_keyword() {
+                    alias = Some(self.consume_identifier()?);
+                }
+            }
+            
             columns.push(crate::sql::ast::ColumnSpec {
-                expr: self.parse_expression()?,
-                alias: None,
+                expr,
+                alias,
             });
 
             while self.match_token(TokenType::Comma) {
+                let mut expr = self.parse_expression()?;
+                let mut alias = None;
+                
+                // Check for alias (AS identifier or just identifier)
+                if self.match_token(TokenType::As) {
+                    alias = Some(self.consume_identifier()?);
+                } else if let TokenType::Identifier(_) = self.peek().token_type {
+                    // Check if next token is an alias (not a keyword)
+                    let next_token = self.peek();
+                    if !next_token.is_keyword() {
+                        alias = Some(self.consume_identifier()?);
+                    }
+                }
+                
                 columns.push(crate::sql::ast::ColumnSpec {
-                    expr: self.parse_expression()?,
-                    alias: None,
+                    expr,
+                    alias,
                 });
             }
         }
@@ -336,15 +364,43 @@ impl Parser {
                 alias: None,
             });
         } else {
+            let mut expr = self.parse_expression()?;
+            let mut alias = None;
+            
+            // Check for alias (AS identifier or just identifier)
+            if self.match_token(TokenType::As) {
+                alias = Some(self.consume_identifier()?);
+            } else if let TokenType::Identifier(_) = self.peek().token_type {
+                // Check if next token is an alias (not a keyword)
+                let next_token = self.peek();
+                if !next_token.is_keyword() {
+                    alias = Some(self.consume_identifier()?);
+                }
+            }
+            
             columns.push(crate::sql::ast::ColumnSpec {
-                expr: self.parse_expression()?,
-                alias: None,
+                expr,
+                alias,
             });
 
             while self.match_token(TokenType::Comma) {
+                let mut expr = self.parse_expression()?;
+                let mut alias = None;
+                
+                // Check for alias (AS identifier or just identifier)
+                if self.match_token(TokenType::As) {
+                    alias = Some(self.consume_identifier()?);
+                } else if let TokenType::Identifier(_) = self.peek().token_type {
+                    // Check if next token is an alias (not a keyword)
+                    let next_token = self.peek();
+                    if !next_token.is_keyword() {
+                        alias = Some(self.consume_identifier()?);
+                    }
+                }
+                
                 columns.push(crate::sql::ast::ColumnSpec {
-                    expr: self.parse_expression()?,
-                    alias: None,
+                    expr,
+                    alias,
                 });
             }
         }
@@ -456,19 +512,34 @@ impl Parser {
         }
 
         self.consume_token(TokenType::Values, "Expected VALUES")?;
-        self.consume_token(TokenType::LeftParen, "Expected '(' before values")?;
 
-        let mut values = Vec::new();
-        values.push(self.parse_expression()?);
+        // Parse first parenthesized value list
+        self.consume_token(TokenType::LeftParen, "Expected '(' before values")?;
+        let mut first_row = Vec::new();
+        first_row.push(self.parse_expression()?);
         while self.match_token(TokenType::Comma) {
-            values.push(self.parse_expression()?);
+            first_row.push(self.parse_expression()?);
         }
         self.consume_token(TokenType::RightParen, "Expected ')' after values")?;
+
+        let mut all_values = vec![first_row];
+
+        // Parse additional parenthesized value lists if present
+        while self.match_token(TokenType::Comma) {
+            self.consume_token(TokenType::LeftParen, "Expected '(' before values")?;
+            let mut next_row = Vec::new();
+            next_row.push(self.parse_expression()?);
+            while self.match_token(TokenType::Comma) {
+                next_row.push(self.parse_expression()?);
+            }
+            self.consume_token(TokenType::RightParen, "Expected ')' after values")?;
+            all_values.push(next_row);
+        }
 
         Ok(Statement::Insert(InsertStatement {
             table,
             columns,
-            values: vec![values],
+            values: all_values,
         }))
     }
 
@@ -829,6 +900,11 @@ impl Parser {
                         crate::types::ValueKind::Boolean(b) => b.to_string(),
                         crate::types::ValueKind::Timestamp(ts) => ts.to_rfc3339(),
                         crate::types::ValueKind::Null(_) => "NULL".to_string(),
+                        crate::types::ValueKind::List(_) => {
+                            return Err(crate::error::RustgreSQLError::Parse(
+                                "List values are not supported as DEFAULT constraint values".to_string()
+                            ));
+                        }
                     };
                     constraints.push(ColumnConstraint::Default(value_str));
                 }
@@ -1203,7 +1279,13 @@ impl Parser {
                 TokenType::Like => BinaryOperator::Like,
                 TokenType::ILike => BinaryOperator::ILike,
                 TokenType::In => BinaryOperator::In,
-                TokenType::Is => BinaryOperator::Is,
+                TokenType::Is => {
+                    if self.match_token(TokenType::Not) {
+                        BinaryOperator::IsNot
+                    } else {
+                        BinaryOperator::Is
+                    }
+                },
                 _ => unreachable!(),
             };
 
@@ -1346,6 +1428,10 @@ impl Parser {
                 self.advance();
                 Ok(Expression::Star)
             }
+            TokenType::Null => {
+                self.advance();
+                Ok(Expression::Value(crate::types::Value::null()))
+            }
             TokenType::LeftParen => {
                 self.advance();
                 // Check if this is a subquery (starts with SELECT)
@@ -1354,9 +1440,21 @@ impl Parser {
                     self.consume_token(TokenType::RightParen, "Expected ')' after subquery")?;
                     Ok(Expression::Subquery(Box::new(subquery_statement)))
                 } else {
-                    let expr = self.parse_expression()?;
-                    self.consume_token(TokenType::RightParen, "Expected ')' after expression")?;
-                    Ok(expr)
+                    let expr = self.parse_additive_expression()?;
+
+                    // Check if it's a list of expressions (e.g. for IN clause)
+                    if self.match_token(TokenType::Comma) {
+                        let mut values = vec![expr];
+                        values.push(self.parse_additive_expression()?);
+                        while self.match_token(TokenType::Comma) {
+                            values.push(self.parse_additive_expression()?);
+                        }
+                        self.consume_token(TokenType::RightParen, "Expected ')' after value list")?;
+                        Ok(Expression::List(values))
+                    } else {
+                        self.consume_token(TokenType::RightParen, "Expected ')' after expression")?;
+                        Ok(expr)
+                    }
                 }
             }
             TokenType::Count | TokenType::Sum | TokenType::Avg | TokenType::Min | TokenType::Max => {
@@ -2208,6 +2306,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{Value, ValueKind};
 
     #[test]
     fn test_simple_select() -> Result<()> {
@@ -2222,7 +2321,7 @@ mod tests {
                 assert_eq!(from[0].name, "users");
                 assert_eq!(columns.len(), 2);
 
-                if let Expression::Column { name, .. } = &columns[0] {
+                if let Expression::Column { name, .. } = &columns[0].expr {
                     assert_eq!(name, "name");
                 } else {
                     panic!("Expected column expression");
@@ -2292,6 +2391,124 @@ mod tests {
             assert_eq!(insert.columns, vec!["name", "age"]);
             assert_eq!(insert.values.len(), 1);
             assert_eq!(insert.values[0].len(), 2);
+        } else {
+            panic!("Expected INSERT statement");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_multi_row() -> Result<()> {
+        let sql = "INSERT INTO users (name, age) VALUES ('John', 25), ('Jane', 30), ('Bob', 35);";
+        let statements = parse_sql(sql)?;
+
+        assert_eq!(statements.len(), 1);
+
+        if let Statement::Insert(insert) = &statements[0] {
+            assert_eq!(insert.table.name, "users");
+            assert_eq!(insert.columns, vec!["name", "age"]);
+            assert_eq!(insert.values.len(), 3); // Three rows
+
+            // Check first row
+            assert_eq!(insert.values[0].len(), 2);
+            if let Expression::Value(Value { kind: ValueKind::String(name) }) = &insert.values[0][0] {
+                assert_eq!(name, "John");
+            } else {
+                panic!("Expected string value for name");
+            }
+            if let Expression::Value(Value { kind: ValueKind::Integer(age) }) = &insert.values[0][1] {
+                assert_eq!(*age, 25);
+            } else {
+                panic!("Expected integer value for age");
+            }
+
+            // Check second row
+            assert_eq!(insert.values[1].len(), 2);
+            if let Expression::Value(Value { kind: ValueKind::String(name) }) = &insert.values[1][0] {
+                assert_eq!(name, "Jane");
+            } else {
+                panic!("Expected string value for name");
+            }
+            if let Expression::Value(Value { kind: ValueKind::Integer(age) }) = &insert.values[1][1] {
+                assert_eq!(*age, 30);
+            } else {
+                panic!("Expected integer value for age");
+            }
+
+            // Check third row
+            assert_eq!(insert.values[2].len(), 2);
+            if let Expression::Value(Value { kind: ValueKind::String(name) }) = &insert.values[2][0] {
+                assert_eq!(name, "Bob");
+            } else {
+                panic!("Expected string value for name");
+            }
+            if let Expression::Value(Value { kind: ValueKind::Integer(age) }) = &insert.values[2][1] {
+                assert_eq!(*age, 35);
+            } else {
+                panic!("Expected integer value for age");
+            }
+        } else {
+            panic!("Expected INSERT statement");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_without_columns_multi_row() -> Result<()> {
+        let sql = "INSERT INTO users VALUES (1, 'Alice', 28), (2, 'Charlie', 32);";
+        let statements = parse_sql(sql)?;
+
+        assert_eq!(statements.len(), 1);
+
+        if let Statement::Insert(insert) = &statements[0] {
+            assert_eq!(insert.table.name, "users");
+            assert_eq!(insert.columns.len(), 0); // No columns specified
+            assert_eq!(insert.values.len(), 2); // Two rows
+            assert_eq!(insert.values[0].len(), 3); // Three values per row
+            assert_eq!(insert.values[1].len(), 3); // Three values per row
+        } else {
+            panic!("Expected INSERT statement");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_single_row_still_works() -> Result<()> {
+        let sql = "INSERT INTO users (name, age) VALUES ('John', 25);";
+        let statements = parse_sql(sql)?;
+
+        assert_eq!(statements.len(), 1);
+
+        if let Statement::Insert(insert) = &statements[0] {
+            assert_eq!(insert.table.name, "users");
+            assert_eq!(insert.columns, vec!["name", "age"]);
+            assert_eq!(insert.values.len(), 1); // One row
+            assert_eq!(insert.values[0].len(), 2); // Two values
+        } else {
+            panic!("Expected INSERT statement");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_with_different_data_types() -> Result<()> {
+        let sql = "INSERT INTO employees (id, name, salary, active, hire_date) VALUES \
+                   (1, 'John Doe', 50000.50, TRUE, '2023-01-15'), \
+                   (2, 'Jane Smith', 60000.00, FALSE, '2022-12-01');";
+        let statements = parse_sql(sql)?;
+
+        assert_eq!(statements.len(), 1);
+
+        if let Statement::Insert(insert) = &statements[0] {
+            assert_eq!(insert.table.name, "employees");
+            assert_eq!(insert.columns, vec!["id", "name", "salary", "active", "hire_date"]);
+            assert_eq!(insert.values.len(), 2); // Two rows
+            assert_eq!(insert.values[0].len(), 5); // Five values per row
+            assert_eq!(insert.values[1].len(), 5); // Five values per row
         } else {
             panic!("Expected INSERT statement");
         }

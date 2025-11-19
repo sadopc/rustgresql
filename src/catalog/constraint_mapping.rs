@@ -299,6 +299,7 @@ fn format_binary_operator(op: &crate::sql::ast::BinaryOperator) -> &'static str 
         crate::sql::ast::BinaryOperator::And => "AND",
         crate::sql::ast::BinaryOperator::Or => "OR",
         crate::sql::ast::BinaryOperator::Is => "IS",
+        crate::sql::ast::BinaryOperator::IsNot => "IS NOT",
         crate::sql::ast::BinaryOperator::Add => "+",
         crate::sql::ast::BinaryOperator::Subtract => "-",
         crate::sql::ast::BinaryOperator::Multiply => "*",

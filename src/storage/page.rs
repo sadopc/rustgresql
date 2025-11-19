@@ -5,9 +5,6 @@
 use crate::{error::Result, PageId};
 use serde::{Deserialize, Serialize};
 
-/// Default page size (8KB)
-pub const DEFAULT_PAGE_SIZE: usize = 8192;
-
 /// Page types
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum PageType {
@@ -53,8 +50,8 @@ pub struct Page {
 
 impl Page {
     /// Create a new page with the specified ID and type
-    pub fn new(page_id: PageId, page_type: PageType) -> Self {
-        let data = vec![0u8; DEFAULT_PAGE_SIZE];
+    pub fn new(page_id: PageId, page_type: PageType, page_size: usize) -> Self {
+        let data = vec![0u8; page_size];
 
         Self {
             header: PageHeader {
@@ -62,7 +59,7 @@ impl Page {
                 page_type,
                 prev_page_id: None,
                 next_page_id: None,
-                free_bytes: DEFAULT_PAGE_SIZE, // All data space is initially free
+                free_bytes: page_size, // Note: This is an overestimation, will be corrected when writing
                 checksum: 0,
             },
             data,
@@ -70,7 +67,7 @@ impl Page {
     }
 
     /// Calculate page checksum
-    pub fn calculate_checksum(&self) -> u32 {
+    pub fn calculate_checksum(&self, page_size: usize) -> u32 {
         use crc::Crc;
 
         let hasher = Crc::<u32>::new(&crc::CRC_32_ISCSI);
@@ -86,7 +83,7 @@ impl Page {
         // Build the full page bytes exactly as in to_bytes
         let mut page_bytes = header_bytes;
         page_bytes.extend_from_slice(&self.data);
-        page_bytes.resize(DEFAULT_PAGE_SIZE, 0);
+        page_bytes.resize(page_size, 0);
 
         // Update digest with the full page bytes
         digest.update(&page_bytes);
@@ -95,13 +92,13 @@ impl Page {
     }
 
     /// Verify page integrity using checksum
-    pub fn verify(&self) -> bool {
-        self.calculate_checksum() == self.header.checksum
+    pub fn verify(&self, page_size: usize) -> bool {
+        self.calculate_checksum(page_size) == self.header.checksum
     }
 
     /// Update checksum after modifications
-    pub fn update_checksum(&mut self) {
-        self.header.checksum = self.calculate_checksum();
+    pub fn update_checksum(&mut self, page_size: usize) {
+        self.header.checksum = self.calculate_checksum(page_size);
     }
 
     /// Get available free space in page
@@ -110,7 +107,7 @@ impl Page {
     }
 
     /// Reserve space in page for data
-    pub fn reserve_space(&mut self, size: usize) -> Result<usize> {
+    pub fn reserve_space(&mut self, size: usize, page_size: usize) -> Result<usize> {
         if size > self.header.free_bytes {
             return Err(crate::error::RustgreSQLError::Storage(
                 format!("Not enough space in page: requested {}, available {}",
@@ -118,14 +115,14 @@ impl Page {
             ));
         }
 
-        let offset = DEFAULT_PAGE_SIZE - self.header.free_bytes;
+        let offset = page_size - self.header.free_bytes;
         self.header.free_bytes -= size;
         Ok(offset)
     }
 
     /// Serialize page to bytes
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        let mut page_bytes = Vec::with_capacity(DEFAULT_PAGE_SIZE);
+    pub fn to_bytes(&self, page_size: usize) -> Result<Vec<u8>> {
+        let mut page_bytes = Vec::with_capacity(page_size);
 
         // Serialize header
         let header_bytes = bincode::serialize(&self.header)
@@ -136,21 +133,14 @@ impl Page {
         // Add data
         page_bytes.extend_from_slice(&self.data);
 
-        // Ensure page is exactly DEFAULT_PAGE_SIZE
-        page_bytes.resize(DEFAULT_PAGE_SIZE, 0);
+        // Ensure page is exactly page_size
+        page_bytes.resize(page_size, 0);
 
         Ok(page_bytes)
     }
 
     /// Deserialize page from bytes
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() != DEFAULT_PAGE_SIZE {
-            return Err(crate::error::RustgreSQLError::Storage(
-                format!("Invalid page size: expected {}, got {}",
-                        DEFAULT_PAGE_SIZE, bytes.len())
-            ));
-        }
-
         // Determine header size by serializing a dummy header
         let dummy_header = PageHeader {
             page_id: 0,
@@ -179,29 +169,29 @@ mod tests {
 
     #[test]
     fn test_page_creation() {
-        let page = Page::new(1, PageType::Data);
+        let page = Page::new(1, PageType::Data, 8192);
         assert_eq!(page.header.page_id, 1);
         assert_eq!(page.header.page_type, PageType::Data);
-        assert_eq!(page.data.len(), DEFAULT_PAGE_SIZE);
+        assert_eq!(page.data.len(), 8192);
     }
 
     #[test]
     fn test_page_checksum() {
-        let mut page = Page::new(1, PageType::Data);
-        page.update_checksum();
+        let mut page = Page::new(1, PageType::Data, 8192);
+        page.update_checksum(8192);
 
-        assert!(page.verify());
+        assert!(page.verify(8192));
 
         // Corrupt data
         page.data[0] = 1;
-        assert!(!page.verify());
+        assert!(!page.verify(8192));
     }
 
     #[test]
     fn test_page_serialization() {
-        let page = Page::new(1, PageType::Data);
-        let bytes = page.to_bytes().unwrap();
-        assert_eq!(bytes.len(), DEFAULT_PAGE_SIZE);
+        let page = Page::new(1, PageType::Data, 8192);
+        let bytes = page.to_bytes(8192).unwrap();
+        assert_eq!(bytes.len(), 8192);
 
         let deserialized = Page::from_bytes(&bytes).unwrap();
         assert_eq!(deserialized.header.page_id, page.header.page_id);
@@ -210,14 +200,14 @@ mod tests {
 
     #[test]
     fn test_reserve_space() {
-        let mut page = Page::new(1, PageType::Data);
+        let mut page = Page::new(1, PageType::Data, 8192);
         let initial_free = page.free_space();
 
-        let offset = page.reserve_space(100).unwrap();
-        assert_eq!(offset, DEFAULT_PAGE_SIZE - initial_free);
+        let offset = page.reserve_space(100, 8192).unwrap();
+        assert_eq!(offset, 8192 - initial_free);
         assert_eq!(page.free_space(), initial_free - 100);
 
         // Try to reserve more than available
-        assert!(page.reserve_space(page.free_space() + 1).is_err());
+        assert!(page.reserve_space(page.free_space() + 1, 8192).is_err());
     }
 }

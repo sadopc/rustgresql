@@ -2,7 +2,7 @@
 //!
 //! Physical operators for executing query plans
 
-use crate::{Result, sql::ast::{Expression, BinaryOperator, SetOperator as SetOperatorType}, executor::planner::PlanNode, types::{Value, ValueKind, DataTypeKind, DataType}};
+use crate::{Result, sql::ast::{Expression, BinaryOperator, SetOperator as SetOperatorType, OrderBy, SortDirection}, executor::planner::PlanNode, types::{Value, ValueKind, DataTypeKind, DataType}};
 use crate::executor::{TableScanner, ExpressionEvaluator, EvaluationContext, ThreeValuedLogic, RowData, AggregateState};
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -27,6 +27,9 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         (ValueKind::String(_), ValueKind::Integer(_)) => std::cmp::Ordering::Greater,
         (ValueKind::Float(_), ValueKind::String(_)) => std::cmp::Ordering::Less,
         (ValueKind::String(_), ValueKind::Float(_)) => std::cmp::Ordering::Greater,
+        (ValueKind::List(_), ValueKind::List(_)) => std::cmp::Ordering::Equal,
+        (ValueKind::List(_), _) => std::cmp::Ordering::Less,
+        (_, ValueKind::List(_)) => std::cmp::Ordering::Greater,
         (ValueKind::Timestamp(_), _) => std::cmp::Ordering::Less,
         (_, ValueKind::Timestamp(_)) => std::cmp::Ordering::Greater,
     }
@@ -324,7 +327,61 @@ impl ProjectOperator {
                         let left_count = left_cols.len();
                         let left_row = row[..left_count].to_vec();
                         let right_row = row[left_count..].to_vec();
-                        EvaluationContext::with_join_data(left_row, right_row, left_cols.clone(), right_cols.clone())
+
+                        // Create columns map with qualified column names
+                        let mut columns = std::collections::HashMap::new();
+
+                        // Add qualified column names with their values
+                        for (i, col_name) in left_cols.iter().enumerate() {
+                            if i < left_row.len() {
+                                // Try to extract table name from qualified column name or use "left" as fallback
+                                let qualified_name = if col_name.contains('.') {
+                                    col_name.clone()
+                                } else {
+                                    // Check if we have qualified names in input_column_names
+                                    if let Some(input_col) = input_column_names.get(i) {
+                                        if input_col.contains('.') {
+                                            input_col.clone()
+                                        } else {
+                                            format!("left.{}", col_name)
+                                        }
+                                    } else {
+                                        format!("left.{}", col_name)
+                                    }
+                                };
+                                columns.insert(qualified_name, left_row[i].clone());
+                            }
+                        }
+
+                        for (i, col_name) in right_cols.iter().enumerate() {
+                            if i < right_row.len() {
+                                // Try to extract table name from qualified column name or use "right" as fallback
+                                let qualified_name = if col_name.contains('.') {
+                                    col_name.clone()
+                                } else {
+                                    // Check if we have qualified names in input_column_names
+                                    if let Some(input_col) = input_column_names.get(left_count + i) {
+                                        if input_col.contains('.') {
+                                            input_col.clone()
+                                        } else {
+                                            format!("right.{}", col_name)
+                                        }
+                                    } else {
+                                        format!("right.{}", col_name)
+                                    }
+                                };
+                                columns.insert(qualified_name, right_row[i].clone());
+                            }
+                        }
+
+                        EvaluationContext {
+                            columns,
+                            row_data: Some(row.clone()),
+                            left_row: Some(left_row),
+                            right_row: Some(right_row),
+                            left_columns: Some(left_cols.clone()),
+                            right_columns: Some(right_cols.clone()),
+                        }
                     } else {
                         self.create_basic_evaluation_context(&input_column_names, &row)
                     };
@@ -455,8 +512,18 @@ impl JoinOperator {
     /// Execute inner, left, right, and full joins
     fn execute_outer_joins(&self, left_result: &QueryResult, right_result: &QueryResult) -> Result<(Vec<Vec<Value>>, Vec<String>)> {
         let mut joined_rows = Vec::new();
-        let mut joined_column_names = left_result.column_names.clone();
-        joined_column_names.extend(right_result.column_names.clone());
+
+        // Create qualified column names to avoid ambiguity
+        let left_table_name = self.left_alias.as_ref().map(|alias| alias.clone()).unwrap_or_else(|| "left".to_string());
+        let right_table_name = self.right_alias.as_ref().map(|alias| alias.clone()).unwrap_or_else(|| "right".to_string());
+
+        let mut joined_column_names = Vec::new();
+        for col_name in &left_result.column_names {
+            joined_column_names.push(format!("{}.{}", left_table_name, col_name));
+        }
+        for col_name in &right_result.column_names {
+            joined_column_names.push(format!("{}.{}", right_table_name, col_name));
+        }
 
         // Track which rows have been matched for outer joins
         let mut left_matched = vec![false; left_result.rows.len()];
@@ -588,12 +655,43 @@ impl JoinOperator {
                                 left_columns: &[String], right_columns: &[String]) -> Result<bool> {
         match &self.condition {
             Some(condition) => {
+                // Create qualified column names for the evaluation context
+                let left_table_name = self.left_alias.as_ref().map(|alias| alias.clone()).unwrap_or_else(|| "left".to_string());
+                let right_table_name = self.right_alias.as_ref().map(|alias| alias.clone()).unwrap_or_else(|| "right".to_string());
+
+                let mut columns = std::collections::HashMap::new();
+
+                // Add qualified column names with their values
+                for (i, col_name) in left_columns.iter().enumerate() {
+                    if i < left_row.len() {
+                        let qualified_name = format!("{}.{}", left_table_name, col_name);
+                        columns.insert(qualified_name, left_row[i].clone());
+                    }
+                }
+
+                for (i, col_name) in right_columns.iter().enumerate() {
+                    if i < right_row.len() {
+                        let qualified_name = format!("{}.{}", right_table_name, col_name);
+                        columns.insert(qualified_name, right_row[i].clone());
+                    }
+                }
+
                 let context = EvaluationContext::with_join_data(
                     left_row.to_vec(),
                     right_row.to_vec(),
                     left_columns.to_vec(),
                     right_columns.to_vec(),
                 );
+
+                // Replace the empty columns map with our qualified columns
+                let context = EvaluationContext {
+                    columns,
+                    row_data: None,
+                    left_row: Some(left_row.to_vec()),
+                    right_row: Some(right_row.to_vec()),
+                    left_columns: Some(left_columns.to_vec()),
+                    right_columns: Some(right_columns.to_vec()),
+                };
 
                 let result = { let evaluator = ExpressionEvaluator; evaluator.evaluate(condition, &context) }?;
                 match result.kind {
@@ -718,11 +816,20 @@ impl InsertOperator {
         let table_def = scanner.get_table_def();
         let mut full_row = vec![Value { kind: ValueKind::Null(crate::types::NullValue) }; table_def.columns.len()];
 
-        // Map provided columns to their positions in the table
-        for (i, column_name) in self.columns.iter().enumerate() {
-            if let Some(column_index) = scanner.get_column_index(column_name) {
-                if i < provided_values.len() {
-                    full_row[column_index] = provided_values[i].clone();
+        if self.columns.is_empty() {
+            // Implicit column list: values map to columns in order
+            for (i, value) in provided_values.iter().enumerate() {
+                if i < full_row.len() {
+                    full_row[i] = value.clone();
+                }
+            }
+        } else {
+            // Map provided columns to their positions in the table
+            for (i, column_name) in self.columns.iter().enumerate() {
+                if let Some(column_index) = scanner.get_column_index(column_name) {
+                    if i < provided_values.len() {
+                        full_row[column_index] = provided_values[i].clone();
+                    }
                 }
             }
         }
@@ -3087,5 +3194,139 @@ impl ExecutionContext {
             }
         }
         Ok(())
+    }
+}
+
+/// Sort operator for ORDER BY clause
+#[derive(Debug)]
+pub struct SortOperator {
+    pub input: Box<PlanNode>,
+    pub order_by: Vec<OrderBy>,
+}
+
+impl SortOperator {
+    pub fn new(input: PlanNode, order_by: Vec<OrderBy>) -> Self {
+        Self {
+            input: Box::new(input),
+            order_by,
+        }
+    }
+
+    pub fn execute(&self, context: &mut ExecutionContext) -> Result<QueryResult> {
+        context.log(&format!("SortOperator: Executing sort with {} order by clauses", self.order_by.len()));
+
+        // Execute input plan to get results
+        let mut input_result = self.input.execute(context)?;
+
+        context.log(&format!("SortOperator: Got {} rows to sort", input_result.rows.len()));
+
+        // If no rows or no order by clauses, return as-is
+        if input_result.rows.is_empty() || self.order_by.is_empty() {
+            return Ok(input_result);
+        }
+
+        // Create expression evaluator
+        let evaluator = ExpressionEvaluator::new();
+
+        // Sort rows using stable sort to maintain relative order for equal keys
+        input_result.rows.sort_by(|row_a, row_b| {
+            for order_by in &self.order_by {
+                // Create evaluation context with column names and values
+                let mut context_a = EvaluationContext::new();
+                let mut context_b = EvaluationContext::new();
+
+                // Populate contexts with column values
+                for (i, col_name) in input_result.column_names.iter().enumerate() {
+                    if i < row_a.len() {
+                        context_a.set_variable(col_name, row_a[i].clone());
+                    }
+                    if i < row_b.len() {
+                        context_b.set_variable(col_name, row_b[i].clone());
+                    }
+                }
+
+                // Evaluate the expression for both rows
+                let eval_result_a = evaluator.evaluate(&order_by.expr, &context_a);
+                let eval_result_b = evaluator.evaluate(&order_by.expr, &context_b);
+
+                match (eval_result_a, eval_result_b) {
+                    (Ok(val_a), Ok(val_b)) => {
+                        let comparison = compare_values(&val_a, &val_b);
+                        if comparison != std::cmp::Ordering::Equal {
+                            // Reverse comparison for DESC order
+                            return match order_by.direction {
+                                SortDirection::Asc => comparison,
+                                SortDirection::Desc => comparison.reverse(),
+                            };
+                        }
+                    }
+                    _ => {
+                        // If evaluation fails, treat as equal and continue to next order by
+                        continue;
+                    }
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+
+        context.log(&format!("SortOperator: Sorted {} rows", input_result.rows.len()));
+        Ok(input_result)
+    }
+}
+
+/// Limit operator for LIMIT and OFFSET clauses
+#[derive(Debug)]
+pub struct LimitOperator {
+    pub input: Box<PlanNode>,
+    pub limit: i64,
+    pub offset: Option<i64>,
+}
+
+impl LimitOperator {
+    pub fn new(input: PlanNode, limit: i64, offset: Option<i64>) -> Self {
+        Self {
+            input: Box::new(input),
+            limit,
+            offset,
+        }
+    }
+
+    pub fn execute(&self, context: &mut ExecutionContext) -> Result<QueryResult> {
+        context.log(&format!("LimitOperator: Executing limit={} offset={:?}", self.limit, self.offset));
+
+        // Execute input plan to get results
+        let mut input_result = self.input.execute(context)?;
+
+        context.log(&format!("LimitOperator: Got {} rows to limit", input_result.rows.len()));
+
+        // Calculate offset and limit bounds
+        let offset_val = self.offset.unwrap_or(0);
+        let start_idx = if offset_val < 0 {
+            context.log(&format!("LimitOperator: Negative offset {}, treating as 0", offset_val));
+            0
+        } else {
+            offset_val as usize
+        };
+
+        let end_idx = if self.limit < 0 {
+            // Negative limit means no limit (return all remaining rows)
+            input_result.rows.len()
+        } else {
+            let limit_val = self.limit as usize;
+            start_idx + limit_val
+        };
+
+        // Apply limit and offset
+        if start_idx >= input_result.rows.len() {
+            // Offset is beyond the end of the result set
+            input_result.rows.clear();
+            context.log("LimitOperator: Offset beyond result set, returning empty rows");
+        } else {
+            let end_idx = std::cmp::min(end_idx, input_result.rows.len());
+            input_result.rows = input_result.rows[start_idx..end_idx].to_vec();
+            context.log(&format!("LimitOperator: Applied limit, returning {} rows", input_result.rows.len()));
+        }
+
+        Ok(input_result)
     }
 }

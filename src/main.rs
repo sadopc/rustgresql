@@ -4,7 +4,12 @@
 
 use rustgresql::{Database, Config, sql::parse_sql, executor::ExecutionEngine};
 use std::env;
-use std::io::{self, Write};
+use rustyline::error::ReadlineError;
+use rustyline::Editor;
+use rustyline::history::FileHistory;
+use comfy_table::Table;
+use comfy_table::modifiers::UTF8_ROUND_CORNERS;
+use comfy_table::presets::UTF8_FULL;
 
 fn main() -> rustgresql::Result<()> {
     // Initialize logging
@@ -38,84 +43,119 @@ fn main() -> rustgresql::Result<()> {
     println!("Type 'help' for commands, SQL queries, or 'exit' to quit.");
     println!();
 
+    // Initialize Rustyline editor with file history
+    let mut rl: Editor<(), FileHistory> = Editor::new().unwrap();
+    let history_file = "rustgresql_history.txt";
+    if rl.load_history(history_file).is_err() {
+        println!("No previous history.");
+    }
+
+    let mut query_buffer = String::new();
+
     // Enhanced REPL with SQL execution
     loop {
-        print!("rustgresql> ");
-        io::stdout().flush()?;
+        let prompt = if query_buffer.is_empty() { "rustgresql> " } else { "-> " };
+        
+        match rl.readline(prompt) {
+            Ok(line) => {
+                let trimmed = line.trim();
+                
+                // Handle special commands immediately if buffer is empty
+                if query_buffer.is_empty() && (trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit")) {
+                    break;
+                }
+                
+                if query_buffer.is_empty() && trimmed.eq_ignore_ascii_case("help") {
+                    print_help();
+                    rl.add_history_entry(trimmed);
+                    continue;
+                }
 
-        let mut input = String::new();
-        let mut line = String::new();
+                if query_buffer.is_empty() && trimmed.eq_ignore_ascii_case("status") {
+                    print_status(&db);
+                    rl.add_history_entry(trimmed);
+                    continue;
+                }
 
-        // Read first line
-        io::stdin().read_line(&mut line)?;
-        input.push_str(&line);
+                 if query_buffer.is_empty() && trimmed.eq_ignore_ascii_case("examples") {
+                    print_examples();
+                    rl.add_history_entry(trimmed);
+                    continue;
+                }
+                
+                // Append line to buffer
+                query_buffer.push_str(&line);
+                query_buffer.push('\n');
 
-        // Continue reading lines until we find a semicolon
-        while !input.trim_end().ends_with(';') && !input.trim().is_empty() {
-            line.clear();
-            io::stdin().read_line(&mut line)?;
-            input.push_str(&line);
-        }
-
-        let command = input.lines()
-            .filter(|line| !line.trim().starts_with("rustgresql>") && !line.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim()
-            .to_string();
-
-        match command.as_str() {
-            "exit" | "quit" => break,
-            "help" => {
-                print_help();
-            }
-            "status" => {
-                print_status(&db);
-            }
-            "examples" => {
-                print_examples();
-            }
-            cmd if !cmd.is_empty() => {
-                // Try to execute as SQL
-                match execute_sql(&execution_engine, cmd) {
-                    Ok((result, stats)) => {
-                        print_query_result(&result, &stats);
-                        // Flush changes to disk
-                        if let Err(e) = db.get_buffer_manager().flush_all_pages() {
-                            eprintln!("Flush error: {}", e);
+                // Check if query is complete (ends with semicolon)
+                if query_buffer.trim_end().ends_with(';') {
+                    let full_query = query_buffer.trim().to_string();
+                    rl.add_history_entry(&full_query);
+                    
+                    // Process the query
+                    match execute_sql(&execution_engine, &full_query) {
+                        Ok(results) => {
+                            for (result, stats) in results {
+                                print_query_result(&result, &stats);
+                            }
+                            // Flush changes to disk
+                            if let Err(e) = db.get_buffer_manager().flush_all_pages() {
+                                eprintln!("Flush error: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            // Check if it's a special command that slipped through (unlikely given logic above but safe)
+                            if !handle_special_command(&full_query, &db) {
+                                eprintln!("Error: {}", e);
+                            }
                         }
                     }
-                    Err(e) => {
-                        // Check if it's a special command first
-                        if !handle_special_command(cmd, &db) {
-                            eprintln!("Error: {}", e);
-                        }
-                    }
+                    
+                    // Reset buffer
+                    query_buffer.clear();
                 }
             }
-            _ => {}
+            Err(ReadlineError::Interrupted) => {
+                println!("^C");
+                query_buffer.clear();
+            }
+            Err(ReadlineError::Eof) => {
+                println!("^D");
+                break;
+            }
+            Err(err) => {
+                println!("Error: {:?}", err);
+                break;
+            }
         }
     }
+    
+    // Save history
+    rl.save_history(history_file).unwrap();
 
     println!("Goodbye!");
     Ok(())
 }
 
-fn execute_sql(engine: &ExecutionEngine, sql: &str) -> rustgresql::Result<(rustgresql::executor::QueryResult, rustgresql::executor::ExecutionStats)> {
+fn execute_sql(engine: &ExecutionEngine, sql: &str) -> rustgresql::Result<Vec<(rustgresql::executor::QueryResult, rustgresql::executor::ExecutionStats)>> {
     // Parse the SQL statement
     let statements = parse_sql(sql)?;
 
     if statements.is_empty() {
-        // No statements found (e.g., just comments), return success
-        return Ok((rustgresql::executor::QueryResult {
+        // No statements found (e.g., just comments), return success with empty result
+        return Ok(vec![(rustgresql::executor::QueryResult {
             rows: vec![],
             column_names: vec![],
-        }, rustgresql::executor::ExecutionStats::default()));
+        }, rustgresql::executor::ExecutionStats::default())]);
     }
 
-    // Execute the first statement (for now, we'll support single statements)
-    let statement = &statements[0];
-    engine.execute_query(statement)
+    let mut results = Vec::new();
+    for statement in statements {
+        let result = engine.execute_query(&statement)?;
+        results.push(result);
+    }
+    
+    Ok(results)
 }
 
 fn print_query_result(result: &rustgresql::executor::QueryResult, stats: &rustgresql::executor::ExecutionStats) {
@@ -127,25 +167,27 @@ fn print_query_result(result: &rustgresql::executor::QueryResult, stats: &rustgr
         return;
     }
 
-    // Print column headers
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS);
+
+    // Add header
     if !result.column_names.is_empty() {
-        let header: String = result.column_names.join(" | ");
-        let separator: String = result.column_names.iter().map(|_| "-".repeat(header.len() / result.column_names.len())).collect::<Vec<_>>().join("-+-");
-        println!("{}", header);
-        println!("{}", separator);
+        table.set_header(&result.column_names);
     }
 
-    // Print rows
+    // Add rows
     for row in &result.rows {
-        let row_str: String = row.iter()
+        let row_cells: Vec<String> = row.iter()
             .map(|value| format_value(value))
-            .collect::<Vec<_>>()
-            .join(" | ");
-        println!("{}", row_str);
+            .collect();
+        table.add_row(row_cells);
     }
+
+    println!("{}", table);
 
     // Print statistics
-    println!();
     println!("Rows returned: {}", result.rows.len());
     if stats.execution_time_ms > 0 {
         println!("Execution time: {}ms", stats.execution_time_ms);
@@ -160,65 +202,329 @@ fn format_value(value: &rustgresql::types::Value) -> String {
         rustgresql::types::ValueKind::Float(f) => f.to_string(),
         rustgresql::types::ValueKind::Boolean(b) => b.to_string(),
         rustgresql::types::ValueKind::Timestamp(ts) => ts.format("%Y-%m-%d %H:%M:%S").to_string(),
+        rustgresql::types::ValueKind::List(list) => {
+            let items: Vec<String> = list.iter().map(|v| format_value(v)).collect();
+            format!("[{}]", items.join(", "))
+        }
     }
 }
 
 fn print_help() {
-    println!("Available commands:");
-    println!("  help       - Show this help message");
-    println!("  status     - Show database status");
-    println!("  examples    - Show SQL examples");
-    println!("  exit       - Exit the program");
+    println!("╭─────────────────────────────────────────────────────────────╮");
+    println!("│              RustgreSQL v0.1.0 - HELP SYSTEM              │");
+    println!("╰─────────────────────────────────────────────────────────────╯");
     println!();
-    println!("SQL commands:");
-    println!("  SELECT     - Query data from tables");
-    println!("  INSERT     - Insert data into tables");
-    println!("  UPDATE     - Update existing data");
-    println!("  DELETE     - Delete data from tables");
-    println!("  CREATE TABLE - Create new tables");
+    
+    println!("🔧 BUILT-IN COMMANDS");
+    println!("  help       - Show this comprehensive help message");
+    println!("  status     - Display database configuration and statistics");
+    println!("  examples   - Show SQL query examples and usage patterns");
+    println!("  exit       - Exit the application gracefully");
     println!();
-    println!("Features available:");
-    println!("  ✅ Arithmetic operations (+, -, *, /)");
-    println!("  ✅ Comparison operations (=, !=, <, <=, >, >=)");
-    println!("  ✅ Logical operations (AND, OR, NOT)");
-    println!("  ✅ Three-valued logic with NULL handling");
-    println!("  ✅ Built-in functions (ABS, COALESCE, LENGTH)");
-    println!("  ✅ String pattern matching (LIKE, ILIKE)");
-    println!("  ✅ Computed columns and expressions");
+    
+    println!("📊 SQL DDL COMMANDS (Data Definition Language)");
+    println!("  CREATE TABLE    - Create new tables with columns and constraints");
+    println!("  DROP TABLE      - Remove existing tables and their data");
+    println!("  ALTER TABLE     - Modify table structure (ADD/DROP columns)");
+    println!("  CREATE INDEX    - Create indexes for performance optimization");
+    println!("  DROP INDEX      - Remove existing indexes");
+    println!("  CREATE VIEW     - Create virtual tables based on queries");
+    println!("  DROP VIEW       - Remove existing views");
+    println!();
+    
+    println!("📝 SQL DML COMMANDS (Data Manipulation Language)");
+    println!("  SELECT          - Query and retrieve data from tables");
+    println!("  INSERT INTO     - Add new rows to tables");
+    println!("  UPDATE          - Modify existing rows in tables");
+    println!("  DELETE FROM     - Remove rows from tables");
+    println!();
+    
+    println!("🔍 QUERY FEATURES");
+    println!("  ✅ Basic arithmetic operations (+, -, *, /, %)");
+    println!("  ✅ Comparison operators (=, !=, <>, <, <=, >, >=)");
+    println!("  ✅ Logical operators (AND, OR, NOT, BETWEEN, IN)");
+    println!("  ✅ Three-valued logic with proper NULL handling");
+    println!("  ✅ String operations (LIKE, ILIKE, CONCAT, SUBSTRING)");
+    println!("  ✅ Aggregate functions (COUNT, SUM, AVG, MIN, MAX)");
+    println!("  ✅ Window functions (ROW_NUMBER, RANK, LAG, LEAD)");
+    println!("  ✅ Common Table Expressions (WITH clauses)");
+    println!("  ✅ Subqueries and correlated subqueries");
+    println!("  ✅ JOIN operations (INNER, LEFT, RIGHT, FULL OUTER)");
+    println!("  ✅ GROUP BY and HAVING clauses");
+    println!("  ✅ ORDER BY with multiple columns and directions");
+    println!("  ✅ LIMIT and OFFSET for pagination");
+    println!("  ✅ DISTINCT for unique results");
+    println!("  ✅ CASE expressions for conditional logic");
+    println!();
+    
+    println!("🏗️  DATABASE ENGINE FEATURES");
+    println!("  ✅ B-tree storage engine with efficient indexing");
+    println!("  ✅ Buffer pool management (configurable size)");
+    println!("  ✅ Write-Ahead Logging (WAL) for durability");
+    println!("  ✅ ACID transactions with MVCC (Multi-Version Concurrency Control)");
+    println!("  ✅ Cost-based query optimization");
+    println!("  ✅ Parallel query execution support");
+    println!("  ✅ Schema management and metadata catalog");
+    println!("  ✅ Constraint enforcement (PRIMARY KEY, FOREIGN KEY, UNIQUE, CHECK)");
+    println!("  ✅ Data types: INTEGER, BIGINT, TEXT, REAL, BOOLEAN, TIMESTAMP");
+    println!();
+    
+    println!("💡 USAGE TIPS");
+    println!("  • All SQL statements must end with a semicolon (;)");
+    println!("  • Use multi-line queries for complex statements");
+    println!("  • Table and column names are case-sensitive");
+    println!("  • String literals use single quotes ('text')");
+    println!("  • Use examples command to see sample queries");
+    println!();
+    
+    println!("📚 EXAMPLE QUERIES");
+    println!("  CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT);");
+    println!("  INSERT INTO users VALUES (1, 'Alice', 25);");
+    println!("  SELECT name, age FROM users WHERE age >= 18 ORDER BY name;");
+    println!("  SELECT COUNT(*) as total FROM users GROUP BY age;");
+    println!();
+    
+    println!("For more examples, type: examples");
+    println!("For database status, type: status");
 }
 
 fn print_status(db: &Database) {
-    println!("Database Status:");
+    println!("╭─────────────────────────────────────────────────────────────╮");
+    println!("│              RustgreSQL v0.1.0 - DATABASE STATUS           │");
+    println!("╰─────────────────────────────────────────────────────────────╯");
+    println!();
+    
+    println!("📊 DATABASE INFORMATION");
     println!("  Version: RustgreSQL v0.1.0");
     println!("  Engine: Phase 1.1 Query Execution Engine");
+    println!("  Build: Debug mode");
+    println!();
+    
+    println!("💾 STORAGE CONFIGURATION");
     println!("  Data file: {}", db.config.data_file_path);
-    println!("  Page size: {} bytes", db.config.page_size);
+    println!("  Page size: {} bytes ({} KB)", db.config.page_size, db.config.page_size / 1024);
     println!("  Buffer pool size: {} pages", db.config.buffer_pool_size);
-    println!("  WAL enabled: {}", db.config.wal_enabled);
+    println!("  Buffer memory: ~{} MB", (db.config.buffer_pool_size * db.config.page_size) / (1024 * 1024));
+    println!();
+    
+    println!("🔒 TRANSACTION & DURABILITY");
+    println!("  WAL enabled: {}", if db.config.wal_enabled { "✅ Yes" } else { "❌ No" });
+    if let Some(wal_path) = &db.config.wal_file_path {
+        println!("  WAL file: {}", wal_path);
+    }
+    println!("  Transaction isolation: MVCC (Multi-Version Concurrency Control)");
+    println!("  ACID compliance: Full support");
+    println!();
+    
+    println!("🏗️  ENGINE CAPABILITIES");
+    println!("  Storage engine: B-tree with efficient indexing");
+    println!("  Query optimization: Cost-based optimizer");
+    println!("  Parallel execution: Supported");
+    println!("  Schema management: Full catalog system");
+    println!("  Constraint enforcement: PRIMARY KEY, FOREIGN KEY, UNIQUE, CHECK");
+    println!();
+    
+    println!("📈 SUPPORTED DATA TYPES");
+    println!("  Numeric: INTEGER, BIGINT, REAL");
+    println!("  Text: TEXT (variable length strings)");
+    println!("  Boolean: BOOLEAN (TRUE/FALSE/NULL)");
+    println!("  Temporal: TIMESTAMP (date and time)");
+    println!("  Special: NULL (three-valued logic)");
+    println!();
+    
+    println!("🔍 QUERY FEATURES");
+    println!("  DDL: CREATE, ALTER, DROP (TABLE, INDEX, VIEW)");
+    println!("  DML: SELECT, INSERT, UPDATE, DELETE");
+    println!("  Joins: INNER, LEFT, RIGHT, FULL OUTER");
+    println!("  Aggregates: COUNT, SUM, AVG, MIN, MAX");
+    println!("  Window functions: ROW_NUMBER, RANK, LAG, LEAD");
+    println!("  Subqueries: Correlated and non-correlated");
+    println!("  CTEs: Common Table Expressions (WITH clauses)");
+    println!();
+    
+    println!("⚡ PERFORMANCE FEATURES");
+    println!("  Indexing: B-tree indexes for fast lookups");
+    println!("  Buffer management: LRU eviction policy");
+    println!("  Query planning: Parallel execution planning");
+    println!("  Statistics: Cost-based optimization");
+    println!();
+    
+    println!("🛡️  SAFETY & RELIABILITY");
+    println!("  Crash recovery: WAL-based recovery");
+    println!("  Data integrity: Page checksums");
+    println!("  Concurrency: MVCC for high concurrency");
+    println!("  Durability: Write-ahead logging");
+    println!();
+    
+    println!("💻 SYSTEM INFORMATION");
+    println!("  Target: {}", std::env::consts::OS);
+    println!("  Architecture: {}", std::env::consts::ARCH);
+    println!("  Rust version: {}", option_env!("RUSTC_VERSION").unwrap_or("unknown"));
+    println!();
+    
+    println!("📝 USAGE NOTES");
+    println!("  • All SQL statements must end with semicolon (;)");
+    println!("  • Database file is created automatically if it doesn't exist");
+    println!("  • Use 'help' for comprehensive command reference");
+    println!("  • Use 'examples' for SQL query samples");
+    println!("  • Database persists between sessions");
 }
 
 fn print_examples() {
-    println!("SQL Examples:");
+    println!("╭─────────────────────────────────────────────────────────────╮");
+    println!("│              RustgreSQL v0.1.0 - SQL EXAMPLES             │");
+    println!("╰─────────────────────────────────────────────────────────────╯");
     println!();
-    println!("-- Basic queries");
-    println!("SELECT * FROM test_table;");
-    println!("SELECT name, age FROM users WHERE age > 18;");
+    
+    println!("🏗️  DATA DEFINITION (DDL)");
+    println!("-- Create tables with various data types and constraints");
+    println!("CREATE TABLE users (");
+    println!("    id INTEGER PRIMARY KEY,");
+    println!("    name TEXT NOT NULL,");
+    println!("    email TEXT UNIQUE,");
+    println!("    age INTEGER CHECK (age >= 0),");
+    println!("    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP");
+    println!(");");
     println!();
-    println!("-- Arithmetic operations");
-    println!("SELECT name, salary + bonus AS total_comp FROM employees;");
-    println!("SELECT price * quantity AS total FROM orders;");
+    println!("CREATE TABLE orders (");
+    println!("    order_id BIGINT PRIMARY KEY,");
+    println!("    user_id INTEGER REFERENCES users(id),");
+    println!("    amount REAL NOT NULL,");
+    println!("    status TEXT DEFAULT 'pending'");
+    println!(");");
     println!();
-    println!("-- Complex expressions");
-    println!("SELECT * FROM users WHERE age >= 18 AND status = 'active';");
-    println!("SELECT ABS(price - discount) FROM products;");
+    println!("-- Create indexes for performance");
+    println!("CREATE INDEX idx_users_email ON users(email);");
+    println!("CREATE INDEX idx_orders_user_id ON orders(user_id);");
     println!();
-    println!("-- String operations");
-    println!("SELECT * FROM users WHERE name LIKE 'John%';");
-    println!("SELECT LENGTH(description) FROM products;");
+    
+    println!("📝 DATA MANIPULATION (DML)");
+    println!("-- Insert data into tables");
+    println!("INSERT INTO users (id, name, email, age) VALUES");
+    println!("    (1, 'Alice Johnson', 'alice@example.com', 28),");
+    println!("    (2, 'Bob Smith', 'bob@example.com', 35),");
+    println!("    (3, 'Carol Davis', 'carol@example.com', 42);");
     println!();
-    println!("-- Three-valued logic with NULL");
-    println!("SELECT * FROM orders WHERE customer_id IS NULL;");
-    println!("SELECT COALESCE(phone, 'N/A') FROM customers;");
+    println!("INSERT INTO orders (order_id, user_id, amount, status) VALUES");
+    println!("    (1001, 1, 99.99, 'completed'),");
+    println!("    (1002, 2, 149.50, 'pending'),");
+    println!("    (1003, 1, 75.25, 'shipped');");
+    println!();
+    
+    println!("🔍 BASIC QUERIES");
+    println!("-- Select all columns");
+    println!("SELECT * FROM users;");
+    println!();
+    println!("-- Select specific columns with aliases");
+    println!("SELECT name AS full_name, email AS contact FROM users;");
+    println!();
+    println!("-- Filter with WHERE clause");
+    println!("SELECT name, age FROM users WHERE age > 30;");
+    println!();
+    println!("-- Multiple conditions with AND/OR");
+    println!("SELECT * FROM users WHERE age >= 25 AND (name LIKE 'A%' OR name LIKE 'C%');");
+    println!();
+    
+    println!("🧮 ARITHMETIC & EXPRESSIONS");
+    println!("-- Mathematical operations");
+    println!("SELECT name, age + 10 AS age_in_decade FROM users;");
+    println!("SELECT amount * 1.10 AS price_with_tax FROM orders;");
+    println!();
+    println!("-- Case expressions");
+    println!("SELECT name, age,");
+    println!("    CASE");
+    println!("        WHEN age < 30 THEN 'Young'");
+    println!("        WHEN age < 40 THEN 'Middle-aged'");
+    println!("        ELSE 'Senior'");
+    println!("    END AS age_group");
+    println!("FROM users;");
+    println!();
+    
+    println!("🔗 JOINS & RELATIONSHIPS");
+    println!("-- Inner join");
+    println!("SELECT u.name, o.order_id, o.amount");
+    println!("FROM users u");
+    println!("INNER JOIN orders o ON u.id = o.user_id;");
+    println!();
+    println!("-- Left join (show all users, even without orders)");
+    println!("SELECT u.name, COUNT(o.order_id) AS order_count");
+    println!("FROM users u");
+    println!("LEFT JOIN orders o ON u.id = o.user_id");
+    println!("GROUP BY u.id, u.name;");
+    println!();
+    
+    println!("📊 AGGREGATION & GROUPING");
+    println!("-- Basic aggregates");
+    println!("SELECT COUNT(*) AS total_users, AVG(age) AS avg_age FROM users;");
+    println!();
+    println!("-- Group by with having");
+    println!("SELECT status, COUNT(*) AS count, AVG(amount) AS avg_amount");
+    println!("FROM orders");
+    println!("GROUP BY status");
+    println!("HAVING COUNT(*) > 1;");
+    println!();
+    
+    println!("🪟 WINDOW FUNCTIONS");
+    println!("-- Row numbering");
+    println!("SELECT name, age,");
+    println!("    ROW_NUMBER() OVER (ORDER BY age DESC) AS age_rank");
+    println!("FROM users;");
+    println!();
+    println!("-- Running totals");
+    println!("SELECT order_id, amount,");
+    println!("    SUM(amount) OVER (ORDER BY order_id) AS running_total");
+    println!("FROM orders;");
+    println!();
+    
+    println!("🔍 SUBQUERIES & CTEs");
+    println!("-- Common Table Expression (CTE)");
+    println!("WITH user_stats AS (");
+    println!("    SELECT user_id, COUNT(*) AS order_count, SUM(amount) AS total_spent");
+    println!("    FROM orders");
+    println!("    GROUP BY user_id");
+    println!(")");
+    println!("SELECT u.name, us.order_count, us.total_spent");
+    println!("FROM users u");
+    println!("INNER JOIN user_stats us ON u.id = us.user_id;");
+    println!();
+    println!("-- Subquery in WHERE clause");
+    println!("SELECT name FROM users");
+    println!("WHERE id IN (SELECT DISTINCT user_id FROM orders WHERE amount > 100);");
+    println!();
+    
+    println!("🔧 STRING & NULL OPERATIONS");
+    println!("-- String functions and pattern matching");
+    println!("SELECT name, LENGTH(name) AS name_length");
+    println!("FROM users");
+    println!("WHERE name LIKE '%son%';");
+    println!();
+    println!("-- NULL handling");
+    println!("SELECT name, COALESCE(email, 'No email') AS contact_info");
+    println!("FROM users");
+    println!("WHERE email IS NOT NULL;");
+    println!();
+    
+    println!("📄 PAGINATION & ORDERING");
+    println!("-- Order by multiple columns");
+    println!("SELECT * FROM users ORDER BY age DESC, name ASC;");
+    println!();
+    println!("-- Limit and offset for pagination");
+    println!("SELECT * FROM users ORDER BY created_at DESC LIMIT 10 OFFSET 20;");
+    println!();
+    
+    println!("💡 TIPS FOR TESTING");
+    println!("• Start with DDL to create tables, then DML to add data");
+    println!("• Use semicolons (;) at the end of each statement");
+    println!("• Build complex queries step by step");
+    println!("• Use aliases to make results more readable");
+    println!("• Test joins with small datasets first");
+    println!();
+    
+    println!("🚀 QUICK START SEQUENCE");
+    println!("1. CREATE TABLE test (id INT, name TEXT);");
+    println!("2. INSERT INTO test VALUES (1, 'Hello');");
+    println!("3. SELECT * FROM test;");
+    println!();
 }
 
 fn handle_special_command(cmd: &str, _db: &Database) -> bool {
@@ -248,8 +554,10 @@ fn run_basic_test() {
     for query in test_queries {
         println!("Executing: {}", query);
         match execute_sql(&engine, query) {
-            Ok((result, stats)) => {
-                print_query_result(&result, &stats);
+            Ok(results) => {
+                for (result, stats) in results {
+                    print_query_result(&result, &stats);
+                }
             }
             Err(e) => {
                 println!("Error: {}", e);

@@ -3,6 +3,7 @@
 //! Coordinates query execution and manages executor state
 
 use crate::{Result, sql::{Statement, SelectStatement, InsertStatement, UpdateStatement, DeleteStatement, CreateTableStatement}, sql::ast::{CreateIndexStatement, DropTableStatement, DropIndexStatement, AlterTableStatement, CreateViewStatement, DropViewStatement, RefreshMaterializedViewStatement, CreateProcedureStatement, CreateFunctionStatement, DropProcedureStatement, DropFunctionStatement, CallProcedureStatement, PerformStatement, Expression}, executor::planner::{QueryPlanner, PlanNode}, executor::operators::{QueryResult, ExecutionContext}};
+use crate::optimizer::OptimizedQueryPlanner;
 use std::sync::Arc;
 use crate::executor::ddl_error::{DdlError, DdlOperation};
 use crate::executor::query_rewrite::QueryRewriter;
@@ -27,7 +28,7 @@ pub struct ExecutionStats {
 #[derive(Debug)]
 pub struct Executor {
     context: ExecutionContext,
-    planner: QueryPlanner,
+    planner: OptimizedQueryPlanner,
     stats: ExecutionStats,
     catalog: std::sync::Arc<CatalogManager>,
     buffer_manager: std::sync::Arc<crate::storage::BufferPoolManager>,
@@ -46,7 +47,7 @@ impl Executor {
 
         Self {
             context,
-            planner: QueryPlanner::with_catalog(catalog.clone()),
+            planner: OptimizedQueryPlanner::new(),
             stats: ExecutionStats {
                 rows_scanned: 0,
                 rows_filtered: 0,
@@ -68,7 +69,7 @@ impl Executor {
 
         Self {
             context,
-            planner: QueryPlanner::with_catalog(catalog.clone()),
+            planner: OptimizedQueryPlanner::new(),
             stats: ExecutionStats {
                 rows_scanned: 0,
                 rows_filtered: 0,
@@ -184,8 +185,21 @@ impl Executor {
 
     /// Execute SELECT statement
     fn execute_select(&mut self, select: &SelectStatement) -> Result<QueryResult> {
-        let plan = self.planner.plan_select(select)?;
+        let table_indexes = self.get_all_table_indexes()?;
+        let plan = self.planner.plan_select(select, &table_indexes)?;
         self.execute_plan(plan.root)
+    }
+
+    /// Get all table indexes for optimization
+    fn get_all_table_indexes(&self) -> Result<Vec<(String, Vec<crate::catalog::IndexDef>)>> {
+        let mut result = Vec::new();
+        let tables = self.catalog.table_manager.list_tables()?;
+        for table in tables {
+            let indexes = self.catalog.index_manager.list_table_indexes(table.table_id)?;
+            let index_defs = indexes.into_iter().map(|info| info.def).collect();
+            result.push((table.name, index_defs));
+        }
+        Ok(result)
     }
 
     /// Execute INSERT statement
@@ -255,11 +269,11 @@ impl Executor {
                 &create.table_constraints,
             )?;
 
-            // Validate table constraints
-            self.validate_table_constraints(&create.table_constraints, &catalog_columns, &create.table_name)?;
-
             // Merge column-level and table-level constraints
             let final_columns = self.merge_constraints(catalog_columns, &catalog_table_constraints)?;
+
+            // Validate table constraints
+            self.validate_table_constraints(&create.table_constraints, &final_columns, &create.table_name)?;
 
             // Create the table in the catalog
             let table_id = self.catalog.create_table(&create.table_name, final_columns.clone())?;
@@ -791,6 +805,7 @@ impl Executor {
             BinaryOperator::And => "AND",
             BinaryOperator::Or => "OR",
             BinaryOperator::Is => "IS",
+            BinaryOperator::IsNot => "IS NOT",
             BinaryOperator::Add => "+",
             BinaryOperator::Subtract => "-",
             BinaryOperator::Multiply => "*",
@@ -1387,7 +1402,7 @@ impl Executor {
                         if let Some(column) = table_columns.iter().find(|c| c.name == *column_name) {
                             if column.nullable {
                                 return Err(crate::executor::ddl_error::DdlError::invalid_constraint_definition(
-                                    &format!("PRIMARY KEY ({})", column_name),
+                                    &format!("PRIMARY KEY ({})", columns.join(", ")),
                                     "Primary key columns cannot be nullable"
                                 ).into());
                             }

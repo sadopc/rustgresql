@@ -38,7 +38,7 @@ impl FileManager for MockFileManager {
         let page_id = *next_id;
         *next_id += 1;
 
-        let page = Page::new(page_id, page_type);
+        let page = Page::new(page_id, page_type, 8192);
         self.pages.lock().unwrap().insert(page_id, page);
 
         Ok(page_id)
@@ -60,5 +60,9 @@ impl FileManager for MockFileManager {
             free_pages: 0,
             used_pages: pages.len() as u64,
         })
+    }
+
+    fn page_size(&self) -> usize {
+        8192
     }
 }
