@@ -375,6 +375,20 @@ impl ExpressionEvaluator {
                         return Ok(value.clone());
                     }
 
+                    // Fallback: if the qualified name is not found, try to find it using a heuristic
+                    // This handles cases where JOIN creates "left.name" but the query uses "e.name"
+                    // First, try to find "left.name" or "right.name" as fallbacks
+                    let left_fallback = format!("left.{}", name);
+                    let right_fallback = format!("right.{}", name);
+
+                    if let Some(value) = context.get_column_value(&left_fallback) {
+                        return Ok(value.clone());
+                    }
+
+                    if let Some(value) = context.get_column_value(&right_fallback) {
+                        return Ok(value.clone());
+                    }
+
                     // Fallback: search left columns first, then right (for backwards compatibility)
                     if let (Some(left_row), Some(left_columns)) = (&context.left_row, &context.left_columns) {
                         if let Some(idx) = left_columns.iter().position(|c| c == name) {
@@ -385,6 +399,12 @@ impl ExpressionEvaluator {
                         if let Some(idx) = right_columns.iter().position(|c| c == name) {
                             return Ok(right_row[idx].clone());
                         }
+                    }
+
+                    // Final fallback: try unqualified name in columns map
+                    // This handles cases like SELECT e.name FROM e where table scan produces unqualified column names
+                    if let Some(value) = context.get_column_value(name) {
+                        return Ok(value.clone());
                     }
 
                     // Not found

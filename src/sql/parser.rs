@@ -1143,7 +1143,9 @@ impl Parser {
 
     /// Parse join clause
     fn parse_join(&mut self) -> Result<JoinCondition> {
-        let join_type = if self.match_token(TokenType::Left) {
+        let join_type = if self.match_token(TokenType::Cross) {
+            JoinType::Cross
+        } else if self.match_token(TokenType::Left) {
             if self.match_token(TokenType::Outer) {
                 JoinType::Left
             } else if self.match_token(TokenType::Anti) {
@@ -1183,6 +1185,8 @@ impl Parser {
 
         let table = self.parse_table_ref()?;
 
+        // CROSS JOIN does not require an ON clause (it's a Cartesian product)
+        // For other joins, the ON clause is optional (defaults to cross product if omitted)
         let condition = if self.match_token(TokenType::On) {
             Some(self.parse_expression()?)
         } else {

@@ -2,9 +2,10 @@
 
 use crate::Result;
 use chrono::{DateTime, Utc};
+use std::hash::{Hash, Hasher};
 
 /// Null value
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct NullValue;
 
 /// Value kind
@@ -19,10 +20,56 @@ pub enum ValueKind {
     Null(NullValue),
 }
 
+impl Eq for ValueKind {}
+
+impl Hash for ValueKind {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            ValueKind::Integer(i) => {
+                0u8.hash(state);
+                i.hash(state);
+            }
+            ValueKind::String(s) => {
+                1u8.hash(state);
+                s.hash(state);
+            }
+            ValueKind::Boolean(b) => {
+                2u8.hash(state);
+                b.hash(state);
+            }
+            ValueKind::Float(f) => {
+                3u8.hash(state);
+                // Convert float to bits for hashing to handle NaN correctly
+                f.to_bits().hash(state);
+            }
+            ValueKind::Timestamp(t) => {
+                4u8.hash(state);
+                t.hash(state);
+            }
+            ValueKind::List(list) => {
+                5u8.hash(state);
+                list.hash(state);
+            }
+            ValueKind::Null(n) => {
+                6u8.hash(state);
+                n.hash(state);
+            }
+        }
+    }
+}
+
 /// Value
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Value {
     pub kind: ValueKind,
+}
+
+impl Eq for Value {}
+
+impl Hash for Value {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.kind.hash(state);
+    }
 }
 
 impl Value {

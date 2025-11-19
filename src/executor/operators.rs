@@ -5,7 +5,7 @@
 use crate::{Result, sql::ast::{Expression, BinaryOperator, SetOperator as SetOperatorType, OrderBy, SortDirection}, executor::planner::PlanNode, types::{Value, ValueKind, DataTypeKind, DataType}};
 use crate::executor::{TableScanner, ExpressionEvaluator, EvaluationContext, ThreeValuedLogic, RowData, AggregateState};
 use std::sync::Arc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use serde_json;
 
 /// Compare two Values for sorting
@@ -60,7 +60,7 @@ impl ScanOperator {
     pub fn with_scanner(table_name: String, scanner: TableScanner) -> Self {
         Self {
             table_name,
-            scanner: None,
+            scanner: Some(scanner),
         }
     }
 
@@ -319,72 +319,13 @@ impl ProjectOperator {
                 })
                 .collect()
         } else {
-            // Fallback: basic evaluation without proper column resolution
+            // Use basic evaluation - this works correctly for both JOIN and non-JOIN results
+            // because JOIN results have qualified column names (e.g., "e.name", "d.name")
+            // in input_column_names, which get properly mapped to values
             input_result.rows
                 .into_iter()
                 .map(|row| {
-                    let eval_context = if let (Some(left_cols), Some(right_cols)) = (&self.left_columns, &self.right_columns) {
-                        let left_count = left_cols.len();
-                        let left_row = row[..left_count].to_vec();
-                        let right_row = row[left_count..].to_vec();
-
-                        // Create columns map with qualified column names
-                        let mut columns = std::collections::HashMap::new();
-
-                        // Add qualified column names with their values
-                        for (i, col_name) in left_cols.iter().enumerate() {
-                            if i < left_row.len() {
-                                // Try to extract table name from qualified column name or use "left" as fallback
-                                let qualified_name = if col_name.contains('.') {
-                                    col_name.clone()
-                                } else {
-                                    // Check if we have qualified names in input_column_names
-                                    if let Some(input_col) = input_column_names.get(i) {
-                                        if input_col.contains('.') {
-                                            input_col.clone()
-                                        } else {
-                                            format!("left.{}", col_name)
-                                        }
-                                    } else {
-                                        format!("left.{}", col_name)
-                                    }
-                                };
-                                columns.insert(qualified_name, left_row[i].clone());
-                            }
-                        }
-
-                        for (i, col_name) in right_cols.iter().enumerate() {
-                            if i < right_row.len() {
-                                // Try to extract table name from qualified column name or use "right" as fallback
-                                let qualified_name = if col_name.contains('.') {
-                                    col_name.clone()
-                                } else {
-                                    // Check if we have qualified names in input_column_names
-                                    if let Some(input_col) = input_column_names.get(left_count + i) {
-                                        if input_col.contains('.') {
-                                            input_col.clone()
-                                        } else {
-                                            format!("right.{}", col_name)
-                                        }
-                                    } else {
-                                        format!("right.{}", col_name)
-                                    }
-                                };
-                                columns.insert(qualified_name, right_row[i].clone());
-                            }
-                        }
-
-                        EvaluationContext {
-                            columns,
-                            row_data: Some(row.clone()),
-                            left_row: Some(left_row),
-                            right_row: Some(right_row),
-                            left_columns: Some(left_cols.clone()),
-                            right_columns: Some(right_cols.clone()),
-                        }
-                    } else {
-                        self.create_basic_evaluation_context(&input_column_names, &row)
-                    };
+                    let eval_context = self.create_basic_evaluation_context(&input_column_names, &row);
                     self.columns
                         .iter()
                         .map(|(_, expr)| {
@@ -490,7 +431,8 @@ impl JoinOperator {
 
         let (joined_rows, column_names) = match self.join_type {
             crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Left |
-            crate::sql::ast::JoinType::Right | crate::sql::ast::JoinType::Full => {
+            crate::sql::ast::JoinType::Right | crate::sql::ast::JoinType::Full |
+            crate::sql::ast::JoinType::Cross => {
                 self.execute_outer_joins(&left_result, &right_result)?
             }
             crate::sql::ast::JoinType::LeftSemi | crate::sql::ast::JoinType::RightSemi => {
@@ -514,15 +456,28 @@ impl JoinOperator {
         let mut joined_rows = Vec::new();
 
         // Create qualified column names to avoid ambiguity
+        // For nested joins, preserve already-qualified column names from previous joins
         let left_table_name = self.left_alias.as_ref().map(|alias| alias.clone()).unwrap_or_else(|| "left".to_string());
         let right_table_name = self.right_alias.as_ref().map(|alias| alias.clone()).unwrap_or_else(|| "right".to_string());
 
         let mut joined_column_names = Vec::new();
         for col_name in &left_result.column_names {
-            joined_column_names.push(format!("{}.{}", left_table_name, col_name));
+            if col_name.contains('.') {
+                // Already qualified from a previous JOIN - preserve as-is
+                joined_column_names.push(col_name.clone());
+            } else {
+                // Unqualified - add table alias
+                joined_column_names.push(format!("{}.{}", left_table_name, col_name));
+            }
         }
         for col_name in &right_result.column_names {
-            joined_column_names.push(format!("{}.{}", right_table_name, col_name));
+            if col_name.contains('.') {
+                // Already qualified from a previous JOIN - preserve as-is
+                joined_column_names.push(col_name.clone());
+            } else {
+                // Unqualified - add table alias
+                joined_column_names.push(format!("{}.{}", right_table_name, col_name));
+            }
         }
 
         // Track which rows have been matched for outer joins
@@ -547,21 +502,39 @@ impl JoinOperator {
 
         // Add unmatched rows for outer joins
         match self.join_type {
-            crate::sql::ast::JoinType::Left | crate::sql::ast::JoinType::Full => {
+            crate::sql::ast::JoinType::Left => {
+                // LEFT JOIN: Add unmatched left rows with NULL for right columns
                 for (left_idx, left_row) in left_result.rows.iter().enumerate() {
                     if !left_matched[left_idx] {
                         let mut joined_row = left_row.clone();
-                        // Add NULL values for right side columns
                         joined_row.extend(vec![Value { kind: crate::types::ValueKind::Null(crate::types::NullValue) }; right_result.column_names.len()]);
                         joined_rows.push(joined_row);
                     }
                 }
             }
-            crate::sql::ast::JoinType::Right | crate::sql::ast::JoinType::Full => {
+            crate::sql::ast::JoinType::Right => {
+                // RIGHT JOIN: Add unmatched right rows with NULL for left columns
                 for (right_idx, right_row) in right_result.rows.iter().enumerate() {
                     if !right_matched[right_idx] {
                         let mut joined_row = Vec::new();
-                        // Add NULL values for left side columns
+                        joined_row.extend(vec![Value { kind: crate::types::ValueKind::Null(crate::types::NullValue) }; left_result.column_names.len()]);
+                        joined_row.extend(right_row.clone());
+                        joined_rows.push(joined_row);
+                    }
+                }
+            }
+            crate::sql::ast::JoinType::Full => {
+                // FULL JOIN: Add both unmatched left rows and unmatched right rows
+                for (left_idx, left_row) in left_result.rows.iter().enumerate() {
+                    if !left_matched[left_idx] {
+                        let mut joined_row = left_row.clone();
+                        joined_row.extend(vec![Value { kind: crate::types::ValueKind::Null(crate::types::NullValue) }; right_result.column_names.len()]);
+                        joined_rows.push(joined_row);
+                    }
+                }
+                for (right_idx, right_row) in right_result.rows.iter().enumerate() {
+                    if !right_matched[right_idx] {
+                        let mut joined_row = Vec::new();
                         joined_row.extend(vec![Value { kind: crate::types::ValueKind::Null(crate::types::NullValue) }; left_result.column_names.len()]);
                         joined_row.extend(right_row.clone());
                         joined_rows.push(joined_row);
@@ -662,17 +635,32 @@ impl JoinOperator {
                 let mut columns = std::collections::HashMap::new();
 
                 // Add qualified column names with their values
+                // Preserve already-qualified column names from nested JOINs
                 for (i, col_name) in left_columns.iter().enumerate() {
                     if i < left_row.len() {
-                        let qualified_name = format!("{}.{}", left_table_name, col_name);
+                        let qualified_name = if col_name.contains('.') {
+                            // Already qualified from previous JOIN
+                            col_name.clone()
+                        } else {
+                            format!("{}.{}", left_table_name, col_name)
+                        };
                         columns.insert(qualified_name, left_row[i].clone());
+                        // Also add unqualified name for easier access
+                        columns.insert(col_name.clone(), left_row[i].clone());
                     }
                 }
 
                 for (i, col_name) in right_columns.iter().enumerate() {
                     if i < right_row.len() {
-                        let qualified_name = format!("{}.{}", right_table_name, col_name);
+                        let qualified_name = if col_name.contains('.') {
+                            // Already qualified from previous JOIN
+                            col_name.clone()
+                        } else {
+                            format!("{}.{}", right_table_name, col_name)
+                        };
                         columns.insert(qualified_name, right_row[i].clone());
+                        // Also add unqualified name for easier access
+                        columns.insert(col_name.clone(), right_row[i].clone());
                     }
                 }
 
@@ -710,6 +698,7 @@ impl JoinOperator {
             crate::sql::ast::JoinType::Left => "LEFT",
             crate::sql::ast::JoinType::Right => "RIGHT",
             crate::sql::ast::JoinType::Full => "FULL",
+            crate::sql::ast::JoinType::Cross => "CROSS",
             crate::sql::ast::JoinType::LeftSemi => "LEFT SEMI",
             crate::sql::ast::JoinType::RightSemi => "RIGHT SEMI",
             crate::sql::ast::JoinType::LeftAnti => "LEFT ANTI",
@@ -1047,7 +1036,7 @@ impl DeleteOperator {
         Self {
             table_name,
             condition,
-            scanner: None,
+            scanner: Some(scanner),
         }
     }
 
@@ -3328,5 +3317,45 @@ impl LimitOperator {
         }
 
         Ok(input_result)
+    }
+}
+
+/// Distinct operator - removes duplicate rows
+pub struct DistinctOperator {
+    pub input: Box<PlanNode>,
+}
+
+impl DistinctOperator {
+    pub fn new(input: PlanNode) -> Self {
+        Self {
+            input: Box::new(input),
+        }
+    }
+
+    pub fn execute(&self, context: &mut ExecutionContext) -> Result<QueryResult> {
+        context.log("DistinctOperator: Executing distinct operation");
+
+        // Execute input plan to get results
+        let input_result = self.input.execute(context)?;
+
+        context.log(&format!("DistinctOperator: Got {} rows to deduplicate", input_result.rows.len()));
+
+        // Deduplicate rows using HashSet for O(1) lookup
+        let mut seen_rows: HashSet<Vec<Value>> = HashSet::new();
+        let mut distinct_rows: Vec<Vec<Value>> = Vec::new();
+
+        for row in input_result.rows {
+            // HashSet.insert returns true if the value was inserted (not present before)
+            if seen_rows.insert(row.clone()) {
+                distinct_rows.push(row);
+            }
+        }
+
+        context.log(&format!("DistinctOperator: Returning {} distinct rows", distinct_rows.len()));
+
+        Ok(QueryResult {
+            rows: distinct_rows,
+            column_names: input_result.column_names,
+        })
     }
 }

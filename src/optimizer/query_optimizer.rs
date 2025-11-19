@@ -69,6 +69,7 @@ impl OptimizedQueryPlanner {
                 order_by,
                 limit,
                 offset,
+                distinct,
                 ..
             } => {
                 // Extract required columns for the query
@@ -177,6 +178,13 @@ impl OptimizedQueryPlanner {
                         input: Box::new(plan),
                         limit: *limit_val,
                         offset: offset.clone(),
+                    };
+                }
+
+                // Apply DISTINCT if present
+                if *distinct {
+                    plan = PlanNode::Distinct {
+                        input: Box::new(plan),
                     };
                 }
 

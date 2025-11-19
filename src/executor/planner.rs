@@ -162,6 +162,10 @@ pub enum PlanNode {
         limit: i64,
         offset: Option<i64>,
     },
+    /// Distinct operation (remove duplicate rows)
+    Distinct {
+        input: Box<PlanNode>,
+    },
 }
 
 impl PlanNode {
@@ -406,6 +410,11 @@ impl PlanNode {
                 let operator = crate::executor::operators::LimitOperator::new(input_plan, *limit, offset.clone());
                 operator.execute(context)
             }
+            PlanNode::Distinct { input } => {
+                let input_plan = input.as_ref().clone();
+                let operator = crate::executor::operators::DistinctOperator::new(input_plan);
+                operator.execute(context)
+            }
         }
     }
 }
@@ -443,7 +452,7 @@ impl QueryPlanner {
     pub fn plan_select(&self, select: &SelectStatement) -> Result<ExecutionPlan> {
         match select {
             SelectStatement::Simple {
-
+                distinct,
                 with_clause,
                 from,
                 joins,
@@ -602,6 +611,13 @@ impl QueryPlanner {
                         input: Box::new(plan),
                         limit: *limit_val,
                         offset: offset.clone(),
+                    };
+                }
+
+                // Apply DISTINCT if present
+                if *distinct {
+                    plan = PlanNode::Distinct {
+                        input: Box::new(plan),
                     };
                 }
 

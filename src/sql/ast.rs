@@ -192,6 +192,7 @@ pub enum JoinType {
     Left,
     Right,
     Full,
+    Cross,         // CROSS JOIN (Cartesian product)
     LeftAnti,      // LEFT ANTI JOIN (NOT EXISTS/NOT IN)
     LeftSemi,      // LEFT SEMI JOIN (EXISTS/IN)
     RightAnti,     // RIGHT ANTI JOIN
