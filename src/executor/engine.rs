@@ -191,8 +191,11 @@ impl Executor {
         let plan = match self.planner.plan_select(select, &table_indexes) {
             Ok(plan) => plan,
             Err(_) => {
-                // Fallback to regular planner when optimization fails (e.g., for subqueries)
-                let regular_planner = crate::executor::planner::QueryPlanner::new();
+                // Fallback to regular planner when optimization fails (e.g., for subqueries or CTEs)
+                let catalog = self.context.get_catalog().ok_or_else(|| {
+                    crate::error::RustgreSQLError::Execution("Catalog not available in execution context".to_string())
+                })?;
+                let regular_planner = crate::executor::planner::QueryPlanner::with_catalog(catalog.clone());
                 regular_planner.plan_select(select)?
             }
         };

@@ -59,7 +59,7 @@ impl OptimizedQueryPlanner {
     pub fn plan_select(&self, select: &SelectStatement, table_indexes: &[(String, Vec<IndexDef>)]) -> Result<ExecutionPlan> {
         match select {
             SelectStatement::Simple {
-                with_clause: _,
+                with_clause,
                 from,
                 joins,
                 where_clause,
@@ -72,6 +72,14 @@ impl OptimizedQueryPlanner {
                 distinct,
                 ..
             } => {
+                // Check if this query has CTEs - if so, return an error to trigger fallback
+                // This ensures the engine's fallback planner with catalog context is used
+                if with_clause.is_some() {
+                    return Err(crate::error::RustgreSQLError::Internal(
+                        "CTE queries not supported in optimizer, falling back to base planner".to_string()
+                    ));
+                }
+
                 // Extract required columns for the query
                 let required_columns = self.extract_required_columns(select);
 

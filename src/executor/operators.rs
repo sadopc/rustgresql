@@ -3042,11 +3042,11 @@ pub struct CTEOperator {
 }
 
 impl CTEOperator {
-    pub fn new(with_clause: crate::sql::ast::WithClause, main_query: crate::sql::ast::Statement) -> Self {
+    pub fn new(with_clause: crate::sql::ast::WithClause, main_query: crate::sql::ast::Statement, catalog: std::sync::Arc<crate::catalog::CatalogManager>) -> Self {
         Self {
             with_clause,
             main_query: Box::new(main_query),
-            planner: crate::executor::planner::QueryPlanner::new(),
+            planner: crate::executor::planner::QueryPlanner::with_catalog(catalog),
             materialized_ctes: std::collections::HashMap::new(),
         }
     }

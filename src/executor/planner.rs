@@ -390,7 +390,10 @@ impl PlanNode {
                 })
             }
             PlanNode::CTE { with_clause, main_query } => {
-                let mut cte_operator = CTEOperator::new(with_clause.clone(), *main_query.clone());
+                let catalog = context.get_catalog().ok_or_else(|| {
+                    crate::error::RustgreSQLError::Execution("Catalog not available in execution context for CTE".to_string())
+                })?;
+                let mut cte_operator = CTEOperator::new(with_clause.clone(), *main_query.clone(), catalog.clone());
                 cte_operator.execute(context)
             }
             PlanNode::CTEScan { cte_name, materialized_result } => {
@@ -1099,12 +1102,59 @@ impl QueryPlanner {
         }
     }
 
+    /// Helper function to strip WITH clause from a SelectStatement to prevent infinite recursion
+    fn strip_with_clause(select: &SelectStatement) -> SelectStatement {
+        match select {
+            SelectStatement::Simple {
+                with_clause: _,
+                distinct,
+                columns,
+                from,
+                joins,
+                where_clause,
+                group_by,
+                having,
+                order_by,
+                limit,
+                offset,
+                named_windows,
+            } => SelectStatement::Simple {
+                with_clause: None, // Strip the WITH clause
+                distinct: *distinct,
+                columns: columns.clone(),
+                from: from.clone(),
+                joins: joins.clone(),
+                where_clause: where_clause.clone(),
+                group_by: group_by.clone(),
+                having: having.clone(),
+                order_by: order_by.clone(),
+                limit: *limit,
+                offset: *offset,
+                named_windows: named_windows.clone(),
+            },
+            SelectStatement::SetOperation(set_op) => {
+                // Recursively strip WITH clause from left and right queries
+                SelectStatement::SetOperation(crate::sql::ast::SetOperation {
+                    operator: set_op.operator.clone(),
+                    left: Box::new(Self::strip_with_clause(&set_op.left)),
+                    right: Box::new(Self::strip_with_clause(&set_op.right)),
+                    all: set_op.all,
+                })
+            }
+        }
+    }
+
     /// Plan a CTE SELECT statement
     fn plan_cte_select(&self, with_clause: &WithClause, select: &SelectStatement) -> Result<ExecutionPlan> {
+        // Strip the WITH clause from the main query to prevent infinite recursion
+        // The WITH clause is already being handled at this level, so the main query
+        // should not contain it when it's planned later
+        let stripped_select = Self::strip_with_clause(select);
+
         // Create a CTE plan node that will handle the entire WITH clause
         let plan_node = PlanNode::CTE {
             with_clause: with_clause.clone(),
-            main_query: Box::new(crate::sql::ast::Statement::Select(select.clone())),
+            main_query: Box::new(crate::sql::ast::Statement::Select(stripped_select)),
         };
 
         // For now, we'll use the column names from the main query
