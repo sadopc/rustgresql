@@ -74,3 +74,4 @@ logs/
 --test
 --file
 
+*.sql

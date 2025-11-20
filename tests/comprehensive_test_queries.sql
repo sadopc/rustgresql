@@ -176,6 +176,10 @@ SELECT d.name FROM departments d WHERE EXISTS (SELECT 1 FROM employees e WHERE e
 -- Query 43: NOT EXISTS subquery
 SELECT d.name FROM departments d WHERE NOT EXISTS (SELECT 1 FROM employees e WHERE e.department_id = d.id);
 
+-- Query 43b: NOT EXISTS subquery
+INSERT INTO departments (id, name, budget, location) VALUES (6, 'Future Projects', 100000.00, 'Remote');
+SELECT d.name FROM departments d WHERE NOT EXISTS (SELECT 1 FROM employees e WHERE e.department_id = d.id);
+
 -- Query 44: Correlated subquery
 SELECT e.name, e.salary, (SELECT AVG(e2.salary) FROM employees e2 WHERE e2.department_id = e.department_id) AS dept_avg FROM employees e;
 

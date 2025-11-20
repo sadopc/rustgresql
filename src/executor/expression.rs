@@ -25,6 +25,21 @@ pub struct EvaluationContext {
     pub catalog: Option<std::sync::Arc<crate::catalog::CatalogManager>>,
     /// Buffer manager for subquery execution
     pub buffer_manager: Option<std::sync::Arc<crate::storage::BufferPoolManager>>,
+    /// Context tracking for subquery evaluation (e.g., IN clause)
+    pub subquery_context: Option<SubqueryContext>,
+    /// Aggregate function values for HAVING clause evaluation (expression -> value)
+    pub having_aggregates: Option<std::collections::HashMap<String, Value>>,
+}
+
+/// Context for subquery evaluation to determine how results should be processed
+#[derive(Debug, Clone)]
+pub enum SubqueryContext {
+    /// Subquery used in IN clause - should return list of values
+    InClause,
+    /// Scalar subquery - should return single value
+    Scalar,
+    /// EXISTS subquery - should return boolean
+    Exists,
 }
 
 impl EvaluationContext {
@@ -38,6 +53,8 @@ impl EvaluationContext {
             right_columns: None,
             catalog: None,
             buffer_manager: None,
+            subquery_context: None,
+            having_aggregates: None,
         }
     }
 
@@ -51,6 +68,8 @@ impl EvaluationContext {
             right_columns: None,
             catalog: None,
             buffer_manager: None,
+            subquery_context: None,
+            having_aggregates: None,
         }
     }
 
@@ -64,6 +83,8 @@ impl EvaluationContext {
             right_columns: None,
             catalog: None,
             buffer_manager: None,
+            subquery_context: None,
+            having_aggregates: None,
         }
     }
 
@@ -77,6 +98,8 @@ impl EvaluationContext {
             right_columns: Some(right_columns),
             catalog: None,
             buffer_manager: None,
+            subquery_context: None,
+            having_aggregates: None,
         }
     }
 
@@ -94,6 +117,34 @@ impl EvaluationContext {
 
     pub fn set_buffer_manager(&mut self, buffer_manager: std::sync::Arc<crate::storage::BufferPoolManager>) {
         self.buffer_manager = Some(buffer_manager);
+    }
+
+    pub fn set_subquery_context(&mut self, context: SubqueryContext) {
+        self.subquery_context = Some(context);
+    }
+
+    pub fn set_having_aggregates(&mut self, aggregates: std::collections::HashMap<String, Value>) {
+        self.having_aggregates = Some(aggregates);
+    }
+
+    pub fn get_subquery_context(&self) -> Option<&SubqueryContext> {
+        self.subquery_context.as_ref()
+    }
+
+    /// Create a new context with IN clause subquery context
+    pub fn with_in_subquery_context() -> Self {
+        Self {
+            columns: HashMap::new(),
+            row_data: None,
+            left_row: None,
+            right_row: None,
+            left_columns: None,
+            right_columns: None,
+            catalog: None,
+            buffer_manager: None,
+            subquery_context: Some(SubqueryContext::InClause),
+            having_aggregates: None,
+        }
     }
 }
 
@@ -409,6 +460,18 @@ impl ExpressionEvaluator {
                         return Ok(value.clone());
                     }
 
+                    // General fallback: try to find the column with any table alias prefix
+                    // This handles cases like "d.id" where "d" is an arbitrary table alias
+                    for (column_name, value) in &context.columns {
+                        // Check if this column matches our target column name (ignoring table alias)
+                        if let Some(pos) = column_name.find('.') {
+                            let column_part = &column_name[pos + 1..];
+                            if column_part == name {
+                                return Ok(value.clone());
+                            }
+                        }
+                    }
+
                     // Fallback: search left columns first, then right (for backwards compatibility)
                     if let (Some(left_row), Some(left_columns)) = (&context.left_row, &context.left_columns) {
                         if let Some(idx) = left_columns.iter().position(|c| c == name) {
@@ -447,9 +510,29 @@ impl ExpressionEvaluator {
             }
 
             Expression::BinaryOp { left, op, right } => {
-                let left_val = self.evaluate(left, context)?;
-                let right_val = self.evaluate(right, context)?;
-                Self::evaluate_binary_operation(*op, &left_val, &right_val)
+                // Special handling for IN operations with subqueries
+                if *op == BinaryOperator::In {
+                    // Evaluate left side normally
+                    let left_val = self.evaluate(left, context)?;
+
+                    // For IN operations, check if right side is a subquery
+                    if let Expression::Subquery(_) = right.as_ref() {
+                        // Create a new context with IN clause subquery context
+                        let mut in_context = context.clone();
+                        in_context.set_subquery_context(SubqueryContext::InClause);
+                        let right_val = self.evaluate(right, &in_context)?;
+                        Self::evaluate_binary_operation(*op, &left_val, &right_val)
+                    } else {
+                        // Evaluate right side normally for non-subquery IN operations
+                        let right_val = self.evaluate(right, context)?;
+                        Self::evaluate_binary_operation(*op, &left_val, &right_val)
+                    }
+                } else {
+                    // For all other operations, evaluate normally
+                    let left_val = self.evaluate(left, context)?;
+                    let right_val = self.evaluate(right, context)?;
+                    Self::evaluate_binary_operation(*op, &left_val, &right_val)
+                }
             }
 
             Expression::UnaryOp { op, expr: inner_expr } => {
@@ -487,6 +570,11 @@ impl ExpressionEvaluator {
             Expression::WindowFunction(_) => {
                 // Window functions should be handled by WindowOperator, not in expression evaluator
                 Err(RustgreSQLError::InvalidOperation("Window functions must be evaluated by WindowOperator".to_string()))
+            }
+
+            Expression::Exists { subquery, negated } => {
+                // Execute the subquery and check if it returns any rows
+                self.evaluate_exists_subquery(subquery.as_ref(), *negated, context)
             }
         }
     }
@@ -558,6 +646,14 @@ impl ExpressionEvaluator {
                     ValueKind::Null(_) => Ok(Value { kind: ValueKind::Null(NullValue) }),
                     _ => Err(RustgreSQLError::InvalidOperation("Unary plus not supported for this type".to_string())),
                 }
+            }
+            UnaryOperator::Exists => {
+                // EXISTS should be handled as part of EXISTS expression evaluation
+                Err(RustgreSQLError::InvalidOperation("EXISTS should be handled as EXISTS expression, not as unary operator".to_string()))
+            }
+            UnaryOperator::NotExists => {
+                // NOT EXISTS should be handled as part of EXISTS expression evaluation
+                Err(RustgreSQLError::InvalidOperation("NOT EXISTS should be handled as EXISTS expression, not as unary operator".to_string()))
             }
         }
     }
@@ -835,8 +931,26 @@ impl ExpressionEvaluator {
     // Function evaluation
     fn evaluate_function(&self, name: &str, args: &[Expression], context: &EvaluationContext) -> Result<Value> {
         match name.to_uppercase().as_str() {
-            // Aggregate functions - these should be handled by AggregateOperator, not direct evaluation
+            // Aggregate functions - check if they're available in HAVING context
             "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" => {
+                // Check if we have aggregate values available for HAVING clause evaluation
+                if let Some(ref having_aggregates) = context.having_aggregates {
+                    // Create a string representation of the function call to use as key
+                    let mut key_parts = vec![name.to_uppercase()];
+                    for arg in args {
+                        match arg {
+                            Expression::Column { name, .. } => key_parts.push(name.to_uppercase()),
+                            Expression::Literal(_) => key_parts.push("LITERAL".to_string()),
+                            _ => key_parts.push("EXPR".to_string()),
+                        }
+                    }
+                    let key = format!("{}({})", key_parts[0], key_parts[1..].join(","));
+
+                    if let Some(value) = having_aggregates.get(&key) {
+                        return Ok(value.clone());
+                    }
+                }
+
                 Err(RustgreSQLError::InvalidOperation(
                     format!("Aggregate function '{}' cannot be evaluated directly. Use GROUP BY or aggregate context.", name)
                 ))
@@ -893,8 +1007,29 @@ impl ExpressionEvaluator {
                 // Get all tables available in the subquery's FROM clause
                 let mut subquery_tables = std::collections::HashSet::new();
                 for table_ref in from {
-                    subquery_tables.insert(&table_ref.name);
+                    match table_ref {
+                        crate::sql::ast::TableRef::Table { name, alias } => {
+                            // Add the base table name
+                            subquery_tables.insert(name.clone());
+
+                            // Add the alias if present
+                            if let Some(ref table_alias) = alias {
+                                subquery_tables.insert(table_alias.clone());
+                            }
+                        },
+                        crate::sql::ast::TableRef::Subquery { alias, .. } => {
+                            // For subqueries, add the alias if present
+                            if let Some(ref table_alias) = alias {
+                                subquery_tables.insert(table_alias.clone());
+                                // Debug log
+                                // subquery_context.log(&format!("DEBUG: Added subquery alias '{}' to subquery_tables", table_alias));
+                            }
+                        }
+                    };
                 }
+
+                // Debug log
+                // subquery_context.log(&format!("DEBUG: Final subquery_tables: {:?}", subquery_tables));
 
                 // Collect all column references in the subquery
                 let mut all_columns = Vec::new();
@@ -953,6 +1088,11 @@ impl ExpressionEvaluator {
                 // Don't recurse into subqueries for correlation detection
                 // They should be handled independently
             }
+            crate::sql::ast::Expression::Exists { subquery, .. } => {
+                // Don't recurse into EXISTS subqueries for correlation detection
+                // They should be handled independently
+                std::mem::drop(subquery); // Suppress unused warning
+            }
             _ => {}
         }
     }
@@ -986,19 +1126,59 @@ impl ExpressionEvaluator {
             subquery_op.execute(&mut subquery_context)?
         };
 
-        // For scalar subqueries, return the first column of the first row
-        // For EXISTS clauses, return boolean based on whether any rows were returned
-        if result.rows.is_empty() {
-            // Empty subquery result
-            Ok(Value { kind: ValueKind::Null(crate::types::NullValue) })
-        } else if result.rows.len() == 1 && result.column_names.len() == 1 {
-            // Scalar subquery - return the single value
-            Ok(result.rows[0][0].clone())
+        // Handle subquery results based on context
+        match context.get_subquery_context() {
+            Some(SubqueryContext::InClause) => {
+                // For IN clauses, convert all rows to a list of values from the first column
+                if result.rows.is_empty() {
+                    // Empty subquery result - return empty list for IN clause
+                    Ok(Value { kind: ValueKind::List(Vec::new()) })
+                } else {
+                    // Convert first column of each row to a list
+                    let values: Vec<Value> = result.rows.iter()
+                        .map(|row| row[0].clone())  // Take first column of each row
+                        .collect();
+                    Ok(Value { kind: ValueKind::List(values) })
+                }
+            }
+            Some(SubqueryContext::Exists) => {
+                // For EXISTS clauses, return boolean based on whether any rows were returned
+                Ok(Value { kind: ValueKind::Boolean(!result.rows.is_empty()) })
+            }
+            Some(SubqueryContext::Scalar) | None => {
+                // For scalar subqueries or default context, return the first column of the first row
+                if result.rows.is_empty() {
+                    // Empty subquery result
+                    Ok(Value { kind: ValueKind::Null(crate::types::NullValue) })
+                } else if result.rows.len() == 1 && result.column_names.len() == 1 {
+                    // Scalar subquery - return the single value
+                    Ok(result.rows[0][0].clone())
+                } else {
+                    // Multiple rows or columns but used in scalar context - return first value
+                    // This maintains backwards compatibility for existing code
+                    Ok(result.rows[0][0].clone())
+                }
+            }
+        }
+    }
+
+    /// Evaluate EXISTS subquery - returns TRUE if subquery returns any rows, FALSE otherwise
+    fn evaluate_exists_subquery(&self, subquery_stmt: &crate::sql::ast::Statement, negated: bool, context: &EvaluationContext) -> Result<Value> {
+        // Create a temporary context with EXISTS subquery context
+        let mut exists_context = context.clone();
+        exists_context.set_subquery_context(SubqueryContext::Exists);
+
+        // Use the existing subquery evaluation logic with EXISTS context
+        let exists_result = self.evaluate_subquery(subquery_stmt, &exists_context)?;
+
+        // Apply negation if needed
+        if negated {
+            match &exists_result.kind {
+                ValueKind::Boolean(exists) => Ok(Value { kind: ValueKind::Boolean(!exists) }),
+                _ => Err(crate::error::RustgreSQLError::InvalidOperation("EXISTS subquery did not return boolean value".to_string())),
+            }
         } else {
-            // Multiple rows or columns - this is a row/value subquery
-            // For now, return the first column of the first row
-            // In a complete implementation, we'd handle different subquery contexts properly
-            Ok(result.rows[0][0].clone())
+            Ok(exists_result)
         }
     }
 }
@@ -1057,5 +1237,130 @@ mod tests {
 
         let result = ExpressionEvaluator::evaluate_binary_operation(BinaryOperator::Equals, &left, &right).unwrap();
         assert_eq!(result.kind, ValueKind::Boolean(false));
+    }
+
+    #[test]
+    fn test_in_clause_with_literal_list() {
+        let left = Value { kind: ValueKind::Integer(2) };
+        let right = Value { kind: ValueKind::List(vec![
+            Value { kind: ValueKind::Integer(1) },
+            Value { kind: ValueKind::Integer(2) },
+            Value { kind: ValueKind::Integer(3) },
+        ])};
+
+        let result = ExpressionEvaluator::evaluate_in(&left, &right).unwrap();
+        assert_eq!(result.kind, ValueKind::Boolean(true));
+
+        // Test with value not in list
+        let left = Value { kind: ValueKind::Integer(5) };
+        let result = ExpressionEvaluator::evaluate_in(&left, &right).unwrap();
+        assert_eq!(result.kind, ValueKind::Boolean(false));
+    }
+
+    #[test]
+    fn test_in_clause_with_string_values() {
+        let left = Value { kind: ValueKind::String("Engineering".to_string()) };
+        let right = Value { kind: ValueKind::List(vec![
+            Value { kind: ValueKind::String("Sales".to_string()) },
+            Value { kind: ValueKind::String("Engineering".to_string()) },
+            Value { kind: ValueKind::String("Marketing".to_string()) },
+        ])};
+
+        let result = ExpressionEvaluator::evaluate_in(&left, &right).unwrap();
+        assert_eq!(result.kind, ValueKind::Boolean(true));
+
+        // Test with string not in list
+        let left = Value { kind: ValueKind::String("Finance".to_string()) };
+        let result = ExpressionEvaluator::evaluate_in(&left, &right).unwrap();
+        assert_eq!(result.kind, ValueKind::Boolean(false));
+    }
+
+    #[test]
+    fn test_in_clause_with_empty_list() {
+        let left = Value { kind: ValueKind::Integer(1) };
+        let right = Value { kind: ValueKind::List(vec![]) };
+
+        let result = ExpressionEvaluator::evaluate_in(&left, &right).unwrap();
+        assert_eq!(result.kind, ValueKind::Boolean(false));
+    }
+
+    #[test]
+    fn test_in_clause_with_single_string() {
+        // This tests the old behavior for single string values
+        let left = Value { kind: ValueKind::String("test".to_string()) };
+        let right = Value { kind: ValueKind::String("test".to_string()) };
+
+        let result = ExpressionEvaluator::evaluate_in(&left, &right).unwrap();
+        assert_eq!(result.kind, ValueKind::Boolean(true));
+
+        // Test with different strings
+        let left = Value { kind: ValueKind::String("different".to_string()) };
+        let result = ExpressionEvaluator::evaluate_in(&left, &right).unwrap();
+        assert_eq!(result.kind, ValueKind::Boolean(false));
+    }
+
+    #[test]
+    fn test_subquery_context_creation() {
+        let context = EvaluationContext::with_in_subquery_context();
+        assert!(matches!(context.get_subquery_context(), Some(SubqueryContext::InClause)));
+    }
+
+    #[test]
+    fn test_subquery_context_setting() {
+        let mut context = EvaluationContext::new();
+        assert_eq!(context.get_subquery_context(), None);
+
+        context.set_subquery_context(SubqueryContext::Scalar);
+        assert!(matches!(context.get_subquery_context(), Some(SubqueryContext::Scalar)));
+
+        context.set_subquery_context(SubqueryContext::Exists);
+        assert!(matches!(context.get_subquery_context(), Some(SubqueryContext::Exists)));
+    }
+
+    #[test]
+    fn test_in_clause_error_handling() {
+        let left = Value { kind: ValueKind::Integer(1) };
+        let right = Value { kind: ValueKind::Float(1.0) };
+
+        let result = ExpressionEvaluator::evaluate_in(&left, &right);
+        assert!(result.is_err());
+
+        if let Err(RustgreSQLError::Type(msg)) = result {
+            assert!(msg.contains("IN operation requires a list or subquery result"));
+        } else {
+            panic!("Expected Type error for unsupported IN operation");
+        }
+    }
+
+    #[test]
+    fn test_mixed_types_in_in_clause() {
+        // Test with integer and float values
+        let left = Value { kind: ValueKind::Integer(2) };
+        let right = Value { kind: ValueKind::List(vec![
+            Value { kind: ValueKind::Integer(1) },
+            Value { kind: ValueKind::Float(2.0) },  // Should match due to float comparison
+            Value { kind: ValueKind::Integer(3) },
+        ])};
+
+        let result = ExpressionEvaluator::evaluate_in(&left, &right).unwrap();
+        assert_eq!(result.kind, ValueKind::Boolean(true));
+    }
+
+    #[test]
+    fn test_null_values_in_in_clause() {
+        let left = Value { kind: ValueKind::Integer(1) };
+        let right = Value { kind: ValueKind::List(vec![
+            Value { kind: ValueKind::Integer(1) },
+            Value { kind: ValueKind::Null(NullValue) },
+            Value { kind: ValueKind::Integer(2) },
+        ])};
+
+        let result = ExpressionEvaluator::evaluate_in(&left, &right).unwrap();
+        assert_eq!(result.kind, ValueKind::Boolean(true)); // Should find the match before NULL
+
+        // Test when value is NULL
+        let left = Value { kind: ValueKind::Null(NullValue) };
+        let result = ExpressionEvaluator::evaluate_in(&left, &right).unwrap();
+        assert_eq!(result.kind, ValueKind::Boolean(false)); // NULL should not match anything
     }
 }

@@ -86,6 +86,10 @@ pub enum TokenType {
     Serial,
     BigSerial,
 
+    // Boolean literals
+    True,
+    False,
+
     // Stored Procedure and Control Flow Keywords
     Procedure,
     Function,
@@ -633,6 +637,8 @@ impl Lexer {
             "DATA" => TokenType::Data,
             "SERIAL" => TokenType::Serial,
             "BIGSERIAL" => TokenType::BigSerial,
+            "TRUE" => TokenType::True,
+            "FALSE" => TokenType::False,
             // Stored procedure and control flow keywords
             "PROCEDURE" => TokenType::Procedure,
             "FUNCTION" => TokenType::Function,

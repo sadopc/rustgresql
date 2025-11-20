@@ -54,9 +54,17 @@ pub struct ColumnSpec {
 
 /// Table reference
 #[derive(Debug, Clone)]
-pub struct TableRef {
-    pub name: String,
-    pub alias: Option<String>,
+pub enum TableRef {
+    /// Simple table reference with optional alias
+    Table {
+        name: String,
+        alias: Option<String>,
+    },
+    /// Subquery with optional alias
+    Subquery {
+        subquery: Box<Statement>,
+        alias: Option<String>,
+    },
 }
 
 /// Window frame clause
@@ -134,6 +142,11 @@ pub enum Expression {
     },
     /// Subquery
     Subquery(Box<Statement>),
+    /// EXISTS subquery
+    Exists {
+        subquery: Box<Statement>,
+        negated: bool,
+    },
     /// List of expressions
     List(Vec<Expression>),
     /// Star (SELECT *)
@@ -170,6 +183,8 @@ pub enum UnaryOperator {
     Not,
     Minus,
     Plus,
+    Exists,
+    NotExists,
 }
 
 /// Sort direction

@@ -189,7 +189,16 @@ impl QueryRewriter {
                 // Extract base tables
                 let mut base_tables = HashSet::new();
                 for table in from {
-                    base_tables.insert(table.name.clone());
+                    match table {
+                        crate::sql::ast::TableRef::Table { name, .. } => {
+                            base_tables.insert(name.clone());
+                        }
+                        crate::sql::ast::TableRef::Subquery { .. } => {
+                            // For subqueries, we could either extract tables from the subquery
+                            // or skip them for join condition analysis
+                            // For now, we'll skip subqueries in join analysis
+                        }
+                    }
                 }
 
                 // Extract join conditions
@@ -198,7 +207,14 @@ impl QueryRewriter {
                     if let Some(condition) = &join.condition {
                         self.extract_join_condition(condition, &base_tables, &mut join_conditions)?;
                     }
-                    base_tables.insert(join.table.name.clone());
+                    match &join.table {
+                        crate::sql::ast::TableRef::Table { name, .. } => {
+                            base_tables.insert(name.clone());
+                        }
+                        crate::sql::ast::TableRef::Subquery { .. } => {
+                            // Skip subqueries in join analysis
+                        }
+                    }
                 }
 
                 // Extract filters
@@ -424,7 +440,7 @@ impl QueryRewriter {
                 let rewritten_select = SelectStatement::Simple {
                     with_clause: None,
                     distinct: false,
-                    from: vec![TableRef {
+                    from: vec![TableRef::Table {
                         name: view.name.clone(),
                         alias: None,
                     }],

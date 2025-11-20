@@ -1125,20 +1125,50 @@ impl Parser {
 
     /// Parse table reference
     fn parse_table_ref(&mut self) -> Result<TableRef> {
-        let name = self.consume_identifier()?;
-        let mut alias = None;
+        // Check for subquery first
+        if self.match_token(TokenType::LeftParen) {
+            // Parse subquery
+            let subquery_statement = self.parse_statement()?;
 
-        if self.match_token(TokenType::As) {
-            alias = Some(self.consume_identifier()?);
-        } else if let TokenType::Identifier(_) = self.peek().token_type {
-            // Check if next token is an alias (not a keyword)
-            let next_token = self.peek();
-            if !next_token.is_keyword() {
+            // Expect closing parenthesis
+            self.consume_token(TokenType::RightParen, "Expected ')' after subquery")?;
+
+            // Parse optional alias
+            let mut alias = None;
+            if self.match_token(TokenType::As) {
                 alias = Some(self.consume_identifier()?);
+            } else if let TokenType::Identifier(_) = self.peek().token_type {
+                // Check if next token is an alias (not a keyword)
+                let next_token = self.peek();
+                if !next_token.is_keyword() {
+                    alias = Some(self.consume_identifier()?);
+                }
             }
-        }
 
-        Ok(TableRef { name, alias })
+            Ok(TableRef::Subquery {
+                subquery: Box::new(subquery_statement),
+                alias,
+            })
+        } else {
+            // Parse simple table reference
+            let name = self.consume_identifier()?;
+            let mut alias = None;
+
+            if self.match_token(TokenType::As) {
+                alias = Some(self.consume_identifier()?);
+            } else if let TokenType::Identifier(_) = self.peek().token_type {
+                // Check if next token is an alias (not a keyword)
+                let next_token = self.peek();
+                if !next_token.is_keyword() {
+                    alias = Some(self.consume_identifier()?);
+                }
+            }
+
+            Ok(TableRef::Table {
+                name,
+                alias,
+            })
+        }
     }
 
     /// Parse join clause
@@ -1360,6 +1390,36 @@ impl Parser {
                 op: UnaryOperator::Plus,
                 expr: Box::new(expr),
             })
+        } else if self.match_token(TokenType::Not) {
+            // Check if this is NOT EXISTS
+            if self.match_token(TokenType::Exists) {
+                // NOT EXISTS must be followed by a parenthesized subquery
+                self.consume_token(TokenType::LeftParen, "Expected '(' after NOT EXISTS")?;
+
+                // Parse the subquery - for NOT EXISTS, we expect a proper SELECT statement
+                if !self.match_token(TokenType::Select) {
+                    return Err(RustgreSQLError::Parse(
+                        format!("Expected SELECT after NOT EXISTS( at line {}, column {}",
+                               self.peek().line, self.peek().column)
+                    ));
+                }
+
+                let subquery_statement = self.parse_select_after_select()?;
+
+                self.consume_token(TokenType::RightParen, "Expected ')' after NOT EXISTS subquery")?;
+
+                Ok(Expression::Exists {
+                    subquery: Box::new(subquery_statement),
+                    negated: true,
+                })
+            } else {
+                // Regular NOT unary operator
+                let expr = self.parse_unary_expression()?;
+                Ok(Expression::UnaryOp {
+                    op: UnaryOperator::Not,
+                    expr: Box::new(expr),
+                })
+            }
         } else {
             self.parse_primary_expression()
         }
@@ -1436,6 +1496,14 @@ impl Parser {
                 self.advance();
                 Ok(Expression::Value(crate::types::Value::null()))
             }
+            TokenType::True => {
+                self.advance();
+                Ok(Expression::Value(crate::types::Value::boolean(true)))
+            }
+            TokenType::False => {
+                self.advance();
+                Ok(Expression::Value(crate::types::Value::boolean(false)))
+            }
             TokenType::LeftParen => {
                 self.advance();
                 // Check if this is a subquery (starts with SELECT)
@@ -1506,6 +1574,28 @@ impl Parser {
                     })
                 }
             }
+            TokenType::Exists => {
+                self.advance();
+                // EXISTS must be followed by a parenthesized subquery
+                self.consume_token(TokenType::LeftParen, "Expected '(' after EXISTS")?;
+
+                // Parse the subquery - for EXISTS, we expect a proper SELECT statement
+                if !self.match_token(TokenType::Select) {
+                    return Err(RustgreSQLError::Parse(
+                        format!("Expected SELECT after EXISTS( at line {}, column {}",
+                               self.peek().line, self.peek().column)
+                    ));
+                }
+
+                let subquery_statement = self.parse_select_after_select()?;
+
+                self.consume_token(TokenType::RightParen, "Expected ')' after EXISTS subquery")?;
+
+                Ok(Expression::Exists {
+                    subquery: Box::new(subquery_statement),
+                    negated: false,
+                })
+            }
             _ => Err(RustgreSQLError::Parse(
                 format!("Unexpected token '{}' at line {}, column {}",
                        self.peek().value, self.peek().line, self.peek().column)
@@ -1526,6 +1616,8 @@ impl Parser {
                 }
             }
             TokenType::Identifier(i) => Ok(crate::types::Value::string(i.clone())),
+            TokenType::True => Ok(crate::types::Value::boolean(true)),
+            TokenType::False => Ok(crate::types::Value::boolean(false)),
             _ => Err(RustgreSQLError::Parse(
                 format!("Expected literal value at line {}, column {}",
                        token.line, token.column)

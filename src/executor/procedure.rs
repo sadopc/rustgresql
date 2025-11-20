@@ -857,6 +857,14 @@ impl ProcedureExecutor {
             UnaryOperator::Not => Ok(Value::boolean(!operand.is_truthy())),
             UnaryOperator::Minus => operand.negate(),
             UnaryOperator::Plus => Ok(operand.clone()),
+            UnaryOperator::Exists => {
+                // EXISTS should be handled as part of EXISTS expression evaluation
+                Err(crate::error::RustgreSQLError::Procedure("EXISTS should be handled as EXISTS expression, not as unary operator".to_string()))
+            }
+            UnaryOperator::NotExists => {
+                // NOT EXISTS should be handled as part of EXISTS expression evaluation
+                Err(crate::error::RustgreSQLError::Procedure("NOT EXISTS should be handled as EXISTS expression, not as unary operator".to_string()))
+            }
         }
     }
 

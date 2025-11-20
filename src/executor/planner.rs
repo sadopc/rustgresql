@@ -474,10 +474,16 @@ impl QueryPlanner {
 
                 // Apply joins
                 for join in joins {
-                    let right_plan = self.plan_table_scan(&join.table.name, join.table.alias.as_ref())?;
+                    let right_plan = self.plan_table_ref(&join.table)?;
 
                     // Extract left alias from the current plan
                     let left_alias = self.extract_alias_from_plan(&plan);
+
+                    // Extract right alias from table ref
+                    let right_alias = match &join.table {
+                        TableRef::Table { alias, .. } => alias.clone(),
+                        TableRef::Subquery { alias, .. } => alias.clone(),
+                    };
 
                     plan = PlanNode::Join {
                         left: Box::new(plan),
@@ -485,7 +491,7 @@ impl QueryPlanner {
                         condition: join.condition.clone(),
                         join_type: join.join_type,
                         left_alias,
-                        right_alias: join.table.alias.clone(),
+                        right_alias,
                     };
                 }
 
@@ -661,9 +667,17 @@ impl QueryPlanner {
 
     /// Create execution plan from INSERT statement
     pub fn plan_insert(&self, insert: &InsertStatement) -> Result<ExecutionPlan> {
+        // Extract table name from TableRef (only simple tables allowed for INSERT)
+        let table_name = match &insert.table {
+            TableRef::Table { name, .. } => name.clone(),
+            TableRef::Subquery { .. } => {
+                return Err(crate::RustgreSQLError::Parse("INSERT into subquery is not supported".to_string()));
+            }
+        };
+
         Ok(ExecutionPlan {
             root: PlanNode::Insert {
-                table_name: insert.table.name.clone(),
+                table_name,
                 columns: insert.columns.clone(),
                 values: insert.values.clone(),
             },
@@ -673,9 +687,17 @@ impl QueryPlanner {
 
     /// Create execution plan from UPDATE statement
     pub fn plan_update(&self, update: &UpdateStatement) -> Result<ExecutionPlan> {
+        // Extract table name from TableRef (only simple tables allowed for UPDATE)
+        let table_name = match &update.table {
+            TableRef::Table { name, .. } => name.clone(),
+            TableRef::Subquery { .. } => {
+                return Err(crate::RustgreSQLError::Parse("UPDATE subquery is not supported".to_string()));
+            }
+        };
+
         Ok(ExecutionPlan {
             root: PlanNode::Update {
-                table_name: update.table.name.clone(),
+                table_name,
                 assignments: update.assignments.clone(),
                 condition: update.where_clause.clone(),
             },
@@ -685,9 +707,17 @@ impl QueryPlanner {
 
     /// Create execution plan from DELETE statement
     pub fn plan_delete(&self, delete: &DeleteStatement) -> Result<ExecutionPlan> {
+        // Extract table name from TableRef (only simple tables allowed for DELETE)
+        let table_name = match &delete.table {
+            TableRef::Table { name, .. } => name.clone(),
+            TableRef::Subquery { .. } => {
+                return Err(crate::RustgreSQLError::Parse("DELETE from subquery is not supported".to_string()));
+            }
+        };
+
         Ok(ExecutionPlan {
             root: PlanNode::Delete {
-                table_name: delete.table.name.clone(),
+                table_name,
                 condition: delete.where_clause.clone(),
             },
             output_schema: vec![],
@@ -698,15 +728,21 @@ impl QueryPlanner {
     fn plan_from_clause(&self, from: &[TableRef]) -> Result<PlanNode> {
         match from {
             [] => Err(crate::error::RustgreSQLError::Parse("No tables in FROM clause".to_string())),
-            [table] => self.plan_table_scan(&table.name, table.alias.as_ref()),
+            [table] => self.plan_table_ref(table),
             tables => {
                 // Multiple tables without explicit joins - create cross joins
-                let mut plan = self.plan_table_scan(&tables[0].name, tables[0].alias.as_ref())?;
+                let mut plan = self.plan_table_ref(&tables[0])?;
                 for table in &tables[1..] {
-                    let right_plan = self.plan_table_scan(&table.name, table.alias.as_ref())?;
+                    let right_plan = self.plan_table_ref(table)?;
 
                     // Extract left alias from the current plan
                     let left_alias = self.extract_alias_from_plan(&plan);
+
+                    // Extract right alias from table ref
+                    let right_alias = match table {
+                        TableRef::Table { alias, .. } => alias.clone(),
+                        TableRef::Subquery { alias, .. } => alias.clone(),
+                    };
 
                     plan = PlanNode::Join {
                         left: Box::new(plan),
@@ -714,10 +750,27 @@ impl QueryPlanner {
                         condition: None,
                         join_type: JoinType::Inner,
                         left_alias,
-                        right_alias: table.alias.clone(),
+                        right_alias,
                     };
                 }
                 Ok(plan)
+            }
+        }
+    }
+
+    /// Create plan for a table reference (either a table or subquery)
+    fn plan_table_ref(&self, table_ref: &TableRef) -> Result<PlanNode> {
+        match table_ref {
+            TableRef::Table { name, alias } => {
+                self.plan_table_scan(name, alias.as_ref())
+            }
+            TableRef::Subquery { subquery, alias } => {
+                // Create a subquery plan node
+                // Note: This is a derived table subquery, not correlated, so no correlated columns
+                Ok(PlanNode::Subquery {
+                    query: subquery.clone(),
+                    correlated_columns: vec![],
+                })
             }
         }
     }

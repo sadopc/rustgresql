@@ -2,7 +2,7 @@
 //!
 //! Coordinates query execution and manages executor state
 
-use crate::{Result, sql::{Statement, SelectStatement, InsertStatement, UpdateStatement, DeleteStatement, CreateTableStatement}, sql::ast::{CreateIndexStatement, DropTableStatement, DropIndexStatement, AlterTableStatement, CreateViewStatement, DropViewStatement, RefreshMaterializedViewStatement, CreateProcedureStatement, CreateFunctionStatement, DropProcedureStatement, DropFunctionStatement, CallProcedureStatement, PerformStatement, Expression}, executor::planner::{QueryPlanner, PlanNode}, executor::operators::{QueryResult, ExecutionContext}};
+use crate::{Result, sql::{Statement, SelectStatement, InsertStatement, UpdateStatement, DeleteStatement, CreateTableStatement}, sql::ast::{CreateIndexStatement, DropTableStatement, DropIndexStatement, AlterTableStatement, CreateViewStatement, DropViewStatement, RefreshMaterializedViewStatement, CreateProcedureStatement, CreateFunctionStatement, DropProcedureStatement, DropFunctionStatement, CallProcedureStatement, PerformStatement, Expression, TableRef}, executor::planner::{QueryPlanner, PlanNode}, executor::operators::{QueryResult, ExecutionContext}};
 use crate::optimizer::OptimizedQueryPlanner;
 use std::sync::Arc;
 use crate::executor::ddl_error::{DdlError, DdlOperation};
@@ -186,7 +186,17 @@ impl Executor {
     /// Execute SELECT statement
     fn execute_select(&mut self, select: &SelectStatement) -> Result<QueryResult> {
         let table_indexes = self.get_all_table_indexes()?;
-        let plan = self.planner.plan_select(select, &table_indexes)?;
+
+        // Try optimized planning first, fall back to regular planner if optimization fails
+        let plan = match self.planner.plan_select(select, &table_indexes) {
+            Ok(plan) => plan,
+            Err(_) => {
+                // Fallback to regular planner when optimization fails (e.g., for subqueries)
+                let regular_planner = crate::executor::planner::QueryPlanner::new();
+                regular_planner.plan_select(select)?
+            }
+        };
+
         self.execute_plan(plan.root)
     }
 
@@ -649,7 +659,7 @@ impl Executor {
     }
 
     /// Convert SelectStatement to SQL string for storage
-    fn select_to_sql(select: &SelectStatement) -> String {
+    fn select_to_sql(&self, select: &SelectStatement) -> String {
         use crate::sql::ast::SelectStatement;
 
         match select {
@@ -690,10 +700,26 @@ impl Executor {
                 if !from.is_empty() {
                     sql.push_str(" FROM ");
                     let from_strs: Vec<String> = from.iter().map(|table_ref| {
-                        if let Some(alias) = &table_ref.alias {
-                            format!("{} AS {}", table_ref.name, alias)
-                        } else {
-                            table_ref.name.clone()
+                        match table_ref {
+                            TableRef::Table { name, alias } => {
+                                if let Some(alias) = alias {
+                                    format!("{} AS {}", name, alias)
+                                } else {
+                                    name.clone()
+                                }
+                            }
+                            TableRef::Subquery { subquery, alias } => {
+                                let subquery_str = match subquery.as_ref() {
+                                    crate::sql::ast::Statement::Select(select) => self.select_to_sql(select),
+                                    // For other statement types, we could add more formatting
+                                    _ => "SUBQUERY".to_string(),
+                                };
+                                if let Some(alias) = alias {
+                                    format!("({}) AS {}", subquery_str, alias)
+                                } else {
+                                    format!("({})", subquery_str)
+                                }
+                            }
                         }
                     }).collect();
                     sql.push_str(&from_strs.join(", "));
@@ -820,6 +846,8 @@ impl Executor {
             UnaryOperator::Not => "NOT",
             UnaryOperator::Minus => "-",
             UnaryOperator::Plus => "+",
+            UnaryOperator::Exists => "EXISTS",
+            UnaryOperator::NotExists => "NOT EXISTS",
         }
     }
 
@@ -845,7 +873,7 @@ impl Executor {
         };
 
         // Convert the SelectStatement to SQL string for storage
-        let query_string = Self::select_to_sql(&create.query);
+        let query_string = self.select_to_sql(&create.query);
 
         // Create the view using the catalog manager
         let view_id = catalog.create_view(

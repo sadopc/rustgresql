@@ -554,9 +554,18 @@ impl ParallelExecutor {
 
     /// Serialize scan task data
     fn serialize_scan_task(&self, table_ref: &crate::sql::ast::TableRef, worker_id: usize, total_workers: usize, filter: Option<&crate::sql::ast::Expression>) -> Result<Vec<u8>> {
+        // Extract table name based on TableRef type
+        let table_name = match table_ref {
+            crate::sql::ast::TableRef::Table { name, .. } => name.clone(),
+            crate::sql::ast::TableRef::Subquery { .. } => {
+                // For subqueries, we don't support parallel scanning in this implementation
+                return Err(crate::error::RustgreSQLError::Internal("Parallel scanning not supported for subqueries".to_string()));
+            }
+        };
+
         // In a real implementation, this would serialize task-specific data
         let task_data = format!("scan:{},worker:{},total:{},filter:{}",
-            table_ref.name, worker_id, total_workers,
+            table_name, worker_id, total_workers,
             filter.is_some());
         Ok(task_data.into_bytes())
     }

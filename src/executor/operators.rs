@@ -149,7 +149,7 @@ impl FilterOperator {
             input_result.rows
                 .into_iter()
                 .filter(|row| {
-                    let eval_context = self.create_evaluation_context(scanner, &column_names, row);
+                    let eval_context = self.create_evaluation_context(scanner, &column_names, row, context);
                     let evaluator = ExpressionEvaluator;
                     match evaluator.evaluate(&self.condition, &eval_context) {
                         Ok(result) => {
@@ -170,7 +170,7 @@ impl FilterOperator {
             input_result.rows
                 .into_iter()
                 .filter(|row| {
-                    let eval_context = self.create_basic_evaluation_context(&column_names, row);
+                    let eval_context = self.create_basic_evaluation_context(&column_names, row, context);
                     let evaluator = ExpressionEvaluator;
                     match evaluator.evaluate(&self.condition, &eval_context) {
                         Ok(result) => {
@@ -197,32 +197,106 @@ impl FilterOperator {
         })
     }
 
+    /// Extract table alias from the input plan node
+    fn extract_table_alias(&self) -> Option<String> {
+        match &*self.input {
+            PlanNode::Scan { alias, .. } => alias.clone(),
+            PlanNode::Project { table_aliases, .. } => {
+                // For Project nodes, check if there's only one table alias
+                if table_aliases.len() == 1 {
+                    table_aliases.values().next().cloned()
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Create evaluation context with proper column name resolution
-    fn create_evaluation_context(&self, scanner: &TableScanner, column_names: &[String], row: &[Value]) -> EvaluationContext {
+    fn create_evaluation_context(&self, scanner: &TableScanner, column_names: &[String], row: &[Value], context: &ExecutionContext) -> EvaluationContext {
         let mut columns = std::collections::HashMap::new();
 
-        // Map column names to values
+        // Extract table alias information from the input plan
+        let table_alias = self.extract_table_alias();
+
+        // Map column names to values, including qualified names if table alias exists
         for (i, column_name) in column_names.iter().enumerate() {
             if i < row.len() {
-                columns.insert(column_name.clone(), row[i].clone());
+                let value = &row[i];
+
+                // Store unqualified column name (existing behavior)
+                columns.insert(column_name.clone(), value.clone());
+
+                // Also store qualified column name if we have a table alias
+                if let Some(ref alias) = table_alias {
+                    let qualified_name = format!("{}.{}", alias, column_name);
+                    columns.insert(qualified_name, value.clone());
+                }
             }
         }
 
-        EvaluationContext::with_columns(columns)
+        // Include outer context values for correlated subqueries
+        if let Some(outer_values) = context.get_outer_context_values() {
+            for (column_name, value) in outer_values {
+                columns.insert(column_name.clone(), value.clone());
+            }
+        }
+
+        let mut eval_context = EvaluationContext::with_columns(columns);
+
+        // Pass catalog and buffer_manager for subquery execution
+        if let Some(catalog) = context.get_catalog() {
+            eval_context.set_catalog(catalog.clone());
+        }
+        if let Some(buffer_manager) = context.get_buffer_manager() {
+            eval_context.set_buffer_manager(buffer_manager.clone());
+        }
+
+        eval_context
     }
 
     /// Create basic evaluation context (fallback when no scanner available)
-    fn create_basic_evaluation_context(&self, column_names: &[String], row: &[Value]) -> EvaluationContext {
+    fn create_basic_evaluation_context(&self, column_names: &[String], row: &[Value], context: &ExecutionContext) -> EvaluationContext {
         let mut columns = std::collections::HashMap::new();
 
-        // Simple column name to value mapping
+        // Extract table alias information from the input plan
+        let table_alias = self.extract_table_alias();
+
+        // Map column names to values, including qualified names if table alias exists
         for (i, column_name) in column_names.iter().enumerate() {
             if i < row.len() {
-                columns.insert(column_name.clone(), row[i].clone());
+                let value = &row[i];
+
+                // Store unqualified column name (existing behavior)
+                columns.insert(column_name.clone(), value.clone());
+
+                // Also store qualified column name if we have a table alias
+                if let Some(ref alias) = table_alias {
+                    let qualified_name = format!("{}.{}", alias, column_name);
+                    columns.insert(qualified_name, value.clone());
+                }
             }
         }
 
-        EvaluationContext::with_columns(columns)
+        // Include outer context values for correlated subqueries
+        if let Some(outer_values) = context.get_outer_context_values() {
+            for (column_name, value) in outer_values {
+                columns.insert(column_name.clone(), value.clone());
+            }
+        }
+
+        let mut eval_context = EvaluationContext::with_columns(columns);
+
+        // Pass catalog and buffer_manager for subquery execution
+        if let Some(catalog) = context.get_catalog() {
+            eval_context.set_catalog(catalog.clone());
+        }
+        if let Some(buffer_manager) = context.get_buffer_manager() {
+            eval_context.set_buffer_manager(buffer_manager.clone());
+        }
+
+        eval_context
     }
 }
 
@@ -294,6 +368,22 @@ impl ProjectOperator {
         }
     }
 
+    /// Extract table alias from the input plan node (for ProjectOperator)
+    fn extract_table_alias(&self) -> Option<String> {
+        match &*self.input {
+            PlanNode::Scan { alias, .. } => alias.clone(),
+            PlanNode::Project { table_aliases, .. } => {
+                // For Project nodes, check if there's only one table alias
+                if table_aliases.len() == 1 {
+                    table_aliases.values().next().cloned()
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     pub fn execute(&self, context: &mut ExecutionContext) -> Result<QueryResult> {
         let input_result = self.input.execute(context)?;
 
@@ -359,6 +449,13 @@ impl ProjectOperator {
             }
         }
 
+        // Include outer context values for correlated subqueries
+        if let Some(outer_values) = context.get_outer_context_values() {
+            for (column_name, value) in outer_values {
+                columns.insert(column_name.clone(), value.clone());
+            }
+        }
+
         let mut eval_context = EvaluationContext::with_columns(columns);
 
         // Pass catalog and buffer_manager for subquery execution
@@ -376,10 +473,29 @@ impl ProjectOperator {
     fn create_basic_evaluation_context(&self, column_names: &[String], row: &[Value], context: &ExecutionContext) -> EvaluationContext {
         let mut columns = std::collections::HashMap::new();
 
-        // Simple column name to value mapping
+        // Extract table alias information from the input plan
+        let table_alias = self.extract_table_alias();
+
+        // Map column names to values, including qualified names if table alias exists
         for (i, column_name) in column_names.iter().enumerate() {
             if i < row.len() {
-                columns.insert(column_name.clone(), row[i].clone());
+                let value = &row[i];
+
+                // Store unqualified column name (existing behavior)
+                columns.insert(column_name.clone(), value.clone());
+
+                // Also store qualified column name if we have a table alias
+                if let Some(ref alias) = table_alias {
+                    let qualified_name = format!("{}.{}", alias, column_name);
+                    columns.insert(qualified_name, value.clone());
+                }
+            }
+        }
+
+        // Include outer context values for correlated subqueries
+        if let Some(outer_values) = context.get_outer_context_values() {
+            for (column_name, value) in outer_values {
+                columns.insert(column_name.clone(), value.clone());
             }
         }
 
@@ -701,6 +817,8 @@ impl JoinOperator {
                     right_columns: Some(right_columns.to_vec()),
                     catalog: None,  // TODO: Pass catalog/buffer_manager for subqueries in JOIN conditions
                     buffer_manager: None,
+                    subquery_context: None,
+                    having_aggregates: None,
                 };
 
                 let result = { let evaluator = ExpressionEvaluator; evaluator.evaluate(condition, &context) }?;
@@ -1767,6 +1885,53 @@ impl MergeJoinOperator {
     }
 }
 
+/// Helper function to match aggregate function expressions in HAVING clauses to their computed results
+fn match_aggregate_in_having(
+    having_expr: &Expression,
+    aggregate_functions: &[(String, Expression)],
+    result_row: &[Value],
+    group_by_columns_len: usize,
+) -> Option<Value> {
+    match having_expr {
+        Expression::Function { name, args, .. } => {
+            let func_name = name.to_uppercase();
+            if matches!(func_name.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
+                // Try to find matching aggregate function
+                for (i, (alias, agg_expr)) in aggregate_functions.iter().enumerate() {
+                    if expressions_match(having_expr, agg_expr) {
+                        let aggregate_col_index = group_by_columns_len + i;
+                        if aggregate_col_index < result_row.len() {
+                            return Some(result_row[aggregate_col_index].clone());
+                        }
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Check if two expressions are structurally equivalent for matching purposes
+fn expressions_match(expr1: &Expression, expr2: &Expression) -> bool {
+    match (expr1, expr2) {
+        (Expression::Function { name: name1, args: args1, .. },
+         Expression::Function { name: name2, args: args2, .. }) => {
+            name1.to_uppercase() == name2.to_uppercase() &&
+            args1.len() == args2.len() &&
+            args1.iter().zip(args2.iter()).all(|(a1, a2)| expressions_match(a1, a2))
+        }
+        (Expression::Column { name: name1, .. },
+         Expression::Column { name: name2, .. }) => {
+            name1.to_uppercase() == name2.to_uppercase()
+        }
+        (Expression::Literal(val1), Expression::Literal(val2)) => {
+            val1 == val2
+        }
+        _ => false,
+    }
+}
+
 /// Aggregate operator for GROUP BY and aggregate functions
 #[derive(Debug)]
 /// Aggregate operator with window function support
@@ -2028,6 +2193,7 @@ impl AggregateOperator {
             if let Some(ref having_expr) = self.having_clause {
                 // Create evaluation context with group by columns and aggregate results
                 let mut having_columns = std::collections::HashMap::new();
+                let mut having_aggregates = std::collections::HashMap::new();
 
                 // Add GROUP BY columns to context
                 for (i, group_expr) in self.group_by_columns.iter().enumerate() {
@@ -2038,15 +2204,33 @@ impl AggregateOperator {
                     }
                 }
 
-                // Add aggregate results to context using their aliases
-                for (i, (alias, _)) in self.aggregate_functions.iter().enumerate() {
+                // Add aggregate results to context using their aliases and populate having_aggregates
+                for (i, (alias, agg_expr)) in self.aggregate_functions.iter().enumerate() {
                     let aggregate_col_index = self.group_by_columns.len() + i;
                     if aggregate_col_index < result_row.len() {
-                        having_columns.insert(alias.clone(), result_row[aggregate_col_index].clone());
+                        let aggregate_value = &result_row[aggregate_col_index];
+
+                        // Add by alias for backward compatibility
+                        having_columns.insert(alias.clone(), aggregate_value.clone());
+
+                        // Add by function expression for direct aggregate function calls in HAVING
+                        if let Expression::Function { name, args, .. } = agg_expr {
+                            let mut key_parts = vec![name.to_uppercase()];
+                            for arg in args {
+                                match arg {
+                                    Expression::Column { name, .. } => key_parts.push(name.to_uppercase()),
+                                    Expression::Literal(_) => key_parts.push("LITERAL".to_string()),
+                                    _ => key_parts.push("EXPR".to_string()),
+                                }
+                            }
+                            let key = format!("{}({})", key_parts[0], key_parts[1..].join(","));
+                            having_aggregates.insert(key, aggregate_value.clone());
+                        }
                     }
                 }
 
-                let having_context = EvaluationContext::with_columns(having_columns);
+                let mut having_context = EvaluationContext::with_columns(having_columns);
+                having_context.set_having_aggregates(having_aggregates);
 
                 // Evaluate HAVING clause
                 let evaluator = ExpressionEvaluator;
@@ -2388,14 +2572,37 @@ impl SubqueryOperator {
         // Copy all logs from the original context
         correlated_context.logs = context.logs.clone();
 
+        // Copy catalog and buffer_manager from parent context so subquery can access tables
+        if let Some(catalog) = context.get_catalog() {
+            correlated_context.set_catalog(catalog.clone());
+        }
+        if let Some(buffer_manager) = context.get_buffer_manager() {
+            correlated_context.set_buffer_manager(buffer_manager.clone());
+        }
+
         // Inject outer context values into correlated context
         // The correlated_columns list tells us which outer columns we need
+        let mut outer_values = std::collections::HashMap::new();
+
         for correlated_column in &self.correlated_columns {
             if let Some(value) = outer_context.columns.get(correlated_column) {
                 correlated_context.log(&format!("Injecting correlated column {} = {:?}", correlated_column, value));
-                // In a real implementation, we'd store these in a way that the subquery can access them
-                // For now, we'll add them to the context as if they were local variables
+                outer_values.insert(correlated_column.clone(), value.clone());
+            } else {
+                // Fallback: if qualified name not found, try to extract unqualified part
+                if let Some(dot_pos) = correlated_column.find('.') {
+                    let unqualified_name = &correlated_column[dot_pos + 1..];
+                    if let Some(value) = outer_context.columns.get(unqualified_name) {
+                        correlated_context.log(&format!("Injecting correlated column {} (found as {})", correlated_column, unqualified_name));
+                        outer_values.insert(correlated_column.clone(), value.clone());
+                    }
+                }
             }
+        }
+
+        // Store outer context values in the execution context so FilterOperator can access them
+        if !outer_values.is_empty() {
+            correlated_context.set_outer_context_values(outer_values);
         }
 
         // Plan and execute the subquery
@@ -3126,6 +3333,8 @@ pub struct ExecutionContext {
     pub catalog: Option<std::sync::Arc<crate::catalog::CatalogManager>>,
     pub buffer_manager: Option<std::sync::Arc<crate::storage::BufferPoolManager>>,
     pub auto_increment_counters: std::collections::HashMap<String, i64>,
+    /// Outer context values for correlated subqueries (column_name -> value)
+    pub outer_context_values: Option<std::collections::HashMap<String, crate::types::Value>>,
 }
 
 impl std::fmt::Debug for ExecutionContext {
@@ -3145,6 +3354,7 @@ impl ExecutionContext {
             catalog: None,
             buffer_manager: None,
             auto_increment_counters: std::collections::HashMap::new(),
+            outer_context_values: None,
         };
         // Load persistent auto-increment counters
         let _ = context.load_auto_increment_counters();
@@ -3165,6 +3375,14 @@ impl ExecutionContext {
 
     pub fn get_buffer_manager(&self) -> Option<&std::sync::Arc<crate::storage::BufferPoolManager>> {
         self.buffer_manager.as_ref()
+    }
+
+    pub fn set_outer_context_values(&mut self, values: std::collections::HashMap<String, crate::types::Value>) {
+        self.outer_context_values = Some(values);
+    }
+
+    pub fn get_outer_context_values(&self) -> Option<&std::collections::HashMap<String, crate::types::Value>> {
+        self.outer_context_values.as_ref()
     }
 
     pub fn log(&mut self, message: &str) {

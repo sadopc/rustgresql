@@ -80,14 +80,23 @@ impl OptimizedQueryPlanner {
 
                 // Apply joins
                 for join in joins {
-                    let right_plan = self.plan_optimized_table_scan(&join.table.name, &required_columns, table_indexes)?;
+                    let (table_name, alias) = match &join.table {
+                        crate::sql::ast::TableRef::Table { name, alias } => (name.clone(), alias.clone()),
+                        crate::sql::ast::TableRef::Subquery { .. } => {
+                            // For subqueries in joins, we could plan them separately or return an error
+                            // For now, we'll return an error as this is complex to optimize
+                            return Err(crate::error::RustgreSQLError::Internal("Subqueries in joins are not yet supported in optimizer".to_string()));
+                        }
+                    };
+
+                    let right_plan = self.plan_optimized_table_scan(&table_name, &required_columns, table_indexes)?;
                     plan = PlanNode::Join {
                         left: Box::new(plan),
                         right: Box::new(right_plan),
                         condition: join.condition.clone(),
                         join_type: join.join_type.clone(),
                         left_alias: None,
-                        right_alias: join.table.alias.clone(),
+                        right_alias: alias,
                     };
                 }
 
@@ -218,12 +227,36 @@ impl OptimizedQueryPlanner {
     ) -> Result<PlanNode> {
         match from {
             [] => Err(crate::error::RustgreSQLError::Parse("No tables in FROM clause".to_string())),
-            [table] => self.plan_optimized_table_scan(&table.name, required_columns, table_indexes),
+            [table] => {
+                match table {
+                    TableRef::Table { name, .. } => {
+                        self.plan_optimized_table_scan(name, required_columns, table_indexes)
+                    }
+                    TableRef::Subquery { .. } => {
+                        // For subqueries, we could create a non-optimized plan or delegate to the main planner
+                        // For now, return an error as optimization for subqueries is complex
+                        Err(crate::error::RustgreSQLError::Internal("Subquery optimization not yet supported".to_string()))
+                    }
+                }
+            }
             tables => {
                 // Multiple tables without explicit joins - create cross joins
-                let mut plan = self.plan_optimized_table_scan(&tables[0].name, required_columns, table_indexes)?;
+                let first_table_name = match &tables[0] {
+                    TableRef::Table { name, .. } => name,
+                    TableRef::Subquery { .. } => {
+                        return Err(crate::error::RustgreSQLError::Internal("Subquery optimization not yet supported".to_string()));
+                    }
+                };
+                let mut plan = self.plan_optimized_table_scan(first_table_name, required_columns, table_indexes)?;
+
                 for table in &tables[1..] {
-                    let right_plan = self.plan_optimized_table_scan(&table.name, required_columns, table_indexes)?;
+                    let table_name = match table {
+                        TableRef::Table { name, .. } => name,
+                        TableRef::Subquery { .. } => {
+                            return Err(crate::error::RustgreSQLError::Internal("Subquery optimization not yet supported".to_string()));
+                        }
+                    };
+                    let right_plan = self.plan_optimized_table_scan(table_name, required_columns, table_indexes)?;
                     plan = PlanNode::Join {
                         left: Box::new(plan),
                         right: Box::new(right_plan),
@@ -746,7 +779,7 @@ mod tests {
                 Expression::Column { name: "id".to_string(), table: Some("users".to_string()) },
                 Expression::Column { name: "name".to_string(), table: Some("users".to_string()) },
             ],
-            from: vec![TableRef {
+            from: vec![TableRef::Table {
                 name: "users".to_string(),
                 alias: None,
             }],
