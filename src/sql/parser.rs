@@ -1440,6 +1440,9 @@ impl Parser {
                 self.advance();
                 // Check if this is a subquery (starts with SELECT)
                 if self.match_token(TokenType::Select) {
+                    if std::env::var("DEBUG_PARSER").is_ok() {
+                        println!("DEBUG: Parsing subquery in parenthesized expression");
+                    }
                     let subquery_statement = self.parse_select_after_select()?;
                     self.consume_token(TokenType::RightParen, "Expected ')' after subquery")?;
                     Ok(Expression::Subquery(Box::new(subquery_statement)))

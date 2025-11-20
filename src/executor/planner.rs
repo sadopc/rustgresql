@@ -516,13 +516,11 @@ impl QueryPlanner {
                         .map(|(i, col_spec)| {
                             let planned_expr = self.plan_subqueries_in_expression(&col_spec.expr)?;
 
-                            if has_aggregation {
-                                println!("DEBUG: Checking expression for rewrite: {:?}", planned_expr);
-                                println!("DEBUG: is_aggregate: {}", self.is_aggregate_function(&planned_expr));
-                            }
-
                             let final_expr = if has_aggregation {
-                                if self.is_aggregate_function(&planned_expr) {
+                                // Skip rewriting for subqueries - they should be evaluated independently
+                                if matches!(planned_expr, Expression::Subquery(_)) {
+                                    planned_expr
+                                } else if self.is_aggregate_function(&planned_expr) {
                                      let alias = if let Some(alias) = &col_spec.alias {
                                         alias.clone()
                                     } else {
@@ -825,11 +823,74 @@ impl QueryPlanner {
 
     /// Check if an expression is an aggregate function
     fn is_aggregate_function(&self, expr: &Expression) -> bool {
-        if let Expression::Function { name, .. } = expr {
-            matches!(name.to_uppercase().as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
+        match expr {
+            Expression::Function { name, .. } => {
+                matches!(name.to_uppercase().as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
+            }
+            Expression::Subquery(subquery_stmt) => {
+                // Check if the subquery contains aggregate functions
+                let contains_agg = self.subquery_contains_aggregate(subquery_stmt);
+                if std::env::var("DEBUG_SUBQUERY").is_ok() {
+                    println!("DEBUG: Subquery contains aggregate: {}", contains_agg);
+                }
+                contains_agg
+            }
+            _ => false,
+        }
+    }
+
+    /// Check if a subquery statement contains aggregate functions
+    fn subquery_contains_aggregate(&self, subquery_stmt: &crate::sql::ast::Statement) -> bool {
+        if let crate::sql::ast::Statement::Select(select_stmt) = subquery_stmt {
+            match select_stmt {
+                crate::sql::ast::SelectStatement::Simple { columns, having, group_by, .. } => {
+                    // Check if any column is an aggregate function
+                    for col in columns {
+                        if self.expression_contains_aggregate(&col.expr) {
+                            return true;
+                        }
+                    }
+
+                    // Check HAVING clause for aggregates
+                    if let Some(having_expr) = having {
+                        if self.expression_contains_aggregate(having_expr) {
+                            return true;
+                        }
+                    }
+
+                    // If there are aggregates, it's a scalar aggregate subquery (regardless of GROUP BY)
+                    self.expression_contains_aggregate_in_columns(columns)
+                }
+                _ => false,
+            }
         } else {
             false
         }
+    }
+
+    /// Check if expression contains aggregate functions (recursive)
+    fn expression_contains_aggregate(&self, expr: &Expression) -> bool {
+        match expr {
+            Expression::Function { name, .. } => {
+                matches!(name.to_uppercase().as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
+            }
+            Expression::BinaryOp { left, right, .. } => {
+                self.expression_contains_aggregate(left) || self.expression_contains_aggregate(right)
+            }
+            Expression::UnaryOp { expr, .. } => {
+                self.expression_contains_aggregate(expr)
+            }
+            Expression::Subquery(_) => {
+                // Nested subqueries - handle recursively
+                self.is_aggregate_function(expr)
+            }
+            _ => false,
+        }
+    }
+
+    /// Check if any column in the list contains aggregate functions
+    fn expression_contains_aggregate_in_columns(&self, columns: &[crate::sql::ast::ColumnSpec]) -> bool {
+        columns.iter().any(|col| self.expression_contains_aggregate(&col.expr))
     }
 
     /// Plan aggregation (GROUP BY and aggregate functions)
@@ -863,6 +924,9 @@ impl QueryPlanner {
                             match expr {
                                 Expression::Function { name, .. } => {
                                     format!("{}_{}", name.to_lowercase(), i)
+                                }
+                                Expression::Subquery(_) => {
+                                    format!("subquery_agg_{}", i)
                                 }
                                 _ => format!("aggregate{}", i),
                             }

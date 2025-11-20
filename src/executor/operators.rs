@@ -306,7 +306,7 @@ impl ProjectOperator {
             input_result.rows
                 .into_iter()
                 .map(|row| {
-                    let eval_context = self.create_evaluation_context(scanner, &input_column_names, &row);
+                    let eval_context = self.create_evaluation_context(scanner, &input_column_names, &row, context);
                     self.columns
                         .iter()
                         .map(|(_, expr)| {
@@ -325,7 +325,7 @@ impl ProjectOperator {
             input_result.rows
                 .into_iter()
                 .map(|row| {
-                    let eval_context = self.create_basic_evaluation_context(&input_column_names, &row);
+                    let eval_context = self.create_basic_evaluation_context(&input_column_names, &row, context);
                     self.columns
                         .iter()
                         .map(|(_, expr)| {
@@ -349,7 +349,7 @@ impl ProjectOperator {
     }
 
     /// Create evaluation context with proper column name resolution
-    fn create_evaluation_context(&self, scanner: &TableScanner, column_names: &[String], row: &[Value]) -> EvaluationContext {
+    fn create_evaluation_context(&self, scanner: &TableScanner, column_names: &[String], row: &[Value], context: &ExecutionContext) -> EvaluationContext {
         let mut columns = std::collections::HashMap::new();
 
         // Map column names to values
@@ -359,11 +359,21 @@ impl ProjectOperator {
             }
         }
 
-        EvaluationContext::with_columns(columns)
+        let mut eval_context = EvaluationContext::with_columns(columns);
+
+        // Pass catalog and buffer_manager for subquery execution
+        if let Some(catalog) = context.get_catalog() {
+            eval_context.set_catalog(catalog.clone());
+        }
+        if let Some(buffer_manager) = context.get_buffer_manager() {
+            eval_context.set_buffer_manager(buffer_manager.clone());
+        }
+
+        eval_context
     }
 
     /// Create basic evaluation context (fallback when no scanner available)
-    fn create_basic_evaluation_context(&self, column_names: &[String], row: &[Value]) -> EvaluationContext {
+    fn create_basic_evaluation_context(&self, column_names: &[String], row: &[Value], context: &ExecutionContext) -> EvaluationContext {
         let mut columns = std::collections::HashMap::new();
 
         // Simple column name to value mapping
@@ -373,7 +383,17 @@ impl ProjectOperator {
             }
         }
 
-        EvaluationContext::with_columns(columns)
+        let mut eval_context = EvaluationContext::with_columns(columns);
+
+        // Pass catalog and buffer_manager for subquery execution
+        if let Some(catalog) = context.get_catalog() {
+            eval_context.set_catalog(catalog.clone());
+        }
+        if let Some(buffer_manager) = context.get_buffer_manager() {
+            eval_context.set_buffer_manager(buffer_manager.clone());
+        }
+
+        eval_context
     }
 
     /// Handle SELECT * expansion
@@ -679,6 +699,8 @@ impl JoinOperator {
                     right_row: Some(right_row.to_vec()),
                     left_columns: Some(left_columns.to_vec()),
                     right_columns: Some(right_columns.to_vec()),
+                    catalog: None,  // TODO: Pass catalog/buffer_manager for subqueries in JOIN conditions
+                    buffer_manager: None,
                 };
 
                 let result = { let evaluator = ExpressionEvaluator; evaluator.evaluate(condition, &context) }?;

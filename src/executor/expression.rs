@@ -21,6 +21,10 @@ pub struct EvaluationContext {
     pub left_columns: Option<Vec<String>>,
     /// For joins: right columns
     pub right_columns: Option<Vec<String>>,
+    /// Catalog manager for subquery execution
+    pub catalog: Option<std::sync::Arc<crate::catalog::CatalogManager>>,
+    /// Buffer manager for subquery execution
+    pub buffer_manager: Option<std::sync::Arc<crate::storage::BufferPoolManager>>,
 }
 
 impl EvaluationContext {
@@ -32,6 +36,8 @@ impl EvaluationContext {
             right_row: None,
             left_columns: None,
             right_columns: None,
+            catalog: None,
+            buffer_manager: None,
         }
     }
 
@@ -43,6 +49,8 @@ impl EvaluationContext {
             right_row: None,
             left_columns: None,
             right_columns: None,
+            catalog: None,
+            buffer_manager: None,
         }
     }
 
@@ -54,6 +62,8 @@ impl EvaluationContext {
             right_row: None,
             left_columns: None,
             right_columns: None,
+            catalog: None,
+            buffer_manager: None,
         }
     }
 
@@ -65,6 +75,8 @@ impl EvaluationContext {
             right_row: Some(right_row),
             left_columns: Some(left_columns),
             right_columns: Some(right_columns),
+            catalog: None,
+            buffer_manager: None,
         }
     }
 
@@ -74,6 +86,14 @@ impl EvaluationContext {
 
     pub fn set_variable(&mut self, name: &str, value: Value) {
         self.columns.insert(name.to_string(), value);
+    }
+
+    pub fn set_catalog(&mut self, catalog: std::sync::Arc<crate::catalog::CatalogManager>) {
+        self.catalog = Some(catalog);
+    }
+
+    pub fn set_buffer_manager(&mut self, buffer_manager: std::sync::Arc<crate::storage::BufferPoolManager>) {
+        self.buffer_manager = Some(buffer_manager);
     }
 }
 
@@ -950,6 +970,14 @@ impl ExpressionEvaluator {
 
         // Create a new execution context for the subquery
         let mut subquery_context = crate::executor::operators::ExecutionContext::new();
+
+        // Pass catalog and buffer_manager from outer context so subquery can access database
+        if let Some(catalog) = &context.catalog {
+            subquery_context.set_catalog(catalog.clone());
+        }
+        if let Some(buffer_manager) = &context.buffer_manager {
+            subquery_context.set_buffer_manager(buffer_manager.clone());
+        }
 
         // Execute the subquery (correlated or non-correlated)
         let result = if !correlated_columns.is_empty() {
