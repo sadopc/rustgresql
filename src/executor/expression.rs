@@ -29,6 +29,8 @@ pub struct EvaluationContext {
     pub subquery_context: Option<SubqueryContext>,
     /// Aggregate function values for HAVING clause evaluation (expression -> value)
     pub having_aggregates: Option<std::collections::HashMap<String, Value>>,
+    /// Materialized CTEs available in the current execution context
+    pub materialized_ctes: Option<std::collections::HashMap<String, crate::executor::operators::QueryResult>>,
 }
 
 /// Context for subquery evaluation to determine how results should be processed
@@ -55,6 +57,7 @@ impl EvaluationContext {
             buffer_manager: None,
             subquery_context: None,
             having_aggregates: None,
+            materialized_ctes: None,
         }
     }
 
@@ -70,6 +73,7 @@ impl EvaluationContext {
             buffer_manager: None,
             subquery_context: None,
             having_aggregates: None,
+            materialized_ctes: None,
         }
     }
 
@@ -85,6 +89,7 @@ impl EvaluationContext {
             buffer_manager: None,
             subquery_context: None,
             having_aggregates: None,
+            materialized_ctes: None,
         }
     }
 
@@ -100,6 +105,7 @@ impl EvaluationContext {
             buffer_manager: None,
             subquery_context: None,
             having_aggregates: None,
+            materialized_ctes: None,
         }
     }
 
@@ -127,6 +133,14 @@ impl EvaluationContext {
         self.having_aggregates = Some(aggregates);
     }
 
+    pub fn set_materialized_ctes(&mut self, ctes: std::collections::HashMap<String, crate::executor::operators::QueryResult>) {
+        self.materialized_ctes = Some(ctes);
+    }
+
+    pub fn get_materialized_ctes(&self) -> Option<&std::collections::HashMap<String, crate::executor::operators::QueryResult>> {
+        self.materialized_ctes.as_ref()
+    }
+
     pub fn get_subquery_context(&self) -> Option<&SubqueryContext> {
         self.subquery_context.as_ref()
     }
@@ -144,6 +158,7 @@ impl EvaluationContext {
             buffer_manager: None,
             subquery_context: Some(SubqueryContext::InClause),
             having_aggregates: None,
+            materialized_ctes: None,
         }
     }
 }
@@ -1111,12 +1126,15 @@ impl ExpressionEvaluator {
         // Create a new execution context for the subquery
         let mut subquery_context = crate::executor::operators::ExecutionContext::new();
 
-        // Pass catalog and buffer_manager from outer context so subquery can access database
+        // Pass catalog, buffer_manager, and materialized_ctes from outer context so subquery can access database and CTEs
         if let Some(catalog) = &context.catalog {
             subquery_context.set_catalog(catalog.clone());
         }
         if let Some(buffer_manager) = &context.buffer_manager {
             subquery_context.set_buffer_manager(buffer_manager.clone());
+        }
+        if let Some(materialized_ctes) = context.get_materialized_ctes() {
+            subquery_context.set_materialized_ctes(materialized_ctes.clone());
         }
 
         // Execute the subquery (correlated or non-correlated)

@@ -245,12 +245,15 @@ impl FilterOperator {
 
         let mut eval_context = EvaluationContext::with_columns(columns);
 
-        // Pass catalog and buffer_manager for subquery execution
+        // Pass catalog, buffer_manager, and materialized_ctes for subquery execution
         if let Some(catalog) = context.get_catalog() {
             eval_context.set_catalog(catalog.clone());
         }
         if let Some(buffer_manager) = context.get_buffer_manager() {
             eval_context.set_buffer_manager(buffer_manager.clone());
+        }
+        if let Some(materialized_ctes) = context.get_materialized_ctes() {
+            eval_context.set_materialized_ctes(materialized_ctes.clone());
         }
 
         eval_context
@@ -288,12 +291,15 @@ impl FilterOperator {
 
         let mut eval_context = EvaluationContext::with_columns(columns);
 
-        // Pass catalog and buffer_manager for subquery execution
+        // Pass catalog, buffer_manager, and materialized_ctes for subquery execution
         if let Some(catalog) = context.get_catalog() {
             eval_context.set_catalog(catalog.clone());
         }
         if let Some(buffer_manager) = context.get_buffer_manager() {
             eval_context.set_buffer_manager(buffer_manager.clone());
+        }
+        if let Some(materialized_ctes) = context.get_materialized_ctes() {
+            eval_context.set_materialized_ctes(materialized_ctes.clone());
         }
 
         eval_context
@@ -458,12 +464,15 @@ impl ProjectOperator {
 
         let mut eval_context = EvaluationContext::with_columns(columns);
 
-        // Pass catalog and buffer_manager for subquery execution
+        // Pass catalog, buffer_manager, and materialized_ctes for subquery execution
         if let Some(catalog) = context.get_catalog() {
             eval_context.set_catalog(catalog.clone());
         }
         if let Some(buffer_manager) = context.get_buffer_manager() {
             eval_context.set_buffer_manager(buffer_manager.clone());
+        }
+        if let Some(materialized_ctes) = context.get_materialized_ctes() {
+            eval_context.set_materialized_ctes(materialized_ctes.clone());
         }
 
         eval_context
@@ -501,12 +510,15 @@ impl ProjectOperator {
 
         let mut eval_context = EvaluationContext::with_columns(columns);
 
-        // Pass catalog and buffer_manager for subquery execution
+        // Pass catalog, buffer_manager, and materialized_ctes for subquery execution
         if let Some(catalog) = context.get_catalog() {
             eval_context.set_catalog(catalog.clone());
         }
         if let Some(buffer_manager) = context.get_buffer_manager() {
             eval_context.set_buffer_manager(buffer_manager.clone());
+        }
+        if let Some(materialized_ctes) = context.get_materialized_ctes() {
+            eval_context.set_materialized_ctes(materialized_ctes.clone());
         }
 
         eval_context
@@ -781,8 +793,10 @@ impl JoinOperator {
                             format!("{}.{}", left_table_name, col_name)
                         };
                         columns.insert(qualified_name, left_row[i].clone());
-                        // Also add unqualified name for easier access
-                        columns.insert(col_name.clone(), left_row[i].clone());
+                        // Also add unqualified name only if not already present (to avoid overwriting in self-joins)
+                        if !columns.contains_key(col_name) {
+                            columns.insert(col_name.clone(), left_row[i].clone());
+                        }
                     }
                 }
 
@@ -795,8 +809,8 @@ impl JoinOperator {
                             format!("{}.{}", right_table_name, col_name)
                         };
                         columns.insert(qualified_name, right_row[i].clone());
-                        // Also add unqualified name for easier access
-                        columns.insert(col_name.clone(), right_row[i].clone());
+                        // Don't add unqualified name for right side to avoid ambiguity in self-joins
+                        // Use qualified names (e.g., d2.id) to access right side columns
                     }
                 }
 
@@ -819,6 +833,7 @@ impl JoinOperator {
                     buffer_manager: None,
                     subquery_context: None,
                     having_aggregates: None,
+                    materialized_ctes: None,
                 };
 
                 let result = { let evaluator = ExpressionEvaluator; evaluator.evaluate(condition, &context) }?;
@@ -2521,7 +2536,6 @@ impl SetOperationOperator {
 pub struct SubqueryOperator {
     pub query: crate::sql::ast::Statement,
     pub correlated_columns: Vec<String>,
-    pub planner: crate::executor::planner::QueryPlanner,
 }
 
 impl SubqueryOperator {
@@ -2529,17 +2543,25 @@ impl SubqueryOperator {
         Self {
             query,
             correlated_columns,
-            planner: crate::executor::planner::QueryPlanner::new(),
         }
     }
 
     pub fn execute(&self, context: &mut ExecutionContext) -> Result<QueryResult> {
         context.log(&format!("Executing subquery: {:?}", self.query));
 
+        // Create a planner that has access to materialized CTEs from the context
+        let catalog = context.get_catalog().cloned();
+        let materialized_ctes = context.get_materialized_ctes()
+            .cloned()
+            .unwrap_or_else(|| std::collections::HashMap::new());
+
+        // Always use with_ctes constructor which accepts optional catalog
+        let planner = crate::executor::planner::QueryPlanner::with_ctes(catalog, materialized_ctes);
+
         // Plan and execute the subquery
         let plan = match &self.query {
             crate::sql::ast::Statement::Select(select_stmt) => {
-                self.planner.plan_select(select_stmt)?
+                planner.plan_select(select_stmt)?
             }
             _ => {
                 return Err(crate::error::RustgreSQLError::InvalidOperation(
@@ -2572,12 +2594,15 @@ impl SubqueryOperator {
         // Copy all logs from the original context
         correlated_context.logs = context.logs.clone();
 
-        // Copy catalog and buffer_manager from parent context so subquery can access tables
+        // Copy catalog, buffer_manager, and materialized_ctes from parent context so subquery can access tables and CTEs
         if let Some(catalog) = context.get_catalog() {
             correlated_context.set_catalog(catalog.clone());
         }
         if let Some(buffer_manager) = context.get_buffer_manager() {
             correlated_context.set_buffer_manager(buffer_manager.clone());
+        }
+        if let Some(materialized_ctes) = context.get_materialized_ctes() {
+            correlated_context.set_materialized_ctes(materialized_ctes.clone());
         }
 
         // Inject outer context values into correlated context
@@ -2605,10 +2630,19 @@ impl SubqueryOperator {
             correlated_context.set_outer_context_values(outer_values);
         }
 
+        // Create a planner that has access to materialized CTEs from the context
+        let catalog = correlated_context.get_catalog().cloned();
+        let materialized_ctes = correlated_context.get_materialized_ctes()
+            .cloned()
+            .unwrap_or_else(|| std::collections::HashMap::new());
+
+        // Always use with_ctes constructor which accepts optional catalog
+        let planner = crate::executor::planner::QueryPlanner::with_ctes(catalog, materialized_ctes);
+
         // Plan and execute the subquery
         let plan = match &self.query {
             crate::sql::ast::Statement::Select(select_stmt) => {
-                self.planner.plan_select(select_stmt)?
+                planner.plan_select(select_stmt)?
             }
             _ => {
                 return Err(crate::error::RustgreSQLError::InvalidOperation(
@@ -3008,19 +3042,169 @@ impl WindowOperator {
 #[derive(Debug)]
 pub struct CTEScanOperator {
     pub cte_name: String,
-    pub materialized_result: QueryResult,
 }
 
 impl CTEScanOperator {
-    pub fn new(cte_name: String, materialized_result: QueryResult) -> Self {
+    pub fn new(cte_name: String) -> Self {
         Self {
             cte_name,
-            materialized_result,
         }
     }
 
-    pub fn execute(&self, _context: &mut ExecutionContext) -> Result<QueryResult> {
-        Ok(self.materialized_result.clone())
+    pub fn execute(&self, context: &mut ExecutionContext) -> Result<QueryResult> {
+        // Look up the CTE from the execution context
+        if let Some(materialized_ctes) = &context.materialized_ctes {
+            if let Some(cte_result) = materialized_ctes.get(&self.cte_name) {
+                Ok(cte_result.clone())
+            } else {
+                Err(crate::error::RustgreSQLError::Execution(
+                    format!("CTE '{}' not found in execution context", self.cte_name)
+                ))
+            }
+        } else {
+            Err(crate::error::RustgreSQLError::Execution(
+                "No materialized CTEs in execution context".to_string()
+            ))
+        }
+    }
+}
+
+/// CTE Dependency Graph for managing multiple recursive CTEs
+#[derive(Debug, Clone)]
+pub struct CTEDependencyGraph {
+    pub nodes: std::collections::HashMap<String, CTENode>,
+    pub execution_order: Vec<Vec<String>>, // Groups of CTEs that can be executed together
+}
+
+#[derive(Debug, Clone)]
+pub struct CTENode {
+    pub name: String,
+    pub is_recursive: bool,
+    pub dependencies: std::collections::HashSet<String>,
+    pub execution_group: Option<usize>,
+}
+
+impl CTEDependencyGraph {
+    pub fn new() -> Self {
+        Self {
+            nodes: std::collections::HashMap::new(),
+            execution_order: Vec::new(),
+        }
+    }
+
+    pub fn add_cte(&mut self, cte: &crate::sql::ast::CommonTableExpression) {
+        let node = CTENode {
+            name: cte.name.clone(),
+            is_recursive: cte.recursive,
+            dependencies: self.extract_dependencies(&cte.query),
+            execution_group: None,
+        };
+        self.nodes.insert(cte.name.clone(), node);
+    }
+
+    pub fn build_execution_order(&mut self) -> Result<()> {
+        // Group CTEs by dependency level
+        let mut groups: Vec<Vec<String>> = Vec::new();
+        let mut processed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut remaining: std::collections::HashSet<String> = self.nodes.keys().cloned().collect();
+
+        // First, handle all non-recursive CTEs
+        let mut non_recursive_group = Vec::new();
+        let mut recursive_ctes = Vec::new();
+
+        for name in &remaining.clone() {
+            if let Some(node) = self.nodes.get(name) {
+                if !node.is_recursive {
+                    non_recursive_group.push(name.clone());
+                } else {
+                    recursive_ctes.push(name.clone());
+                }
+            }
+        }
+
+        // Execute non-recursive CTEs first (they can depend on each other)
+        if !non_recursive_group.is_empty() {
+            groups.push(non_recursive_group);
+            for name in groups[0].iter() {
+                processed.insert(name.clone());
+                remaining.remove(name);
+            }
+        }
+
+        // Handle recursive CTEs - they must be executed one at a time in dependency order
+        while !remaining.is_empty() {
+            let mut current_group = Vec::new();
+            let mut to_remove = Vec::new();
+
+            for name in &remaining.clone() {
+                if let Some(node) = self.nodes.get(name) {
+                    // Check if all dependencies are processed
+                    let deps_processed = node.dependencies.iter().all(|dep| processed.contains(dep));
+
+                    if deps_processed {
+                        current_group.push(name.clone());
+                        to_remove.push(name.clone());
+                    }
+                }
+            }
+
+            if current_group.is_empty() {
+                return Err(crate::error::RustgreSQLError::InvalidOperation(
+                    "Circular dependency detected in recursive CTEs".to_string()
+                ));
+            }
+
+            // For recursive CTEs, execute them individually to avoid mutual recursion
+            for name in current_group {
+                groups.push(vec![name.clone()]);
+                processed.insert(name.clone());
+                remaining.remove(&name);
+            }
+        }
+
+        self.execution_order = groups;
+        Ok(())
+    }
+
+    fn extract_dependencies(&self, query: &crate::sql::ast::SelectStatement) -> std::collections::HashSet<String> {
+        let mut dependencies = std::collections::HashSet::new();
+        self.extract_query_dependencies(query, &mut dependencies);
+        dependencies
+    }
+
+    fn extract_query_dependencies(&self, query: &crate::sql::ast::SelectStatement, deps: &mut std::collections::HashSet<String>) {
+        match query {
+            crate::sql::ast::SelectStatement::Simple { from, joins, .. } => {
+                // Extract table references from FROM clause
+                for table_ref in from {
+                    self.extract_table_dependencies(table_ref, deps);
+                }
+
+                // Extract table references from JOINs
+                for join in joins {
+                    self.extract_table_dependencies(&join.table, deps);
+                }
+            }
+            crate::sql::ast::SelectStatement::SetOperation(set_op) => {
+                self.extract_query_dependencies(&set_op.left, deps);
+                self.extract_query_dependencies(&set_op.right, deps);
+            }
+        }
+    }
+
+    fn extract_table_dependencies(&self, table_ref: &crate::sql::ast::TableRef, deps: &mut std::collections::HashSet<String>) {
+        match table_ref {
+            crate::sql::ast::TableRef::Table { name, .. } => {
+                if self.nodes.contains_key(name) {
+                    deps.insert(name.clone());
+                }
+            }
+            crate::sql::ast::TableRef::Subquery { subquery, .. } => {
+                if let crate::sql::ast::Statement::Select(select) = subquery.as_ref() {
+                    self.extract_query_dependencies(select, deps);
+                }
+            }
+        }
     }
 }
 
@@ -3028,7 +3212,8 @@ impl CTEScanOperator {
 ///
 /// This operator handles the execution of Common Table Expressions by materializing
 /// the CTE results and making them available to the main query. It supports both
-/// recursive and non-recursive CTEs.
+/// recursive and non-recursive CTEs, including multiple recursive CTEs with proper
+/// dependency management.
 #[derive(Debug)]
 pub struct CTEOperator {
     /// The WITH clause containing all CTEs
@@ -3078,7 +3263,19 @@ impl CTEOperator {
         for cte in &self.with_clause.ctes {
             context.log(&format!("Materializing CTE: {}", cte.name));
 
-            let cte_plan = self.planner.plan_select(&cte.query)?;
+            // For materializing CTEs, we need to use a planner that has access to previously materialized CTEs
+            let catalog = self.planner.catalog.clone();
+            let cte_planner = crate::executor::planner::QueryPlanner::with_ctes(
+                catalog,
+                self.materialized_ctes.clone()
+            );
+
+            let cte_plan = cte_planner.plan_select(&cte.query)?;
+            context.log(&format!("Created execution plan for CTE {}", cte.name));
+
+            // Set the materialized CTEs in the context so subqueries can access them
+            context.set_materialized_ctes(self.materialized_ctes.clone());
+
             let cte_result = cte_plan.root.execute(context)?;
 
             // Store the materialized result for use by the main query
@@ -3088,9 +3285,13 @@ impl CTEOperator {
 
         // Execute the main query with access to materialized CTEs
         context.log("Executing main query with CTEs");
+
+        // Set all materialized CTEs in the context for the main query
+        context.set_materialized_ctes(self.materialized_ctes.clone());
+
         let main_plan = match self.main_query.as_ref() {
             crate::sql::ast::Statement::Select(select_stmt) => {
-                self.plan_select_with_ctes(select_stmt)?
+                self.plan_select_with_ctes(select_stmt, context)?
             }
             _ => {
                 return Err(crate::error::RustgreSQLError::InvalidOperation(
@@ -3102,153 +3303,225 @@ impl CTEOperator {
         main_plan.root.execute(context)
     }
 
-    /// Execute recursive CTEs
+    /// Execute multiple recursive CTEs with proper dependency management
     fn execute_recursive_ctes(&mut self, context: &mut ExecutionContext) -> Result<QueryResult> {
-        context.log("Executing recursive CTEs");
+        context.log("Executing multiple recursive CTEs with dependency management");
 
-        if self.with_clause.ctes.len() != 1 {
-            return Err(crate::error::RustgreSQLError::InvalidOperation(
-                "Recursive CTEs currently support only a single CTE".to_string()
-            ));
+        // Clear any previous CTE results
+        self.materialized_ctes.clear();
+
+        // Build dependency graph for all CTEs
+        let mut dependency_graph = CTEDependencyGraph::new();
+        for cte in &self.with_clause.ctes {
+            dependency_graph.add_cte(cte);
         }
 
-        let cte = &self.with_clause.ctes[0];
-        context.log(&format!("Materializing recursive CTE: {}", cte.name));
+        // Build execution order based on dependencies
+        dependency_graph.build_execution_order()?;
+        context.log(&format!("Built execution order with {} groups", dependency_graph.execution_order.len()));
 
-        // Extract anchor and recursive members from the CTE query
-        let (anchor_query, recursive_query) = match cte.query.as_ref() {
-            crate::sql::ast::SelectStatement::SetOperation(set_op) if
-                matches!(set_op.operator, crate::sql::ast::SetOperator::Union) &&
-                !set_op.all => {
-                // This is a UNION query - extract left (anchor) and right (recursive) parts
-                (&*set_op.left, &*set_op.right)
+        // Execute CTEs in dependency order
+        for (group_index, group) in dependency_graph.execution_order.iter().enumerate() {
+            context.log(&format!("Executing group {} with {} CTEs", group_index, group.len()));
+
+            if group.len() == 1 {
+                let cte_name = &group[0];
+                if let Some(cte_node) = dependency_graph.nodes.get(cte_name) {
+                    if cte_node.is_recursive {
+                        // Execute single recursive CTE
+                        self.execute_single_recursive_cte(cte_name, context)?;
+                    } else {
+                        // Execute non-recursive CTE
+                        self.execute_single_non_recursive_cte(cte_name, context)?;
+                    }
+                }
+            } else {
+                // Execute multiple non-recursive CTEs in parallel (they have no circular dependencies)
+                self.execute_non_recursive_cte_group(group, context)?;
+            }
+        }
+
+        // Execute the main query
+        context.log("Executing main query with all recursive CTEs materialized");
+
+        // Set the materialized CTEs in the context for the main query
+        context.set_materialized_ctes(self.materialized_ctes.clone());
+
+        // Create a CTE-aware planner for the main query
+        let catalog = self.planner.catalog.clone();
+        let main_planner = crate::executor::planner::QueryPlanner::with_ctes(
+            catalog,
+            self.materialized_ctes.clone()
+        );
+
+        let main_plan = match self.main_query.as_ref() {
+            crate::sql::ast::Statement::Select(select_stmt) => {
+                main_planner.plan_select(select_stmt)?
             }
             _ => {
                 return Err(crate::error::RustgreSQLError::InvalidOperation(
-                    "Recursive CTE must be a UNION (not UNION ALL) of anchor and recursive parts".to_string()
+                    "CTE operator only supports SELECT statements as main query".to_string()
                 ));
             }
         };
 
-        context.log("Executing anchor member of recursive CTE");
+        main_plan.root.execute(context)
+    }
+
+    /// Execute a single recursive CTE with the existing recursive logic
+    fn execute_single_recursive_cte(&mut self, cte_name: &str, context: &mut ExecutionContext) -> Result<()> {
+        let cte = self.with_clause.ctes.iter()
+            .find(|c| c.name == cte_name)
+            .ok_or_else(|| crate::error::RustgreSQLError::Internal(
+                format!("CTE '{}' not found in WITH clause", cte_name)
+            ))?;
+
+        context.log(&format!("Executing recursive CTE: {}", cte_name));
+
+        // Extract anchor and recursive members from the CTE query
+        let (anchor_query, recursive_query, is_union_all) = match cte.query.as_ref() {
+            crate::sql::ast::SelectStatement::SetOperation(set_op) if
+                matches!(set_op.operator, crate::sql::ast::SetOperator::Union) => {
+                // This is a UNION query - extract left (anchor) and right (recursive) parts
+                (&*set_op.left, &*set_op.right, set_op.all)
+            }
+            _ => {
+                return Err(crate::error::RustgreSQLError::InvalidOperation(
+                    format!("Recursive CTE '{}' must be a UNION or UNION ALL of anchor and recursive parts", cte_name)
+                ));
+            }
+        };
+
+        context.log(&format!("Executing anchor member of recursive CTE: {}", cte_name));
+
+        // Set the materialized CTEs in the context (includes previously materialized CTEs)
+        context.set_materialized_ctes(self.materialized_ctes.clone());
 
         // Execute the anchor member (non-recursive part)
-        let anchor_plan = self.planner.plan_select(anchor_query)?;
+        // Create a planner that has access to previously materialized CTEs
+        let catalog = self.planner.catalog.clone();
+        let anchor_planner = crate::executor::planner::QueryPlanner::with_ctes(
+            catalog,
+            self.materialized_ctes.clone()
+        );
+        let anchor_plan = anchor_planner.plan_select(anchor_query)?;
         let anchor_result = anchor_plan.root.execute(context)?;
-        context.log(&format!("Anchor member produced {} rows", anchor_result.rows.len()));
+        context.log(&format!("Anchor member of {} produced {} rows", cte_name, anchor_result.rows.len()));
 
         // Initialize working set with anchor results
         let mut working_result = anchor_result.clone();
         let mut all_results = anchor_result.clone();
-        let mut previous_row_count = 0;
         let mut iteration_count = 0;
         let max_iterations = 1000; // Prevent infinite loops
 
-        // Create a temporary execution context for recursive execution
-        // This simulates the CTE being available as a temporary table
-        let mut recursive_context = ExecutionContext::new();
-        if let Some(catalog) = context.get_catalog() {
-            recursive_context.set_catalog(catalog.clone());
-        }
-        if let Some(buffer_manager) = context.get_buffer_manager() {
-            recursive_context.set_buffer_manager(buffer_manager.clone());
-        }
-
         // Iteratively execute the recursive part until no new rows are produced
-        while working_result.rows.len() > previous_row_count && iteration_count < max_iterations {
+        while !working_result.rows.is_empty() && iteration_count < max_iterations {
             iteration_count += 1;
-            previous_row_count = working_result.rows.len();
 
-            context.log(&format!("Recursive iteration {} - working set has {} rows",
-                iteration_count, working_result.rows.len()));
+            context.log(&format!("Recursive iteration {} for {} - working set has {} rows",
+                iteration_count, cte_name, working_result.rows.len()));
 
-            // In a full implementation, we would:
-            // 1. Make the current working results available as a temporary table named after the CTE
-            // 2. Execute the recursive query against this temporary table
-            // 3. Filter out rows that already exist in all_results (cycle detection)
-            // 4. Add new rows to both working_result and all_results
+            // Update the materialized CTEs map with the current working result (delta only)
+            // This makes the delta from the previous iteration available for recursive queries
+            let mut updated_materialized_ctes = self.materialized_ctes.clone();
+            updated_materialized_ctes.insert(cte_name.to_string(), working_result.clone());
+            context.set_materialized_ctes(updated_materialized_ctes.clone());
 
-            // For this implementation, we'll simulate the recursive execution
-            // In practice, this would require:
-            // - Creating a temporary table or in-memory structure to hold the CTE results
-            // - Modifying the planner to recognize CTE references and use the temporary data
-            // - Implementing proper row comparison for cycle detection
+            // Execute the actual recursive query
+            context.log(&format!("Executing recursive query for {} - iteration {}", cte_name, iteration_count));
+            // Create a planner that has access to the updated materialized CTEs (including the CTE being executed)
+            let catalog = self.planner.catalog.clone();
+            let recursive_planner = crate::executor::planner::QueryPlanner::with_ctes(
+                catalog,
+                updated_materialized_ctes
+            );
+            let recursive_plan = recursive_planner.plan_select(recursive_query)?;
+            let recursive_result = recursive_plan.root.execute(context)?;
 
-            context.log(&format!("Simulating recursive execution - iteration {}", iteration_count));
+            context.log(&format!("Recursive query for {} produced {} new rows", cte_name, recursive_result.rows.len()));
 
-            // Break after a few iterations for this prototype
-            // In a real implementation, this would continue until convergence
-            if iteration_count >= 3 {
-                context.log("Reached iteration limit for prototype implementation");
+            // Break if no new rows were produced (convergence)
+            if recursive_result.rows.is_empty() {
+                context.log(&format!("Recursive CTE {} converged after {} iterations", cte_name, iteration_count));
                 break;
             }
 
-            // Simulate adding some rows (in reality, this would be the result of executing the recursive query)
-            // This is where the actual recursive execution would happen
-            let simulated_new_rows = self.simulate_recursive_execution(&working_result, iteration_count, context)?;
+            // Create a new working result containing ONLY the delta (new rows from this iteration)
+            // This ensures the next iteration only sees new rows, not all accumulated rows
+            let mut new_working_result = QueryResult {
+                column_names: working_result.column_names.clone(),
+                rows: vec![],
+            };
 
-            // Add new rows to our results (cycle detection would happen here)
-            for row in simulated_new_rows.rows {
-                if !self.row_exists_in_results(&all_results.rows, &row) {
-                    working_result.rows.push(row.clone());
+            // Add new rows to results (cycle detection only for UNION, not UNION ALL)
+            for row in recursive_result.rows {
+                if is_union_all {
+                    // UNION ALL: Allow all rows, including duplicates
+                    new_working_result.rows.push(row.clone());
                     all_results.rows.push(row);
+                } else {
+                    // UNION: Prevent duplicate rows
+                    if !self.row_exists_in_results(&all_results.rows, &row) {
+                        new_working_result.rows.push(row.clone());
+                        all_results.rows.push(row);
+                    }
                 }
             }
+
+            // Replace working_result with only the new rows (delta)
+            working_result = new_working_result;
         }
 
-        context.log(&format!("Recursive CTE execution completed after {} iterations with {} total rows",
-            iteration_count, all_results.rows.len()));
+        context.log(&format!("Recursive CTE {} execution completed after {} iterations with {} total rows",
+            cte_name, iteration_count, all_results.rows.len()));
 
         // Store the final result in the materialized CTEs map
-        // Note: This would require the CTEOperator to be mutable in a full implementation
-        // For now, we'll proceed with the main query execution
+        self.materialized_ctes.insert(cte_name.to_string(), all_results.clone());
 
-        // Execute the main query
-        context.log("Executing main query with recursive CTEs");
-        let main_plan = match self.main_query.as_ref() {
-            crate::sql::ast::Statement::Select(select_stmt) => {
-                self.planner.plan_select(select_stmt)?
-            }
-            _ => {
-                return Err(crate::error::RustgreSQLError::InvalidOperation(
-                    "CTE operator only supports SELECT statements as main query".to_string()
-                ));
-            }
-        };
+        // Also update the context with the final result so the main query can access it
+        context.set_materialized_ctes(self.materialized_ctes.clone());
 
-        main_plan.root.execute(context)
+        Ok(())
     }
 
-    /// Simulate recursive execution for prototype implementation
-    /// In a real implementation, this would execute the actual recursive query
-    fn simulate_recursive_execution(&self, base_result: &QueryResult, iteration: usize, _context: &ExecutionContext) -> Result<QueryResult> {
-        // This is a placeholder that simulates recursive execution
-        // In practice, this would:
-        // 1. Create a temporary table/view with the current working results
-        // 2. Execute the recursive query against this temporary table
-        // 3. Return the new results
+    /// Execute a single non-recursive CTE
+    fn execute_single_non_recursive_cte(&mut self, cte_name: &str, context: &mut ExecutionContext) -> Result<()> {
+        let cte = self.with_clause.ctes.iter()
+            .find(|c| c.name == cte_name)
+            .ok_or_else(|| crate::error::RustgreSQLError::Internal(
+                format!("CTE '{}' not found in WITH clause", cte_name)
+            ))?;
 
-        let mut simulated_result = base_result.clone();
+        context.log(&format!("Materializing non-recursive CTE: {}", cte_name));
 
-        // Simulate some new rows being generated in each iteration
-        // This represents the recursive part finding new related records
-        if iteration <= 2 {
-            let new_row_count = std::cmp::min(3, base_result.rows.len());
-            for i in 0..new_row_count {
-                if let Some(base_row) = base_result.rows.get(i) {
-                    let mut new_row = base_row.clone();
-                    // Modify the row slightly to simulate "new" data
-                    if let Some(val) = new_row.get_mut(1) {
-                        if let ValueKind::Integer(int_val) = &mut val.kind {
-                            *int_val += (iteration * 10) as i64;
-                        }
-                    }
-                    simulated_result.rows.push(new_row);
-                }
-            }
+        // Set the materialized CTEs in the context so subqueries can access them
+        context.set_materialized_ctes(self.materialized_ctes.clone());
+
+        // Create a planner that has access to previously materialized CTEs
+        let catalog = self.planner.catalog.clone();
+        let cte_planner = crate::executor::planner::QueryPlanner::with_ctes(
+            catalog,
+            self.materialized_ctes.clone()
+        );
+
+        let cte_plan = cte_planner.plan_select(&cte.query)?;
+        context.log(&format!("Created execution plan for CTE {}", cte_name));
+
+        let cte_result = cte_plan.root.execute(context)?;
+
+        // Store the materialized result for use by other CTEs
+        context.log(&format!("Materialized CTE {} with {} rows", cte_name, cte_result.rows.len()));
+        self.materialized_ctes.insert(cte_name.to_string(), cte_result);
+
+        Ok(())
+    }
+
+    /// Execute a group of non-recursive CTEs (they can be executed in any order)
+    fn execute_non_recursive_cte_group(&mut self, cte_names: &[String], context: &mut ExecutionContext) -> Result<()> {
+        for cte_name in cte_names {
+            self.execute_single_non_recursive_cte(cte_name, context)?;
         }
-
-        Ok(simulated_result)
+        Ok(())
     }
 
     /// Check if a row already exists in the results (for cycle detection)
@@ -3289,7 +3562,7 @@ impl CTEOperator {
     }
 
     /// Plan a SELECT statement with access to materialized CTEs
-    fn plan_select_with_ctes(&self, select: &crate::sql::ast::SelectStatement) -> Result<crate::executor::planner::ExecutionPlan> {
+    fn plan_select_with_ctes(&self, select: &crate::sql::ast::SelectStatement, context: &mut ExecutionContext) -> Result<crate::executor::planner::ExecutionPlan> {
         use crate::sql::ast::SelectStatement;
 
         match select {
@@ -3309,12 +3582,18 @@ impl CTEOperator {
             } => {
                 // Use the CTE-aware planner with access to materialized CTEs
                 let catalog = self.planner.catalog.clone();
+                context.log(&format!("Creating CTE-aware planner with {} materialized CTEs", self.materialized_ctes.len()));
+                for (cte_name, cte_result) in &self.materialized_ctes {
+                    context.log(&format!("  CTE '{}' has {} rows", cte_name, cte_result.rows.len()));
+                }
+
                 let planner = crate::executor::planner::QueryPlanner::with_ctes(
                     catalog,
                     self.materialized_ctes.clone()
                 );
 
                 // The planner will now automatically check for CTE references first
+                context.log("Planning main query with CTEs");
                 planner.plan_select(select)
             }
             SelectStatement::SetOperation(_) => {
@@ -3335,6 +3614,8 @@ pub struct ExecutionContext {
     pub auto_increment_counters: std::collections::HashMap<String, i64>,
     /// Outer context values for correlated subqueries (column_name -> value)
     pub outer_context_values: Option<std::collections::HashMap<String, crate::types::Value>>,
+    /// Materialized CTEs available in the current execution context
+    pub materialized_ctes: Option<std::collections::HashMap<String, QueryResult>>,
 }
 
 impl std::fmt::Debug for ExecutionContext {
@@ -3355,6 +3636,7 @@ impl ExecutionContext {
             buffer_manager: None,
             auto_increment_counters: std::collections::HashMap::new(),
             outer_context_values: None,
+            materialized_ctes: None,
         };
         // Load persistent auto-increment counters
         let _ = context.load_auto_increment_counters();
@@ -3383,6 +3665,14 @@ impl ExecutionContext {
 
     pub fn get_outer_context_values(&self) -> Option<&std::collections::HashMap<String, crate::types::Value>> {
         self.outer_context_values.as_ref()
+    }
+
+    pub fn set_materialized_ctes(&mut self, ctes: std::collections::HashMap<String, QueryResult>) {
+        self.materialized_ctes = Some(ctes);
+    }
+
+    pub fn get_materialized_ctes(&self) -> Option<&std::collections::HashMap<String, QueryResult>> {
+        self.materialized_ctes.as_ref()
     }
 
     pub fn log(&mut self, message: &str) {

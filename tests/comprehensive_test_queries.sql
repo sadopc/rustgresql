@@ -212,7 +212,6 @@ WITH RECURSIVE employee_hierarchy AS (SELECT id, name, manager_id, 0 AS level FR
 -- Query 52: CTE used multiple times
 WITH dept_budgets AS (SELECT id, name, budget FROM departments) SELECT d1.name, d1.budget, d2.budget AS comparison_budget FROM dept_budgets d1 CROSS JOIN dept_budgets d2 WHERE d1.id < d2.id;
 
-
 -- ============================================================================
 -- SECTION 7: Window Functions (8 queries)
 -- ============================================================================

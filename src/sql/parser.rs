@@ -80,6 +80,13 @@ impl Parser {
             ctes.push(self.parse_cte()?);
         }
 
+        // Set recursive flag for individual CTEs if this is a recursive WITH clause
+        if recursive {
+            for cte in &mut ctes {
+                cte.recursive = self.is_recursive_cte(&cte.query);
+            }
+        }
+
         // Parse the main SELECT statement
         let main_select = match self.peek().token_type {
             TokenType::Select => self.parse_select()?,
@@ -166,8 +173,19 @@ impl Parser {
             name,
             column_names,
             query: Box::new(query),
-            recursive: false, // Will be set to true if this is part of a recursive WITH
+            recursive: false, // Will be determined later by is_recursive_cte()
         })
+    }
+
+    /// Determine if a CTE is recursive by analyzing its query structure
+    fn is_recursive_cte(&self, query: &SelectStatement) -> bool {
+        match query {
+            SelectStatement::SetOperation(set_op) => {
+                // A CTE is recursive if it contains a UNION or UNION ALL operation
+                matches!(set_op.operator, SetOperator::Union)
+            }
+            _ => false
+        }
     }
 
     /// Parse SELECT statement (consumes SELECT token)

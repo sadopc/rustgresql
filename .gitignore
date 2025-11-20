@@ -75,3 +75,4 @@ logs/
 --file
 
 *.sql
+*.txt

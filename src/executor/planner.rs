@@ -149,7 +149,7 @@ pub enum PlanNode {
     /// CTE Scan operator for accessing materialized CTE results
     CTEScan {
         cte_name: String,
-        materialized_result: QueryResult,
+        alias: Option<String>,
     },
     /// Sort operation
     Sort {
@@ -396,10 +396,9 @@ impl PlanNode {
                 let mut cte_operator = CTEOperator::new(with_clause.clone(), *main_query.clone(), catalog.clone());
                 cte_operator.execute(context)
             }
-            PlanNode::CTEScan { cte_name, materialized_result } => {
+            PlanNode::CTEScan { cte_name, alias } => {
                 let cte_scan_operator = crate::executor::operators::CTEScanOperator::new(
-                    cte_name.clone(),
-                    materialized_result.clone()
+                    cte_name.clone()
                 );
                 cte_scan_operator.execute(context)
             }
@@ -782,7 +781,7 @@ impl QueryPlanner {
     fn extract_alias_from_plan(&self, plan: &PlanNode) -> Option<String> {
         match plan {
             PlanNode::Scan { alias, .. } => alias.clone(),
-            PlanNode::CTEScan { cte_name, .. } => Some(cte_name.clone()),
+            PlanNode::CTEScan { alias, cte_name, .. } => alias.clone().or_else(|| Some(cte_name.clone())),
             PlanNode::Join { left_alias, .. } => left_alias.clone(),
             PlanNode::Filter { input, .. } => self.extract_alias_from_plan(input),
             PlanNode::Aggregate { input, .. } => self.extract_alias_from_plan(input),
@@ -799,9 +798,10 @@ impl QueryPlanner {
         // First check if this table name refers to a materialized CTE
         if let Some(cte_result) = self.materialized_ctes.get(table_name) {
             // This is a CTE reference - create a CTEScan plan node
+            println!("DEBUG: Resolving '{}' as CTE with {} rows", table_name, cte_result.rows.len());
             return Ok(PlanNode::CTEScan {
                 cte_name: table_name.to_string(),
-                materialized_result: cte_result.clone(),
+                alias: alias.map(|a| a.clone()),
             });
         }
 
