@@ -171,6 +171,7 @@ pub enum PlanNode {
 impl PlanNode {
     /// Execute the plan node and return results
     pub fn execute(&self, context: &mut ExecutionContext) -> Result<QueryResult> {
+        println!("DEBUG: PlanNode::execute called with {:?}", std::mem::discriminant(self));
         match self {
             PlanNode::Scan { table_name, .. } => {
                 // Create TableScanner with catalog and buffer manager from context
@@ -215,6 +216,7 @@ impl PlanNode {
                 operator.execute(context)
             }
             PlanNode::Project { input, columns, .. } => {
+                println!("DEBUG: Executing Project with {} columns", columns.len());
                 let input_plan = input.as_ref().clone();
                 let operator = ProjectOperator::new(input_plan, columns.clone());
                 operator.execute(context)
@@ -344,6 +346,7 @@ impl PlanNode {
                 operator.execute(context)
             }
             PlanNode::Window { input, window_functions } => {
+                println!("DEBUG: Executing Window with {} window functions", window_functions.len());
                 let input_plan = input.as_ref().clone();
 
                 // Extract WindowFunction objects from expressions
@@ -352,7 +355,7 @@ impl PlanNode {
                 let mut order_by = Vec::new();
                 let mut window_frame = None;
 
-                for (_name, expr) in window_functions {
+                for (name, expr) in window_functions {
                     if let Expression::WindowFunction(ref wf) = expr {
                         // Take window clause from first function (simplified)
                         if window_funcs.is_empty() {
@@ -360,7 +363,7 @@ impl PlanNode {
                             order_by = wf.window_clause.order_by.clone();
                             window_frame = wf.window_clause.window_frame.clone();
                         }
-                        window_funcs.push(wf.clone());
+                        window_funcs.push((name.clone(), wf.clone()));
                     }
                 }
 
@@ -452,6 +455,7 @@ impl QueryPlanner {
 
     /// Create execution plan from SELECT statement
     pub fn plan_select(&self, select: &SelectStatement) -> Result<ExecutionPlan> {
+        println!("DEBUG: plan_select called");
         match select {
             SelectStatement::Simple {
                 distinct,
@@ -467,6 +471,7 @@ impl QueryPlanner {
                 offset,
                 ..
             } => {
+                println!("DEBUG: plan_select - Simple statement with {} columns", columns.len());
                 // Check if this is a CTE query first
                 if let Some(with_clause) = with_clause {
                     return self.plan_cte_select(with_clause, select);
@@ -517,6 +522,7 @@ impl QueryPlanner {
                 } else {
                     // Check if we have aggregation
                     let has_aggregation = !group_by.is_empty() || self.has_aggregate_functions(&columns.iter().map(|c| c.expr.clone()).collect::<Vec<_>>());
+                    println!("DEBUG: has_aggregation = {}, group_by.is_empty() = {}", has_aggregation, group_by.is_empty());
 
                     let projections: Result<Vec<(String, Expression)>> = columns
                         .iter()
@@ -571,13 +577,18 @@ impl QueryPlanner {
                     let all_projections = projections?;
 
                     // Separate window functions from regular projections
+                    println!("DEBUG: Before separation, all_projections has {} items", all_projections.len());
                     let (window_funcs, regular_projections) = self.separate_window_functions(&all_projections);
+                    println!("DEBUG: Separated {} window functions and {} regular projections", window_funcs.len(), regular_projections.len());
+                    println!("DEBUG: Window function aliases: {:?}", window_funcs.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>());
 
                     // Apply regular projections if any
                     if !regular_projections.is_empty() || window_funcs.is_empty() {
+                        let columns_to_use = if window_funcs.is_empty() { &all_projections } else { &regular_projections };
+                        println!("DEBUG: Creating Project with {} columns", columns_to_use.len());
                         plan = PlanNode::Project {
                             input: Box::new(plan),
-                            columns: if window_funcs.is_empty() { all_projections } else { regular_projections },
+                            columns: columns_to_use.clone(),
                             table_aliases: std::collections::HashMap::new(),
                             left_columns: None,
                             right_columns: None,
@@ -586,6 +597,7 @@ impl QueryPlanner {
 
                     // Apply window functions if any
                     if !window_funcs.is_empty() {
+                        println!("DEBUG: Creating Window node on top with {} window functions", window_funcs.len());
                         plan = PlanNode::Window {
                             input: Box::new(plan),
                             window_functions: window_funcs,

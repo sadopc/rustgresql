@@ -86,6 +86,20 @@ pub enum TokenType {
     Serial,
     BigSerial,
 
+    // Window function keywords
+    RowNumber,
+    Rank,
+    DenseRank,
+    Lag,
+    Lead,
+    FirstValue,
+    LastValue,
+    Ntile,
+
+    // Sort direction keywords
+    Asc,
+    Desc,
+
     // Boolean literals
     True,
     False,
@@ -232,6 +246,16 @@ impl Token {
                 | TokenType::Data
                 | TokenType::Serial
                 | TokenType::BigSerial
+                | TokenType::RowNumber
+                | TokenType::Rank
+                | TokenType::DenseRank
+                | TokenType::Lag
+                | TokenType::Lead
+                | TokenType::FirstValue
+                | TokenType::LastValue
+                | TokenType::Ntile
+                | TokenType::Asc
+                | TokenType::Desc
                 | TokenType::Procedure
                 | TokenType::Function
                 | TokenType::Language
@@ -555,6 +579,16 @@ impl Lexer {
         }
 
         let upper_identifier = identifier.to_uppercase();
+
+        // Skip whitespace to check for opening parenthesis for window functions
+        let mut temp_position = self.position;
+        while temp_position < self.input.len() && self.input[temp_position].is_whitespace() {
+            temp_position += 1;
+        }
+
+        let is_followed_by_paren = temp_position < self.input.len() &&
+            self.input[temp_position] == '(';
+
         let token_type = match upper_identifier.as_str() {
             "SELECT" => TokenType::Select,
             "INSERT" => TokenType::Insert,
@@ -637,6 +671,17 @@ impl Lexer {
             "DATA" => TokenType::Data,
             "SERIAL" => TokenType::Serial,
             "BIGSERIAL" => TokenType::BigSerial,
+            // Window functions - only tokenize as function keywords when followed by parentheses
+            "ROW_NUMBER" => if is_followed_by_paren { TokenType::RowNumber } else { TokenType::Identifier(identifier.clone()) },
+            "RANK" => if is_followed_by_paren { TokenType::Rank } else { TokenType::Identifier(identifier.clone()) },
+            "DENSE_RANK" => if is_followed_by_paren { TokenType::DenseRank } else { TokenType::Identifier(identifier.clone()) },
+            "LAG" => if is_followed_by_paren { TokenType::Lag } else { TokenType::Identifier(identifier.clone()) },
+            "LEAD" => if is_followed_by_paren { TokenType::Lead } else { TokenType::Identifier(identifier.clone()) },
+            "FIRST_VALUE" => if is_followed_by_paren { TokenType::FirstValue } else { TokenType::Identifier(identifier.clone()) },
+            "LAST_VALUE" => if is_followed_by_paren { TokenType::LastValue } else { TokenType::Identifier(identifier.clone()) },
+            "NTILE" => if is_followed_by_paren { TokenType::Ntile } else { TokenType::Identifier(identifier.clone()) },
+            "ASC" => TokenType::Asc,
+            "DESC" => TokenType::Desc,
             "TRUE" => TokenType::True,
             "FALSE" => TokenType::False,
             // Stored procedure and control flow keywords

@@ -279,4 +279,102 @@ mod tests {
             assert!(result.is_ok(), "Failed to parse edge case '{}': {:?}", case, result.err());
         }
     }
+
+    #[test]
+    fn test_window_function_frame_edge_cases() {
+        let edge_cases = vec![
+            // Complex numeric bounds with BETWEEN (the main focus of the fix)
+            "SELECT SUM(salary) OVER (ORDER BY hire_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM employees",
+            "SELECT SUM(salary) OVER (ORDER BY hire_date ROWS BETWEEN CURRENT ROW AND 3 FOLLOWING) FROM employees",
+            "SELECT SUM(salary) OVER (ORDER BY hire_date ROWS BETWEEN 1 PRECEDING AND 5 FOLLOWING) FROM employees",
+
+            // Numeric bounds with larger values
+            "SELECT SUM(salary) OVER (ORDER BY hire_date ROWS BETWEEN 10 PRECEDING AND 10 FOLLOWING) FROM employees",
+            "SELECT SUM(salary) OVER (ORDER BY hire_date ROWS BETWEEN 100 PRECEDING AND CURRENT ROW) FROM employees",
+
+            // Mixed numeric and unbounded bounds
+            "SELECT SUM(salary) OVER (ORDER BY hire_date ROWS BETWEEN UNBOUNDED PRECEDING AND 2 FOLLOWING) FROM employees",
+            "SELECT SUM(salary) OVER (ORDER BY hire_date ROWS BETWEEN 3 PRECEDING AND UNBOUNDED FOLLOWING) FROM employees",
+
+            // Range frames (should parse correctly even if execution isn't fully implemented)
+            "SELECT SUM(salary) OVER (ORDER BY salary RANGE BETWEEN 100 PRECEDING AND CURRENT ROW) FROM employees",
+            "SELECT SUM(salary) OVER (ORDER BY salary RANGE BETWEEN CURRENT ROW AND 200 FOLLOWING) FROM employees",
+
+            // Multiple window functions with different frames in same query
+            "SELECT
+                SUM(salary) OVER (ORDER BY hire_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as recent_avg,
+                SUM(salary) OVER (ORDER BY hire_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as total_avg,
+                name,
+                salary,
+                hire_date
+             FROM employees",
+
+            // Original failing query variants
+            "SELECT AVG(salary) OVER (ORDER BY hire_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM employees",
+            "SELECT SUM(salary) OVER (ORDER BY salary DESC ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM employees",
+            "SELECT COUNT(*) OVER (ORDER BY id ROWS BETWEEN 3 PRECEDING AND UNBOUNDED FOLLOWING) FROM employees",
+        ];
+
+        for case in edge_cases {
+            let mut lexer = Lexer::new(case);
+            let tokens = lexer.tokenize().unwrap();
+
+            let mut parser = Parser::new(tokens);
+            let result = parser.parse();
+
+            assert!(result.is_ok(), "Failed to parse frame edge case '{}': {:?}", case, result.err());
+        }
+    }
+
+    #[test]
+    fn test_original_failing_query() {
+        // This test specifically verifies the fix for the original issue reported
+        let sql = "SELECT name, salary, hire_date, AVG(salary) OVER (ORDER BY hire_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS moving_avg FROM employees";
+
+        let mut lexer = Lexer::new(sql);
+        let tokens = lexer.tokenize().unwrap();
+
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+
+        assert!(result.is_ok(), "Failed to parse original failing query: {:?}", result.err());
+
+        // Verify the AST structure is correct
+        let ast = result.unwrap();
+        if let Some(select_statement) = ast.body.iter().find_map(|stmt| {
+            match stmt {
+                crate::sql::ast::Statement::Select(select) => Some(select),
+                _ => None,
+            }
+        }) {
+            // Verify we have a window function
+            let has_window_function = select_statement.columns.iter().any(|col| {
+                match col {
+                    crate::sql::ast::SelectItem::Expression(expr, _) => {
+                        contains_window_function(expr)
+                    }
+                    _ => false,
+                }
+            });
+
+            assert!(has_window_function, "AST should contain a window function");
+        }
+    }
+
+    // Helper function to check if an expression contains a window function
+    fn contains_window_function(expr: &crate::sql::ast::Expression) -> bool {
+        match expr {
+            crate::sql::ast::Expression::Function { window_clause: Some(_), .. } => true,
+            crate::sql::ast::Expression::Function { args, .. } => {
+                args.iter().any(|arg| contains_window_function(arg))
+            }
+            crate::sql::ast::Expression::BinaryOp { left, right, .. } => {
+                contains_window_function(left) || contains_window_function(right)
+            }
+            crate::sql::ast::Expression::UnaryOp { expr, .. } => {
+                contains_window_function(expr)
+            }
+            _ => false,
+        }
+    }
 }

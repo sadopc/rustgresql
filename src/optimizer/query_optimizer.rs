@@ -171,13 +171,29 @@ impl OptimizedQueryPlanner {
                             })
                             .collect();
 
-                        plan = PlanNode::Project {
-                            input: Box::new(plan),
-                            columns: projections,
-                            table_aliases: std::collections::HashMap::new(),
-                            left_columns: None,
-                            right_columns: None,
-                        };
+                        // Separate window functions from regular projections
+                        let (window_funcs, regular_projections): (Vec<_>, Vec<_>) = projections
+                            .into_iter()
+                            .partition(|(_name, expr)| matches!(expr, Expression::WindowFunction(_)));
+
+                        // Apply regular projections if any
+                        if !regular_projections.is_empty() || window_funcs.is_empty() {
+                            plan = PlanNode::Project {
+                                input: Box::new(plan),
+                                columns: if window_funcs.is_empty() { regular_projections.clone() } else { regular_projections },
+                                table_aliases: std::collections::HashMap::new(),
+                                left_columns: None,
+                                right_columns: None,
+                            };
+                        }
+
+                        // Apply window functions if any
+                        if !window_funcs.is_empty() {
+                            plan = PlanNode::Window {
+                                input: Box::new(plan),
+                                window_functions: window_funcs,
+                            };
+                        }
                 }
 
 

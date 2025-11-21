@@ -1251,9 +1251,9 @@ impl Parser {
     /// Parse ORDER BY expression
     fn parse_order_by(&mut self) -> Result<OrderBy> {
         let expr = self.parse_expression()?;
-        let direction = if self.match_identifier_token("ASC")? {
+        let direction = if self.match_token(TokenType::Asc) || self.match_identifier_token("ASC")? {
             SortDirection::Asc
-        } else if self.match_identifier_token("DESC")? {
+        } else if self.match_token(TokenType::Desc) || self.match_identifier_token("DESC")? {
             SortDirection::Desc
         } else {
             SortDirection::Asc // Default
@@ -1506,6 +1506,50 @@ impl Parser {
                     })
                 }
             }
+            TokenType::RowNumber | TokenType::Rank | TokenType::DenseRank |
+            TokenType::Lag | TokenType::Lead | TokenType::FirstValue | TokenType::LastValue | TokenType::Ntile => {
+                let name = match self.peek().token_type {
+                    TokenType::RowNumber => "ROW_NUMBER",
+                    TokenType::Rank => "RANK",
+                    TokenType::DenseRank => "DENSE_RANK",
+                    TokenType::Lag => "LAG",
+                    TokenType::Lead => "LEAD",
+                    TokenType::FirstValue => "FIRST_VALUE",
+                    TokenType::LastValue => "LAST_VALUE",
+                    TokenType::Ntile => "NTILE",
+                    _ => unreachable!(),
+                }.to_string();
+                self.advance();
+
+                if self.match_token(TokenType::LeftParen) {
+                    let mut args = Vec::new();
+                    if !self.match_token(TokenType::RightParen) {
+                        args.push(self.parse_expression()?);
+                        while self.match_token(TokenType::Comma) {
+                            args.push(self.parse_expression()?);
+                        }
+                        self.consume_token(TokenType::RightParen, "Expected ')' after function arguments")?;
+                    }
+
+                    // Check if this is a window function (has OVER clause)
+                    if self.match_token(TokenType::Over) {
+                        let window_clause = self.parse_window_clause()?;
+                        Ok(Expression::WindowFunction(WindowFunction {
+                            name,
+                            args,
+                            window_clause,
+                            window_name: None,
+                        }))
+                    } else {
+                        Ok(Expression::Function { name, args, distinct: false })
+                    }
+                } else {
+                    Ok(Expression::Column {
+                        table: None,
+                        name,
+                    })
+                }
+            }
             TokenType::Asterisk => {
                 self.advance();
                 Ok(Expression::Star)
@@ -1578,11 +1622,23 @@ impl Parser {
                         }
                         self.consume_token(TokenType::RightParen, "Expected ')' after function arguments")?;
                     }
-                    Ok(Expression::Function {
-                        name: function_name.to_string(),
-                        args,
-                        distinct,
-                    })
+
+                    // Check if this is a window function (has OVER clause)
+                    if self.match_token(TokenType::Over) {
+                        let window_clause = self.parse_window_clause()?;
+                        Ok(Expression::WindowFunction(WindowFunction {
+                            name: function_name.to_string(),
+                            args,
+                            window_clause,
+                            window_name: None,
+                        }))
+                    } else {
+                        Ok(Expression::Function {
+                            name: function_name.to_string(),
+                            args,
+                            distinct,
+                        })
+                    }
                 } else {
                     // Function without parentheses, default to star for COUNT
                     Ok(Expression::Function {
@@ -1808,39 +1864,27 @@ impl Parser {
             }
             Ok(WindowFrameBound::CurrentRow)
         } else if self.match_token(TokenType::Unbounded) {
-            // Check for PRECEDING or FOLLOWING identifier
-            match &self.peek().token_type {
-                TokenType::Identifier(id) if id.to_uppercase() == "PRECEDING" => {
-                    self.advance();
-                    Ok(WindowFrameBound::UnboundedPreceding)
-                }
-                TokenType::Identifier(id) if id.to_uppercase() == "FOLLOWING" => {
-                    self.advance();
-                    Ok(WindowFrameBound::UnboundedFollowing)
-                }
-                _ => {
-                    Err(crate::error::RustgreSQLError::Parse(
-                        "Expected PRECEDING or FOLLOWING after UNBOUNDED".to_string(),
-                    ))
-                }
+            // Check for PRECEDING or FOLLOWING token
+            if self.match_token(TokenType::Preceding) {
+                Ok(WindowFrameBound::UnboundedPreceding)
+            } else if self.match_token(TokenType::Following) {
+                Ok(WindowFrameBound::UnboundedFollowing)
+            } else {
+                Err(crate::error::RustgreSQLError::Parse(
+                    "Expected PRECEDING or FOLLOWING after UNBOUNDED".to_string(),
+                ))
             }
         } else {
             // Expression bound: N PRECEDING or N FOLLOWING
             let expr = self.parse_expression()?;
-            match &self.peek().token_type {
-                TokenType::Identifier(id) if id.to_uppercase() == "PRECEDING" => {
-                    self.advance();
-                    Ok(WindowFrameBound::Preceding(Box::new(expr)))
-                }
-                TokenType::Identifier(id) if id.to_uppercase() == "FOLLOWING" => {
-                    self.advance();
-                    Ok(WindowFrameBound::Following(Box::new(expr)))
-                }
-                _ => {
-                    Err(crate::error::RustgreSQLError::Parse(
-                        "Expected PRECEDING or FOLLOWING after expression".to_string(),
-                    ))
-                }
+            if self.match_token(TokenType::Preceding) {
+                Ok(WindowFrameBound::Preceding(Box::new(expr)))
+            } else if self.match_token(TokenType::Following) {
+                Ok(WindowFrameBound::Following(Box::new(expr)))
+            } else {
+                Err(crate::error::RustgreSQLError::Parse(
+                    "Expected PRECEDING or FOLLOWING after expression".to_string(),
+                ))
             }
         }
     }

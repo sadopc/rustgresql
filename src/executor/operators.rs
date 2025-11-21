@@ -2025,7 +2025,7 @@ impl AggregateOperator {
                 .map(|(alias, _)| alias.clone())
                 .collect();
 
-            // Add window function column names
+              // Add window function column names
             for (alias, _) in &self.window_functions {
                 output_column_names.push(alias.clone());
             }
@@ -2041,9 +2041,28 @@ impl AggregateOperator {
                     row_values.push(value);
                 }
 
-                // Window functions on empty input - return NULL
-                for _ in &self.window_functions {
-                    row_values.push(Value { kind: ValueKind::Null(crate::types::NullValue) });
+              // Apply window functions if present (for empty input case)
+                if !self.window_functions.is_empty() {
+                    // Create a QueryResult with the aggregate values to pass to WindowOperator
+                    let aggregate_result = QueryResult {
+                        rows: vec![row_values],
+                        column_names: output_column_names,
+                    };
+
+                    // Create a window operator to apply window functions on the aggregate result
+                    let window_op = WindowOperator {
+                        input: Box::new(PlanNode::Values {
+                            rows: aggregate_result.rows.clone(),
+                            column_names: aggregate_result.column_names.clone(),
+                        }),
+                        window_functions: self.window_functions.iter().map(|(alias, wf)| (alias.clone(), wf.clone())).collect(),
+                        partition_by: Vec::new(), // Window functions specify their own partitioning
+                        order_by: Vec::new(),      // Window functions specify their own ordering
+                        window_frame: None,
+                        scanner: None,
+                    };
+
+                    return window_op.execute(context);
                 }
 
                 return Ok(QueryResult {
@@ -2288,7 +2307,7 @@ impl AggregateOperator {
                     rows: aggregated_result.rows.clone(),
                     column_names: aggregated_result.column_names.clone(),
                 }),
-                window_functions: self.window_functions.iter().map(|(_, wf)| wf.clone()).collect(),
+                window_functions: self.window_functions.iter().map(|(alias, wf)| (alias.clone(), wf.clone())).collect(),
                 partition_by: Vec::new(), // Window functions specify their own partitioning
                 order_by: Vec::new(),      // Window functions specify their own ordering
                 window_frame: None,
@@ -2667,7 +2686,7 @@ impl SubqueryOperator {
 #[derive(Debug)]
 pub struct WindowOperator {
     pub input: Box<PlanNode>,
-    pub window_functions: Vec<crate::sql::ast::WindowFunction>,
+    pub window_functions: Vec<(String, crate::sql::ast::WindowFunction)>,
     pub partition_by: Vec<Expression>,
     pub order_by: Vec<crate::sql::ast::OrderBy>,
     pub window_frame: Option<crate::sql::ast::WindowFrame>,
@@ -2682,6 +2701,7 @@ pub enum WindowFunctionState {
     DenseRank { current_rank: usize, prev_values: Option<Vec<Value>> },
     Lag { buffer: VecDeque<Value> },
     Lead { buffer: VecDeque<Value> },
+    Aggregate(AggregateState),
 }
 
 use std::collections::VecDeque;
@@ -2689,7 +2709,7 @@ use std::collections::VecDeque;
 impl WindowOperator {
     pub fn new(
         input: PlanNode,
-        window_functions: Vec<crate::sql::ast::WindowFunction>,
+        window_functions: Vec<(String, crate::sql::ast::WindowFunction)>,
         partition_by: Vec<Expression>,
         order_by: Vec<crate::sql::ast::OrderBy>,
         window_frame: Option<crate::sql::ast::WindowFrame>,
@@ -2706,6 +2726,7 @@ impl WindowOperator {
 
     pub fn execute(&self, context: &mut ExecutionContext) -> Result<QueryResult> {
         context.log("Executing WindowOperator");
+        println!("DEBUG: WindowOperator executing with {} window functions", self.window_functions.len());
 
         // Execute input to get source data
         let input_result = self.input.execute(context)?;
@@ -2845,8 +2866,8 @@ impl WindowOperator {
 
         // Prepare result column names
         let mut result_column_names = input_column_names.to_vec();
-        for (i, window_func) in self.window_functions.iter().enumerate() {
-            result_column_names.push(format!("window_{}", i)); // Use function name in real implementation
+        for (alias, _window_func) in self.window_functions.iter() {
+            result_column_names.push(alias.clone());
         }
 
         for partition in partitions {
@@ -2854,7 +2875,7 @@ impl WindowOperator {
             let mut window_states: Vec<WindowFunctionState> = self.window_functions
                 .iter()
                 .enumerate()
-                .map(|(i, window_func)| self.initialize_window_function(i, window_func))
+                .map(|(i, (_alias, window_func))| self.initialize_window_function(i, window_func))
                 .collect();
 
             // Process each row in the partition
@@ -2862,7 +2883,7 @@ impl WindowOperator {
                 let mut result_row = row.clone();
 
                 // Evaluate each window function for this row
-                for (func_index, window_func) in self.window_functions.iter().enumerate() {
+                for (func_index, (_alias, window_func)) in self.window_functions.iter().enumerate() {
                     let context = self.create_sorting_context(row, input_column_names);
                     let window_value = self.evaluate_window_function(
                         func_index,
@@ -2872,6 +2893,7 @@ impl WindowOperator {
                         &mut window_states[func_index],
                         &evaluator,
                         &context,
+                        input_column_names,
                     )?;
                     result_row.push(window_value);
                 }
@@ -2891,6 +2913,11 @@ impl WindowOperator {
             "DENSE_RANK" => WindowFunctionState::DenseRank { current_rank: 0, prev_values: None },
             "LAG" => WindowFunctionState::Lag { buffer: VecDeque::new() },
             "LEAD" => WindowFunctionState::Lead { buffer: VecDeque::new() },
+            "COUNT" => WindowFunctionState::Aggregate(AggregateState::new_count(false)),
+            "SUM" => WindowFunctionState::Aggregate(AggregateState::new_sum(false)),
+            "AVG" => WindowFunctionState::Aggregate(AggregateState::new_avg(false)),
+            "MIN" => WindowFunctionState::Aggregate(AggregateState::new_min()),
+            "MAX" => WindowFunctionState::Aggregate(AggregateState::new_max()),
             _ => WindowFunctionState::RowNumber { count: 0 }, // Default to ROW_NUMBER for unknown functions
         }
     }
@@ -2905,6 +2932,7 @@ impl WindowOperator {
         state: &mut WindowFunctionState,
         evaluator: &ExpressionEvaluator,
         context: &EvaluationContext,
+        input_column_names: &[String],
     ) -> Result<Value> {
         match window_func.name.to_uppercase().as_str() {
             "ROW_NUMBER" => {
@@ -2964,31 +2992,140 @@ impl WindowOperator {
                 }
             }
             "LAG" => {
-                if window_func.args.len() != 1 {
-                    return Err(crate::error::RustgreSQLError::InvalidOperation("LAG function requires exactly one argument".to_string()));
+                // LAG can have 1-2 arguments: LAG(expr) or LAG(expr, offset)
+                if window_func.args.len() < 1 || window_func.args.len() > 2 {
+                    return Err(crate::error::RustgreSQLError::InvalidOperation("LAG function requires 1 or 2 arguments".to_string()));
                 }
 
-                if current_row_index == 0 {
-                    // First row, no previous value
-                    Ok(Value { kind: ValueKind::Null(crate::types::NullValue) })
+                // Get offset (default to 1 if not specified)
+                let offset = if window_func.args.len() == 2 {
+                    match evaluator.evaluate(&window_func.args[1], context)? {
+                        Value { kind: ValueKind::Integer(offset) } => {
+                            if offset <= 0 {
+                                return Err(crate::error::RustgreSQLError::InvalidOperation("LAG offset must be positive".to_string()));
+                            }
+                            offset as usize
+                        }
+                        _ => {
+                            return Err(crate::error::RustgreSQLError::InvalidOperation("LAG offset must be an integer".to_string()));
+                        }
+                    }
                 } else {
-                    // Return value from previous row
-                    let arg_value = evaluator.evaluate(&window_func.args[0], context)?;
-                    Ok(arg_value)
+                    1
+                };
+
+                // Access the buffer mutably to read and add values
+                if let WindowFunctionState::Lag { buffer } = state {
+                    // Retrieve value based on offset BEFORE adding current value
+                    let result = if current_row_index < offset {
+                        // Not enough previous rows
+                        Ok(Value { kind: ValueKind::Null(crate::types::NullValue) })
+                    } else {
+                        // Look back 'offset' rows: buffer[0] is row 0, buffer[1] is row 1, etc.
+                        // buffer[current_row_index - offset] gives us the value from 'offset' rows back
+                        let target_index = current_row_index - offset;
+                        if let Some(target_value) = buffer.iter().nth(target_index) {
+                            Ok(target_value.clone())
+                        } else {
+                            Ok(Value { kind: ValueKind::Null(crate::types::NullValue) })
+                        }
+                    };
+
+                    // Evaluate the expression for the current row AFTER reading from buffer
+                    let current_value = evaluator.evaluate(&window_func.args[0], context)?;
+
+                    // Add current value to the buffer for future LAG calls
+                    buffer.push_back(current_value);
+
+                    result
+                } else {
+                    Err(crate::error::RustgreSQLError::InvalidOperation("Invalid window function state for LAG".to_string()))
                 }
             }
             "LEAD" => {
-                if window_func.args.len() != 1 {
-                    return Err(crate::error::RustgreSQLError::InvalidOperation("LEAD function requires exactly one argument".to_string()));
+                // LEAD can have 1-2 arguments: LEAD(expr) or LEAD(expr, offset)
+                if window_func.args.len() < 1 || window_func.args.len() > 2 {
+                    return Err(crate::error::RustgreSQLError::InvalidOperation("LEAD function requires 1 or 2 arguments".to_string()));
                 }
 
-                if current_row_index >= partition.len() - 1 {
-                    // Last row, no next value
+                // Get offset (default to 1 if not specified)
+                let offset = if window_func.args.len() == 2 {
+                    match evaluator.evaluate(&window_func.args[1], context)? {
+                        Value { kind: ValueKind::Integer(offset) } => {
+                            if offset <= 0 {
+                                return Err(crate::error::RustgreSQLError::InvalidOperation("LEAD offset must be positive".to_string()));
+                            }
+                            offset as usize
+                        }
+                        _ => {
+                            return Err(crate::error::RustgreSQLError::InvalidOperation("LEAD offset must be an integer".to_string()));
+                        }
+                    }
+                } else {
+                    1
+                };
+
+                // For LEAD, we can look forward in the partition directly
+                // since we have all rows in the partition
+                let target_row_index = current_row_index + offset;
+
+                if target_row_index >= partition.len() {
+                    // Beyond the end of partition
                     Ok(Value { kind: ValueKind::Null(crate::types::NullValue) })
                 } else {
-                    // Return value from next row
-                    let arg_value = evaluator.evaluate(&window_func.args[0], context)?;
-                    Ok(arg_value)
+                    // Evaluate the expression for the target (future) row
+                    let target_row = &partition[target_row_index];
+                    let target_context = self.create_sorting_context(target_row, input_column_names);
+                    let target_value = evaluator.evaluate(&window_func.args[0], &target_context)?;
+                    Ok(target_value)
+                }
+            }
+            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" => {
+                if let WindowFunctionState::Aggregate(agg_state) = state {
+                    // For aggregate window functions, compute the aggregate over the window frame
+                    // Create a fresh aggregate state for each row to compute frame-specific results
+                    let mut frame_agg_state = self.create_fresh_aggregate_state(&window_func.name)?;
+
+                    // Calculate frame boundaries for current row
+                    let (frame_start, frame_end) = self.calculate_frame_boundaries(
+                        partition.len(),
+                        current_row_index,
+                        window_func,
+                    )?;
+
+                    // Iterate through rows in the frame and update the aggregate state
+                    for frame_row_index in frame_start..=frame_end {
+                        if frame_row_index < partition.len() {
+                            let row = &partition[frame_row_index];
+
+                            // Create context for this row
+                            let mut row_context = EvaluationContext::new();
+                            for (i, column_name) in input_column_names.iter().enumerate() {
+                                if i < row.len() {
+                                    row_context.columns.insert(column_name.clone(), row[i].clone());
+                                }
+                            }
+
+                            // Evaluate the aggregate argument for this row
+                            let arg_value = if window_func.args.is_empty() {
+                                // COUNT(*) case
+                                Value { kind: ValueKind::Integer(1) }
+                            } else if matches!(&window_func.args[0], Expression::Star) {
+                                // COUNT(*) case
+                                Value { kind: ValueKind::Integer(1) }
+                            } else {
+                                evaluator.evaluate(&window_func.args[0], &row_context)?
+                            };
+
+                            // Update the frame aggregate state
+                            frame_agg_state.update(&arg_value)?;
+                        }
+                    }
+
+                    // Return the frame-specific aggregate result
+                    frame_agg_state.result()
+                } else {
+                    Err(crate::error::RustgreSQLError::InvalidOperation("Invalid window function state for aggregate".to_string()))
                 }
             }
             _ => {
@@ -3033,6 +3170,130 @@ impl WindowOperator {
         }
 
         true
+    }
+
+    /// Create a fresh aggregate state for the specified window function
+    fn create_fresh_aggregate_state(&self, func_name: &str) -> Result<AggregateState> {
+        match func_name.to_uppercase().as_str() {
+            "COUNT" => Ok(AggregateState::new_count(false)),
+            "SUM" => Ok(AggregateState::new_sum(false)),
+            "AVG" => Ok(AggregateState::new_avg(false)),
+            "MIN" => Ok(AggregateState::new_min()),
+            "MAX" => Ok(AggregateState::new_max()),
+            _ => Err(crate::error::RustgreSQLError::InvalidOperation(
+                format!("Unknown aggregate function for window: {}", func_name)
+            ))
+        }
+    }
+
+    /// Calculate frame boundaries for a given row and window frame specification
+    fn calculate_frame_boundaries(
+        &self,
+        partition_size: usize,
+        current_row_index: usize,
+        window_func: &crate::sql::ast::WindowFunction,
+    ) -> Result<(usize, usize)> {
+        let mut frame_start = 0;
+        let mut frame_end = current_row_index;
+
+        // If no window frame is specified, default to RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        if let Some(ref frame) = window_func.window_clause.window_frame {
+            match frame.mode {
+                crate::sql::ast::WindowFrameMode::Rows => {
+                    // For ROWS mode, we use row indices
+                    frame_start = match frame.start {
+                        crate::sql::ast::WindowFrameBound::CurrentRow => current_row_index,
+                        crate::sql::ast::WindowFrameBound::UnboundedPreceding => 0,
+                        crate::sql::ast::WindowFrameBound::UnboundedFollowing => {
+                            return Err(crate::error::RustgreSQLError::InvalidOperation(
+                                "Unbounded following not supported as frame start".to_string()
+                            ));
+                        }
+                        crate::sql::ast::WindowFrameBound::Preceding(ref expr) => {
+                            // Calculate rows to go back
+                            if let Ok(Value { kind: crate::types::ValueKind::Integer(n) }) =
+                                self.evaluate_constant_expression(expr) {
+                                let preceding_rows = n as usize;
+                                if current_row_index >= preceding_rows {
+                                    current_row_index - preceding_rows
+                                } else {
+                                    0
+                                }
+                            } else {
+                                return Err(crate::error::RustgreSQLError::InvalidOperation(
+                                    "Only constant integer expressions supported for frame bounds".to_string()
+                                ));
+                            }
+                        }
+                        crate::sql::ast::WindowFrameBound::Following(ref expr) => {
+                            return Err(crate::error::RustgreSQLError::InvalidOperation(
+                                "Following not supported as frame start".to_string()
+                            ));
+                        }
+                    };
+
+                    frame_end = match frame.end {
+                        Some(crate::sql::ast::WindowFrameBound::CurrentRow) => current_row_index,
+                        Some(crate::sql::ast::WindowFrameBound::UnboundedPreceding) => {
+                            return Err(crate::error::RustgreSQLError::InvalidOperation(
+                                "Unbounded preceding not supported as frame end".to_string()
+                            ));
+                        }
+                        Some(crate::sql::ast::WindowFrameBound::UnboundedFollowing) => partition_size - 1,
+                        Some(crate::sql::ast::WindowFrameBound::Preceding(ref expr)) => {
+                            if let Ok(Value { kind: crate::types::ValueKind::Integer(n) }) =
+                                self.evaluate_constant_expression(expr) {
+                                let preceding_rows = n as usize;
+                                if current_row_index >= preceding_rows {
+                                    current_row_index - preceding_rows
+                                } else {
+                                    0
+                                }
+                            } else {
+                                return Err(crate::error::RustgreSQLError::InvalidOperation(
+                                    "Only constant integer expressions supported for frame bounds".to_string()
+                                ));
+                            }
+                        }
+                        Some(crate::sql::ast::WindowFrameBound::Following(ref expr)) => {
+                            if let Ok(Value { kind: crate::types::ValueKind::Integer(n) }) =
+                                self.evaluate_constant_expression(expr) {
+                                let following_rows = n as usize;
+                                std::cmp::min(current_row_index + following_rows, partition_size - 1)
+                            } else {
+                                return Err(crate::error::RustgreSQLError::InvalidOperation(
+                                    "Only constant integer expressions supported for frame bounds".to_string()
+                                ));
+                            }
+                        }
+                        None => current_row_index,
+                    };
+                }
+                crate::sql::ast::WindowFrameMode::Range => {
+                    // For RANGE mode, we'd need to group by ORDER BY values
+                    // This is more complex and we'll start with ROWS mode support
+                    return Err(crate::error::RustgreSQLError::InvalidOperation(
+                        "RANGE mode not yet implemented for window frames".to_string()
+                    ));
+                }
+            }
+        }
+
+        // Ensure frame boundaries are within partition bounds
+        frame_start = std::cmp::max(frame_start, 0);
+        frame_end = std::cmp::min(frame_end, partition_size - 1);
+
+        Ok((frame_start, frame_end))
+    }
+
+    /// Evaluate a constant expression (used for frame bounds)
+    fn evaluate_constant_expression(&self, expr: &crate::sql::ast::Expression) -> Result<Value> {
+        match expr {
+            crate::sql::ast::Expression::Value(value) => Ok(value.clone()),
+            _ => Err(crate::error::RustgreSQLError::InvalidOperation(
+                "Only constant values supported for frame bounds".to_string()
+            ))
+        }
     }
 }
 
