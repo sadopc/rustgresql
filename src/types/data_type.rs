@@ -206,90 +206,106 @@ pub fn parse_data_type(sql_type: &str) -> Result<DataType> {
     let binding = sql_type.to_lowercase();
     let lower_type = binding.trim();
 
-    match lower_type {
-        "smallint" | "int2" => Ok(DataType::new(DataTypeKind::SmallInt)),
-        "integer" | "int" | "int4" => Ok(DataType::new(DataTypeKind::Integer)),
-        "bigint" | "int8" => Ok(DataType::new(DataTypeKind::BigInt)),
-        "real" | "float4" => Ok(DataType::new(DataTypeKind::Real)),
-        "double precision" | "float8" => Ok(DataType::new(DataTypeKind::DoublePrecision)),
-        "boolean" | "bool" => Ok(DataType::new(DataTypeKind::Boolean)),
-        "text" => Ok(DataType::new(DataTypeKind::Text)),
-        "bytea" => Ok(DataType::new(DataTypeKind::Bytea)),
-        "date" => Ok(DataType::new(DataTypeKind::Date)),
-        "time" => Ok(DataType::new(DataTypeKind::Time)),
-        "time with time zone" | "timetz" => Ok(DataType::new(DataTypeKind::TimeWithTimeZone)),
-        "timestamp" => Ok(DataType::new(DataTypeKind::Timestamp)),
-        "timestamp with time zone" | "timestamptz" => Ok(DataType::new(DataTypeKind::TimestampWithTimeZone)),
-        "interval" => Ok(DataType::new(DataTypeKind::Interval)),
-        "uuid" => Ok(DataType::new(DataTypeKind::Uuid)),
-        "json" => Ok(DataType::new(DataTypeKind::Json)),
-        "jsonb" => Ok(DataType::new(DataTypeKind::JsonB)),
-        "serial" => Ok(DataType::new(DataTypeKind::Serial)),
-        "bigserial" => Ok(DataType::new(DataTypeKind::BigSerial)),
-        "inet" => Ok(DataType::new(DataTypeKind::Inet)),
-        "cidr" => Ok(DataType::new(DataTypeKind::Cidr)),
-        "macaddr" => Ok(DataType::new(DataTypeKind::MacAddr)),
-        "macaddr8" => Ok(DataType::new(DataTypeKind::MacAddr8)),
+    // Check for array suffix (e.g., "integer[]", "text[]")
+    let is_array = lower_type.ends_with("[]");
+    let base_type_str = if is_array {
+        &lower_type[..lower_type.len() - 2]
+    } else {
+        lower_type
+    };
+
+    // Parse the base type
+    let base_type = match base_type_str {
+        "smallint" | "int2" => DataType::new(DataTypeKind::SmallInt),
+        "integer" | "int" | "int4" => DataType::new(DataTypeKind::Integer),
+        "bigint" | "int8" => DataType::new(DataTypeKind::BigInt),
+        "real" | "float4" => DataType::new(DataTypeKind::Real),
+        "double precision" | "float8" => DataType::new(DataTypeKind::DoublePrecision),
+        "boolean" | "bool" => DataType::new(DataTypeKind::Boolean),
+        "text" => DataType::new(DataTypeKind::Text),
+        "bytea" => DataType::new(DataTypeKind::Bytea),
+        "date" => DataType::new(DataTypeKind::Date),
+        "time" => DataType::new(DataTypeKind::Time),
+        "time with time zone" | "timetz" => DataType::new(DataTypeKind::TimeWithTimeZone),
+        "timestamp" => DataType::new(DataTypeKind::Timestamp),
+        "timestamp with time zone" | "timestamptz" => DataType::new(DataTypeKind::TimestampWithTimeZone),
+        "interval" => DataType::new(DataTypeKind::Interval),
+        "uuid" => DataType::new(DataTypeKind::Uuid),
+        "json" => DataType::new(DataTypeKind::Json),
+        "jsonb" => DataType::new(DataTypeKind::JsonB),
+        "serial" => DataType::new(DataTypeKind::Serial),
+        "bigserial" => DataType::new(DataTypeKind::BigSerial),
+        "inet" => DataType::new(DataTypeKind::Inet),
+        "cidr" => DataType::new(DataTypeKind::Cidr),
+        "macaddr" => DataType::new(DataTypeKind::MacAddr),
+        "macaddr8" => DataType::new(DataTypeKind::MacAddr8),
 
         // Types with parameters
-        _ if lower_type.starts_with("varchar(") => {
-            if let Some(start) = lower_type.find('(') {
-                if let Some(end) = lower_type.find(')') {
-                    let len_str = &lower_type[start+1..end];
+        _ if base_type_str.starts_with("varchar(") => {
+            if let Some(start) = base_type_str.find('(') {
+                if let Some(end) = base_type_str.find(')') {
+                    let len_str = &base_type_str[start+1..end];
                     if let Ok(len) = len_str.parse::<usize>() {
-                        Ok(DataType::new(DataTypeKind::Varchar(len)))
+                        DataType::new(DataTypeKind::Varchar(len))
                     } else {
-                        Err(crate::error::RustgreSQLError::Parse(format!("Invalid varchar length: {}", len_str)))
+                        return Err(crate::error::RustgreSQLError::Parse(format!("Invalid varchar length: {}", len_str)));
                     }
                 } else {
-                    Err(crate::error::RustgreSQLError::Parse("Unclosed varchar parenthesis".to_string()))
+                    return Err(crate::error::RustgreSQLError::Parse("Unclosed varchar parenthesis".to_string()));
                 }
             } else {
-                Err(crate::error::RustgreSQLError::Parse("Invalid varchar syntax".to_string()))
+                return Err(crate::error::RustgreSQLError::Parse("Invalid varchar syntax".to_string()));
             }
         }
 
-        _ if lower_type.starts_with("char(") => {
-            if let Some(start) = lower_type.find('(') {
-                if let Some(end) = lower_type.find(')') {
-                    let len_str = &lower_type[start+1..end];
+        _ if base_type_str.starts_with("char(") => {
+            if let Some(start) = base_type_str.find('(') {
+                if let Some(end) = base_type_str.find(')') {
+                    let len_str = &base_type_str[start+1..end];
                     if let Ok(len) = len_str.parse::<usize>() {
-                        Ok(DataType::new(DataTypeKind::Char(len)))
+                        DataType::new(DataTypeKind::Char(len))
                     } else {
-                        Err(crate::error::RustgreSQLError::Parse(format!("Invalid char length: {}", len_str)))
+                        return Err(crate::error::RustgreSQLError::Parse(format!("Invalid char length: {}", len_str)));
                     }
                 } else {
-                    Err(crate::error::RustgreSQLError::Parse("Unclosed char parenthesis".to_string()))
+                    return Err(crate::error::RustgreSQLError::Parse("Unclosed char parenthesis".to_string()));
                 }
             } else {
-                Err(crate::error::RustgreSQLError::Parse("Invalid char syntax".to_string()))
+                return Err(crate::error::RustgreSQLError::Parse("Invalid char syntax".to_string()));
             }
         }
 
-        _ if lower_type.starts_with("numeric(") => {
+        _ if base_type_str.starts_with("numeric(") => {
             // Parse numeric(precision, scale)
-            if let Some(start) = lower_type.find('(') {
-                if let Some(end) = lower_type.find(')') {
-                    let params = &lower_type[start+1..end];
+            if let Some(start) = base_type_str.find('(') {
+                if let Some(end) = base_type_str.find(')') {
+                    let params = &base_type_str[start+1..end];
                     let parts: Vec<&str> = params.split(',').collect();
                     if parts.len() == 2 {
                         if let (Ok(precision), Ok(scale)) = (parts[0].trim().parse::<usize>(), parts[1].trim().parse::<usize>()) {
-                            Ok(DataType::new(DataTypeKind::Numeric(precision, scale)))
+                            DataType::new(DataTypeKind::Numeric(precision, scale))
                         } else {
-                            Err(crate::error::RustgreSQLError::Parse(format!("Invalid numeric parameters: {}", params)))
+                            return Err(crate::error::RustgreSQLError::Parse(format!("Invalid numeric parameters: {}", params)));
                         }
                     } else {
-                        Err(crate::error::RustgreSQLError::Parse("Numeric requires precision and scale".to_string()))
+                        return Err(crate::error::RustgreSQLError::Parse("Numeric requires precision and scale".to_string()));
                     }
                 } else {
-                    Err(crate::error::RustgreSQLError::Parse("Unclosed numeric parenthesis".to_string()))
+                    return Err(crate::error::RustgreSQLError::Parse("Unclosed numeric parenthesis".to_string()));
                 }
             } else {
-                Err(crate::error::RustgreSQLError::Parse("Invalid numeric syntax".to_string()))
+                return Err(crate::error::RustgreSQLError::Parse("Invalid numeric syntax".to_string()));
             }
         }
 
-        _ => Err(crate::error::RustgreSQLError::Parse(format!("Unknown data type: {}", sql_type)))
+        _ => return Err(crate::error::RustgreSQLError::Parse(format!("Unknown data type: {}", base_type_str)))
+    };
+
+    // If it was an array type, wrap it
+    if is_array {
+        Ok(DataType::new(DataTypeKind::Array(Box::new(base_type.kind))))
+    } else {
+        Ok(base_type)
     }
 }
 

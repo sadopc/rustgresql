@@ -409,9 +409,6 @@ BEGIN;
 -- Query 89b: Update in transaction
 UPDATE employees SET salary = salary * 1.05 WHERE department_id = 1;
 
--- Query 89c: Insert in transaction
-INSERT INTO salaries_history (id, employee_id, salary, effective_date) SELECT id + 100, id, salary, '2023-01-01' FROM employees WHERE department_id = 1;
-
 -- Query 89d: Commit transaction
 COMMIT;
 

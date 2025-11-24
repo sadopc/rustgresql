@@ -2,17 +2,31 @@
 //!
 //! Physical operators for executing query plans
 
-use crate::{Result, sql::ast::{Expression, BinaryOperator, SetOperator as SetOperatorType, OrderBy, SortDirection}, executor::planner::PlanNode, types::{Value, ValueKind, DataTypeKind, DataType}};
+use crate::{Result, sql::ast::{Expression, BinaryOperator, SetOperator as SetOperatorType, OrderBy, SortDirection, NullsPosition}, executor::planner::PlanNode, types::{Value, ValueKind, DataTypeKind, DataType}};
 use crate::executor::{TableScanner, ExpressionEvaluator, EvaluationContext, ThreeValuedLogic, RowData, AggregateState};
 use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 use serde_json;
 
 /// Compare two Values for sorting
-fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+fn compare_values(a: &Value, b: &Value, nulls_position: NullsPosition) -> std::cmp::Ordering {
     match (&a.kind, &b.kind) {
-        (ValueKind::Null(_), _) => std::cmp::Ordering::Less,
-        (_, ValueKind::Null(_)) => std::cmp::Ordering::Greater,
+        (ValueKind::Null(_), ValueKind::Null(_)) => std::cmp::Ordering::Equal,
+        (ValueKind::Null(_), _) => {
+            // Determine NULL position based on specification
+            match nulls_position {
+                NullsPosition::First => std::cmp::Ordering::Less,
+                NullsPosition::Last => std::cmp::Ordering::Greater,
+                NullsPosition::Default => std::cmp::Ordering::Less, // Default: NULLs first
+            }
+        }
+        (_, ValueKind::Null(_)) => {
+            match nulls_position {
+                NullsPosition::First => std::cmp::Ordering::Greater,
+                NullsPosition::Last => std::cmp::Ordering::Less,
+                NullsPosition::Default => std::cmp::Ordering::Greater, // Default: NULLs first
+            }
+        }
         (ValueKind::Integer(a_val), ValueKind::Integer(b_val)) => a_val.cmp(b_val),
         (ValueKind::Float(a_val), ValueKind::Float(b_val)) => a_val.partial_cmp(b_val).unwrap_or(std::cmp::Ordering::Equal),
         (ValueKind::String(a_val), ValueKind::String(b_val)) => a_val.cmp(b_val),
@@ -978,7 +992,7 @@ impl InsertOperator {
             }
         }
 
-        // Handle auto-increment columns (SERIAL)
+        // Handle auto-increment columns (SERIAL) and DEFAULT values
         for (i, column) in table_def.columns.iter().enumerate() {
             if full_row[i].kind == ValueKind::Null(crate::types::NullValue) {
                 // Check if this is a SERIAL column
@@ -986,8 +1000,10 @@ impl InsertOperator {
                     // Generate auto-increment value (simplified - should use proper sequence)
                     let next_id = self.generate_auto_increment_value(scanner, &column.name)?;
                     full_row[i] = Value { kind: ValueKind::Integer(next_id) };
+                } else if let Some(ref default_value) = column.default_value {
+                    // Apply DEFAULT value if column has one
+                    full_row[i] = default_value.clone();
                 }
-                // Handle DEFAULT values here if needed
             }
         }
 
@@ -1244,7 +1260,7 @@ impl DeleteOperator {
 
             // Perform the deletions (in reverse order of row_id)
             for row_data in rows_to_delete {
-                if let Err(e) = self.delete_row_data(scanner, &row_data) {
+                if let Err(e) = self.delete_row_data(scanner, &row_data, context) {
                     context.log(&format!("Failed to delete row: {}", e));
                     return Err(e);
                 }
@@ -1277,20 +1293,48 @@ impl DeleteOperator {
     }
 
     /// Delete row data from storage
-    fn delete_row_data(&self, scanner: &TableScanner, row_data: &RowData) -> Result<()> {
+    fn delete_row_data(&self, scanner: &TableScanner, row_data: &RowData, context: &mut ExecutionContext) -> Result<()> {
         // Extract the row index from row_id
         let row_index = row_data.row_id
             .ok_or_else(|| crate::error::RustgreSQLError::Execution(
                 "Cannot delete row: row_id not set".to_string()
             ))? as usize;
 
+        // Get the transaction ID and manager
+        let transaction_id = context.transaction_id;
+        let transaction_manager = context.get_transaction_manager();
+
+        // If we're in a transaction and have a transaction manager, log the deletion
+        if let (Some(tx_id), Some(tm)) = (transaction_id, transaction_manager) {
+            // Get the old row data before deletion for rollback
+            let old_row = scanner.get_catalog_manager().table_manager.get_row(&self.table_name, row_index)
+                .map_err(|e| crate::error::RustgreSQLError::Execution(
+                    format!("Failed to get old row data for transaction logging: {}", e)
+                ))?;
+
+            if let Some(ref old_row_data) = old_row {
+                // Log the deletion to the transaction manager with table name and row data
+                tm.log_delete(tx_id, self.table_name.clone(), row_index, old_row_data.clone())
+                    .map_err(|e| crate::error::RustgreSQLError::Execution(
+                        format!("Failed to log deletion to transaction manager: {}", e)
+                    ))?;
+
+                log::debug!("Logged deletion to transaction manager for tx_id={}, table={}, row_index={}", tx_id, self.table_name, row_index);
+            }
+        }
+
         // Use the catalog manager to delete the row
-        scanner.get_catalog_manager().table_manager.delete_row(
+        let old_row = scanner.get_catalog_manager().table_manager.delete_row(
             &self.table_name,
             row_index
         )?;
 
-        log::info!("Deleted row at index {} from table {}", row_index, self.table_name);
+        if let Some(ref old_row_data) = old_row {
+            log::info!("Deleted row at index {} from table {} ({} columns)", row_index, self.table_name, old_row_data.len());
+        } else {
+            log::info!("Deleted row at index {} from table {}", row_index, self.table_name);
+        }
+
         Ok(())
     }
 }
@@ -1759,7 +1803,7 @@ impl MergeJoinOperator {
         result.rows.sort_by(|a, b| {
             for &idx in &sort_indices {
                 if idx < a.len() && idx < b.len() {
-                    let comparison = compare_values(&a[idx], &b[idx]);
+                    let comparison = compare_values(&a[idx], &b[idx], NullsPosition::Default);
                     if comparison != std::cmp::Ordering::Equal {
                         return comparison;
                     }
@@ -1784,7 +1828,7 @@ impl MergeJoinOperator {
 
             if let (Some(left_idx), Some(right_idx)) = (left_idx, right_idx) {
                 if left_idx < left_row.len() && right_idx < right_row.len() {
-                    let comparison = compare_values(&left_row[left_idx], &right_row[right_idx]);
+                    let comparison = compare_values(&left_row[left_idx], &right_row[right_idx], NullsPosition::Default);
                     if comparison != std::cmp::Ordering::Equal {
                         return comparison;
                     }
@@ -2788,7 +2832,7 @@ impl WindowOperator {
 
                 match (val_a, val_b) {
                     (Ok(a_val), Ok(b_val)) => {
-                        let ordering = compare_values(&a_val, &b_val);
+                        let ordering = compare_values(&a_val, &b_val, order_by_expr.nulls);
                         if ordering != std::cmp::Ordering::Equal {
                             return if order_by_expr.direction == crate::sql::ast::SortDirection::Desc {
                                 ordering.reverse()
@@ -3163,7 +3207,7 @@ impl WindowOperator {
         }
 
         for (val_a, val_b) in a.iter().zip(b.iter()) {
-            match compare_values(val_a, val_b) {
+            match compare_values(val_a, val_b, NullsPosition::Default) {
                 std::cmp::Ordering::Equal => continue,
                 _ => return false,
             }
@@ -3872,11 +3916,14 @@ pub struct ExecutionContext {
     pub logs: Vec<String>,
     pub catalog: Option<std::sync::Arc<crate::catalog::CatalogManager>>,
     pub buffer_manager: Option<std::sync::Arc<crate::storage::BufferPoolManager>>,
+    pub transaction_manager: Option<std::sync::Arc<crate::transaction::TransactionManager>>,
     pub auto_increment_counters: std::collections::HashMap<String, i64>,
     /// Outer context values for correlated subqueries (column_name -> value)
     pub outer_context_values: Option<std::collections::HashMap<String, crate::types::Value>>,
     /// Materialized CTEs available in the current execution context
     pub materialized_ctes: Option<std::collections::HashMap<String, QueryResult>>,
+    /// Current transaction ID
+    pub transaction_id: Option<u64>,
 }
 
 impl std::fmt::Debug for ExecutionContext {
@@ -3885,6 +3932,7 @@ impl std::fmt::Debug for ExecutionContext {
             .field("logs", &self.logs)
             .field("catalog", &"<CatalogManager>")
             .field("buffer_manager", &"<BufferPoolManager>")
+            .field("transaction_manager", &"<TransactionManager>")
             .finish()
     }
 }
@@ -3895,9 +3943,11 @@ impl ExecutionContext {
             logs: Vec::new(),
             catalog: None,
             buffer_manager: None,
+            transaction_manager: None,
             auto_increment_counters: std::collections::HashMap::new(),
             outer_context_values: None,
             materialized_ctes: None,
+            transaction_id: None,
         };
         // Load persistent auto-increment counters
         let _ = context.load_auto_increment_counters();
@@ -3912,12 +3962,20 @@ impl ExecutionContext {
         self.buffer_manager = Some(buffer_manager);
     }
 
+    pub fn set_transaction_manager(&mut self, transaction_manager: std::sync::Arc<crate::transaction::TransactionManager>) {
+        self.transaction_manager = Some(transaction_manager);
+    }
+
     pub fn get_catalog(&self) -> Option<&std::sync::Arc<crate::catalog::CatalogManager>> {
         self.catalog.as_ref()
     }
 
     pub fn get_buffer_manager(&self) -> Option<&std::sync::Arc<crate::storage::BufferPoolManager>> {
         self.buffer_manager.as_ref()
+    }
+
+    pub fn get_transaction_manager(&self) -> Option<&std::sync::Arc<crate::transaction::TransactionManager>> {
+        self.transaction_manager.as_ref()
     }
 
     pub fn set_outer_context_values(&mut self, values: std::collections::HashMap<String, crate::types::Value>) {
@@ -4036,7 +4094,7 @@ impl SortOperator {
 
                 match (eval_result_a, eval_result_b) {
                     (Ok(val_a), Ok(val_b)) => {
-                        let comparison = compare_values(&val_a, &val_b);
+                        let comparison = compare_values(&val_a, &val_b, order_by.nulls);
                         if comparison != std::cmp::Ordering::Equal {
                             // Reverse comparison for DESC order
                             return match order_by.direction {

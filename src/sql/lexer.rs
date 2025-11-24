@@ -99,6 +99,9 @@ pub enum TokenType {
     // Sort direction keywords
     Asc,
     Desc,
+    Nulls,
+    First,
+    Last,
 
     // Boolean literals
     True,
@@ -110,6 +113,8 @@ pub enum TokenType {
     Language,
     Begin,
     End,
+    Commit,
+    Rollback,
     Declare,
     Loop,
     While,
@@ -148,6 +153,8 @@ pub enum TokenType {
     // Punctuation
     LeftParen,
     RightParen,
+    LeftBracket,
+    RightBracket,
     Comma,
     Semicolon,
     Dot,
@@ -256,11 +263,16 @@ impl Token {
                 | TokenType::Ntile
                 | TokenType::Asc
                 | TokenType::Desc
+                | TokenType::Nulls
+                | TokenType::First
+                | TokenType::Last
                 | TokenType::Procedure
                 | TokenType::Function
                 | TokenType::Language
                 | TokenType::Begin
                 | TokenType::End
+                | TokenType::Commit
+                | TokenType::Rollback
                 | TokenType::Declare
                 | TokenType::Loop
                 | TokenType::While
@@ -402,6 +414,8 @@ impl Lexer {
             match current_char {
                 '(' => self.add_token(TokenType::LeftParen, 1),
                 ')' => self.add_token(TokenType::RightParen, 1),
+                '[' => self.add_token(TokenType::LeftBracket, 1),
+                ']' => self.add_token(TokenType::RightBracket, 1),
                 ',' => self.add_token(TokenType::Comma, 1),
                 ';' => self.add_token(TokenType::Semicolon, 1),
                 '.' => self.add_token(TokenType::Dot, 1),
@@ -682,6 +696,9 @@ impl Lexer {
             "NTILE" => if is_followed_by_paren { TokenType::Ntile } else { TokenType::Identifier(identifier.clone()) },
             "ASC" => TokenType::Asc,
             "DESC" => TokenType::Desc,
+            "NULLS" => TokenType::Nulls,
+            "FIRST" => TokenType::First,
+            "LAST" => TokenType::Last,
             "TRUE" => TokenType::True,
             "FALSE" => TokenType::False,
             // Stored procedure and control flow keywords
@@ -690,6 +707,8 @@ impl Lexer {
             "LANGUAGE" => TokenType::Language,
             "BEGIN" => TokenType::Begin,
             "END" => TokenType::End,
+            "COMMIT" => TokenType::Commit,
+            "ROLLBACK" => TokenType::Rollback,
             "DECLARE" => TokenType::Declare,
             "LOOP" => TokenType::Loop,
             "WHILE" => TokenType::While,

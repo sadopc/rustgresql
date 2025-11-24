@@ -36,8 +36,12 @@ fn main() -> rustgresql::Result<()> {
         db
     };
 
-    // Initialize execution engine with database's catalog and buffer manager
-    let execution_engine = ExecutionEngine::with_catalog_and_buffer(db.get_catalog(), db.get_buffer_manager());
+    // Initialize execution engine with database's catalog, buffer manager, and transaction manager
+    let execution_engine = ExecutionEngine::with_catalog_buffer_and_tm(
+        db.get_catalog(), 
+        db.get_buffer_manager(),
+        db.transaction_manager.clone()
+    );
 
     println!("RustgreSQL v0.1.0 - Phase 1.1 Query Execution Engine");
     println!("Type 'help' for commands, SQL queries, or 'exit' to quit.");
@@ -51,10 +55,15 @@ fn main() -> rustgresql::Result<()> {
     }
 
     let mut query_buffer = String::new();
+    let mut current_transaction_id: Option<u64> = None;
 
     // Enhanced REPL with SQL execution
     loop {
-        let prompt = if query_buffer.is_empty() { "rustgresql> " } else { "-> " };
+        let prompt = if query_buffer.is_empty() {
+            if current_transaction_id.is_some() { "rustgresql(tx)> " } else { "rustgresql> " }
+        } else {
+            "-> " 
+        };
         
         match rl.readline(prompt) {
             Ok(line) => {
@@ -93,7 +102,7 @@ fn main() -> rustgresql::Result<()> {
                     rl.add_history_entry(&full_query);
                     
                     // Process the query
-                    match execute_sql(&execution_engine, &full_query) {
+                    match execute_sql(&execution_engine, &full_query, &mut current_transaction_id) {
                         Ok(results) => {
                             for (result, stats) in results {
                                 print_query_result(&result, &stats);
@@ -137,9 +146,10 @@ fn main() -> rustgresql::Result<()> {
     Ok(())
 }
 
-fn execute_sql(engine: &ExecutionEngine, sql: &str) -> rustgresql::Result<Vec<(rustgresql::executor::QueryResult, rustgresql::executor::ExecutionStats)>> {
+fn execute_sql(engine: &ExecutionEngine, sql: &str, current_tx_id: &mut Option<u64>) -> rustgresql::Result<Vec<(rustgresql::executor::QueryResult, rustgresql::executor::ExecutionStats)>> {
     // Parse the SQL statement
     let statements = parse_sql(sql)?;
+    use rustgresql::sql::Statement;
 
     if statements.is_empty() {
         // No statements found (e.g., just comments), return success with empty result
@@ -151,8 +161,49 @@ fn execute_sql(engine: &ExecutionEngine, sql: &str) -> rustgresql::Result<Vec<(r
 
     let mut results = Vec::new();
     for statement in statements {
-        let result = engine.execute_query(&statement)?;
-        results.push(result);
+        match statement {
+            Statement::BeginTransaction => {
+                if current_tx_id.is_some() {
+                     println!("Warning: There is already a transaction in progress");
+                     continue;
+                }
+                if let Some(tm) = &engine.transaction_manager {
+                    let tx_id = tm.begin_transaction(rustgresql::transaction::manager::IsolationLevel::ReadCommitted)?;
+                    *current_tx_id = Some(tx_id);
+                    // Return empty result for BEGIN
+                     results.push((rustgresql::executor::QueryResult { rows: vec![], column_names: vec![] }, rustgresql::executor::ExecutionStats::default()));
+                     println!("BEGIN");
+                }
+            },
+            Statement::CommitTransaction => {
+                 if let Some(tx_id) = *current_tx_id {
+                     if let Some(tm) = &engine.transaction_manager {
+                         tm.commit_transaction(tx_id)?;
+                         *current_tx_id = None;
+                         results.push((rustgresql::executor::QueryResult { rows: vec![], column_names: vec![] }, rustgresql::executor::ExecutionStats::default()));
+                         println!("COMMIT");
+                     }
+                 } else {
+                     println!("Warning: There is no transaction in progress");
+                 }
+            },
+            Statement::RollbackTransaction => {
+                 if let Some(tx_id) = *current_tx_id {
+                     if let Some(tm) = &engine.transaction_manager {
+                         tm.rollback_transaction(tx_id)?;
+                         *current_tx_id = None;
+                         results.push((rustgresql::executor::QueryResult { rows: vec![], column_names: vec![] }, rustgresql::executor::ExecutionStats::default()));
+                         println!("ROLLBACK");
+                     }
+                 } else {
+                     println!("Warning: There is no transaction in progress");
+                 }
+            },
+            _ => {
+                let result = engine.execute_query(&statement, *current_tx_id)?;
+                results.push(result);
+            }
+        }
     }
     
     Ok(results)
@@ -542,6 +593,7 @@ fn run_basic_test() {
     use rustgresql::executor::ExecutionEngine;
 
     let engine = ExecutionEngine::new();
+    let mut tx_id = None;
 
     // Test basic expression evaluation
     let test_queries = vec![
@@ -553,7 +605,7 @@ fn run_basic_test() {
 
     for query in test_queries {
         println!("Executing: {}", query);
-        match execute_sql(&engine, query) {
+        match execute_sql(&engine, query, &mut tx_id) {
             Ok(results) => {
                 for (result, stats) in results {
                     print_query_result(&result, &stats);

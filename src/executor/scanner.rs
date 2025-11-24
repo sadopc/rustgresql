@@ -116,6 +116,9 @@ impl TableScanner {
 
     /// Insert a new row into the table
     pub fn insert_row(&mut self, row_data: RowData) -> Result<()> {
+        // Check for unique index violations
+        self.check_unique_constraints(&row_data.values)?;
+
         // Insert into table manager
         self.catalog_manager.table_manager.insert(&self.table_def.name, row_data.values.clone())?;
 
@@ -137,6 +140,43 @@ impl TableScanner {
 
             // Update table definition with current root page ID in case it changed
             self.catalog_manager.table_manager.update_table_root_page(&self.table_def.name, btree.root_page_id())?;
+        }
+
+        Ok(())
+    }
+
+    /// Check if inserting this row would violate any unique constraints
+    fn check_unique_constraints(&self, values: &[Value]) -> Result<()> {
+        // Get all unique indexes for this table
+        let unique_indexes = self.catalog_manager.index_manager.get_table_unique_indexes(self.table_def.table_id)?;
+
+        for index_info in unique_indexes {
+            // Extract values for the indexed columns
+            let mut index_values = Vec::new();
+            for column_name in &index_info.def.columns {
+                if let Some(&column_index) = self.column_map.get(column_name) {
+                    index_values.push(values[column_index].clone());
+                }
+            }
+
+            // Check if these values already exist in the table
+            let all_rows = self.catalog_manager.table_manager.get_all_rows(&self.table_def.name)?;
+            for existing_row in &all_rows {
+                let mut existing_index_values = Vec::new();
+                for column_name in &index_info.def.columns {
+                    if let Some(&column_index) = self.column_map.get(column_name) {
+                        existing_index_values.push(existing_row[column_index].clone());
+                    }
+                }
+
+                // Compare values
+                if index_values == existing_index_values {
+                    return Err(RustgreSQLError::Constraint(
+                        format!("Duplicate value for unique index '{}' on columns {:?}",
+                                index_info.def.name, index_info.def.columns)
+                    ));
+                }
+            }
         }
 
         Ok(())

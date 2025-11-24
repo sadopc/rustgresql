@@ -332,4 +332,47 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_order_by_nulls_first_last_parsing() {
+        // Test NULLS FIRST
+        let sql = "SELECT * FROM employees ORDER BY manager_id NULLS FIRST";
+        let mut lexer = Lexer::new(sql);
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+        assert!(result.is_ok(), "Failed to parse ORDER BY with NULLS FIRST: {:?}", result.err());
+
+        // Test NULLS LAST
+        let sql = "SELECT * FROM employees ORDER BY manager_id NULLS LAST";
+        let mut lexer = Lexer::new(sql);
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+        assert!(result.is_ok(), "Failed to parse ORDER BY with NULLS LAST: {:?}", result.err());
+
+        // Test ASC NULLS FIRST
+        let sql = "SELECT * FROM employees ORDER BY salary ASC NULLS FIRST";
+        let mut lexer = Lexer::new(sql);
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+        assert!(result.is_ok(), "Failed to parse ORDER BY with ASC NULLS FIRST: {:?}", result.err());
+
+        // Test DESC NULLS LAST
+        let sql = "SELECT * FROM employees ORDER BY salary DESC NULLS LAST";
+        let mut lexer = Lexer::new(sql);
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+        assert!(result.is_ok(), "Failed to parse ORDER BY with DESC NULLS LAST: {:?}", result.err());
+
+        // Test multiple ORDER BY columns with NULLS specification
+        let sql = "SELECT * FROM employees ORDER BY department_id NULLS FIRST, salary DESC NULLS LAST";
+        let mut lexer = Lexer::new(sql);
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+        assert!(result.is_ok(), "Failed to parse ORDER BY with multiple columns and NULLS: {:?}", result.err());
+    }
 }

@@ -23,6 +23,10 @@ pub enum Statement {
     DropFunction(DropFunctionStatement),
     CallProcedure(CallProcedureStatement),
     Perform(PerformStatement),
+    // Transaction control
+    BeginTransaction,
+    CommitTransaction,
+    RollbackTransaction,
     // Control flow statements (used within procedures)
     Block(BlockStatement),
     Return(ReturnStatement),
@@ -194,11 +198,20 @@ pub enum SortDirection {
     Desc,
 }
 
+/// Nulls handling specification
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum NullsPosition {
+    First,   // NULLS FIRST
+    Last,    // NULLS LAST
+    Default, // No specification (use database default)
+}
+
 /// Order by clause
 #[derive(Debug, Clone)]
 pub struct OrderBy {
     pub expr: Expression,
     pub direction: SortDirection,
+    pub nulls: NullsPosition,
 }
 
 /// Join type

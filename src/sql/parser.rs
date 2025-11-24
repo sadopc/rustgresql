@@ -58,6 +58,9 @@ impl Parser {
             TokenType::Refresh => self.parse_refresh_materialized_view(),
             TokenType::Call => self.parse_call_procedure(),
             TokenType::Perform => self.parse_perform_statement(),
+            TokenType::Begin => self.parse_begin_transaction(),
+            TokenType::Commit => self.parse_commit_transaction(),
+            TokenType::Rollback => self.parse_rollback_transaction(),
             _ => Err(RustgreSQLError::Parse(
                 format!("Unexpected token '{}' at line {}, column {}",
                        self.peek().value, self.peek().line, self.peek().column)
@@ -623,9 +626,12 @@ impl Parser {
     fn parse_create(&mut self) -> Result<Statement> {
         self.consume_token(TokenType::Create, "Expected CREATE")?;
 
+        // Check if this is a UNIQUE INDEX
+        let is_unique_index = self.match_token(TokenType::Unique);
+
         match self.peek().token_type {
             TokenType::Table => self.parse_create_table(),
-            TokenType::Index => self.parse_create_index(),
+            TokenType::Index => self.parse_create_index(is_unique_index),
             TokenType::View => self.parse_create_view(),
             TokenType::Materialized => self.parse_create_materialized_view(),
             TokenType::Procedure => self.parse_create_procedure(),
@@ -693,7 +699,7 @@ impl Parser {
     }
 
     /// Parse CREATE INDEX statement
-    fn parse_create_index(&mut self) -> Result<Statement> {
+    fn parse_create_index(&mut self, is_unique: bool) -> Result<Statement> {
         self.consume_token(TokenType::Index, "Expected INDEX")?;
 
         let if_not_exists = self.match_token(TokenType::If);
@@ -720,7 +726,7 @@ impl Parser {
             index_name,
             table_name,
             columns,
-            unique: false, // TODO: Support UNIQUE indexes
+            unique: is_unique,
             if_not_exists,
         }))
     }
@@ -1080,10 +1086,10 @@ impl Parser {
                 // Handle other data types as identifiers
                 let type_name = self.consume_identifier()?;
                 let upper_name = type_name.to_uppercase();
-                match upper_name.as_str() {
-            "INTEGER" | "INT" | "INT4" => Ok(crate::types::DataType::new(crate::types::DataTypeKind::Integer)),
-            "BIGINT" | "INT8" => Ok(crate::types::DataType::new(crate::types::DataTypeKind::BigInt)),
-            "SMALLINT" | "INT2" => Ok(crate::types::DataType::new(crate::types::DataTypeKind::SmallInt)),
+                let mut data_type = match upper_name.as_str() {
+            "INTEGER" | "INT" | "INT4" => crate::types::DataType::new(crate::types::DataTypeKind::Integer),
+            "BIGINT" | "INT8" => crate::types::DataType::new(crate::types::DataTypeKind::BigInt),
+            "SMALLINT" | "INT2" => crate::types::DataType::new(crate::types::DataTypeKind::SmallInt),
             "DECIMAL" | "NUMERIC" => {
                 let mut precision = 10;
                 let mut scale = 0;
@@ -1096,14 +1102,14 @@ impl Parser {
                     self.consume_token(TokenType::RightParen, "Expected ')' after decimal precision")?;
                 }
 
-                Ok(crate::types::DataType::new(crate::types::DataTypeKind::Decimal(precision, scale)))
+                crate::types::DataType::new(crate::types::DataTypeKind::Decimal(precision, scale))
             }
-            "REAL" | "FLOAT4" => Ok(crate::types::DataType::new(crate::types::DataTypeKind::Real)),
+            "REAL" | "FLOAT4" => crate::types::DataType::new(crate::types::DataTypeKind::Real),
             "DOUBLE" => {
                 if self.match_identifier_token("PRECISION")? {
-                    Ok(crate::types::DataType::new(crate::types::DataTypeKind::DoublePrecision))
+                    crate::types::DataType::new(crate::types::DataTypeKind::DoublePrecision)
                 } else {
-                    Ok(crate::types::DataType::new(crate::types::DataTypeKind::DoublePrecision))
+                    crate::types::DataType::new(crate::types::DataTypeKind::DoublePrecision)
                 }
             }
             "VARCHAR" => {
@@ -1114,7 +1120,7 @@ impl Parser {
                     self.consume_token(TokenType::RightParen, "Expected ')' after varchar length")?;
                 }
 
-                Ok(crate::types::DataType::new(crate::types::DataTypeKind::Varchar(length)))
+                crate::types::DataType::new(crate::types::DataTypeKind::Varchar(length))
             }
             "CHAR" => {
                 let mut length = 1;
@@ -1124,19 +1130,30 @@ impl Parser {
                     self.consume_token(TokenType::RightParen, "Expected ')' after char length")?;
                 }
 
-                Ok(crate::types::DataType::new(crate::types::DataTypeKind::Char(length)))
+                crate::types::DataType::new(crate::types::DataTypeKind::Char(length))
             }
-            "TEXT" => Ok(crate::types::DataType::new(crate::types::DataTypeKind::Text)),
-            "BOOLEAN" | "BOOL" => Ok(crate::types::DataType::new(crate::types::DataTypeKind::Boolean)),
-            "DATE" => Ok(crate::types::DataType::new(crate::types::DataTypeKind::Date)),
-            "TIME" => Ok(crate::types::DataType::new(crate::types::DataTypeKind::Time)),
-            "TIMESTAMP" => Ok(crate::types::DataType::new(crate::types::DataTypeKind::Timestamp)),
-            "INTERVAL" => Ok(crate::types::DataType::new(crate::types::DataTypeKind::Interval)),
-            "BLOB" | "BYTEA" => Ok(crate::types::DataType::new(crate::types::DataTypeKind::Bytea)),
-            _ => Err(RustgreSQLError::Parse(
+            "TEXT" => crate::types::DataType::new(crate::types::DataTypeKind::Text),
+            "BOOLEAN" | "BOOL" => crate::types::DataType::new(crate::types::DataTypeKind::Boolean),
+            "DATE" => crate::types::DataType::new(crate::types::DataTypeKind::Date),
+            "TIME" => crate::types::DataType::new(crate::types::DataTypeKind::Time),
+            "TIMESTAMP" => crate::types::DataType::new(crate::types::DataTypeKind::Timestamp),
+            "INTERVAL" => crate::types::DataType::new(crate::types::DataTypeKind::Interval),
+            "UUID" => crate::types::DataType::new(crate::types::DataTypeKind::Uuid),
+            "BLOB" | "BYTEA" => crate::types::DataType::new(crate::types::DataTypeKind::Bytea),
+            _ => return Err(RustgreSQLError::Parse(
                 format!("Unknown data type: {}", type_name)
             ))
+                };
+
+                // Check for array suffix (e.g., INTEGER[], TEXT[])
+                while self.match_token(TokenType::LeftBracket) {
+                    self.consume_token(TokenType::RightBracket, "Expected ']' after '[' in array type")?;
+                    data_type = crate::types::DataType::new(
+                        crate::types::DataTypeKind::Array(Box::new(data_type.kind))
+                    );
                 }
+
+                Ok(data_type)
             }
         }
     }
@@ -1259,7 +1276,23 @@ impl Parser {
             SortDirection::Asc // Default
         };
 
-        Ok(OrderBy { expr, direction })
+        // Parse optional NULLS FIRST or NULLS LAST
+        let nulls = if self.match_token(TokenType::Nulls) {
+            if self.match_token(TokenType::First) {
+                NullsPosition::First
+            } else if self.match_token(TokenType::Last) {
+                NullsPosition::Last
+            } else {
+                return Err(RustgreSQLError::Parse(
+                    format!("Expected FIRST or LAST after NULLS at line {}, column {}",
+                           self.peek().line, self.peek().column)
+                ));
+            }
+        } else {
+            NullsPosition::Default
+        };
+
+        Ok(OrderBy { expr, direction, nulls })
     }
 
     /// Parse expression
@@ -2359,6 +2392,32 @@ impl Parser {
         let expression = self.parse_expression()?;
 
         Ok(Statement::Perform(PerformStatement { expression }))
+    }
+
+    /// Parse BEGIN transaction statement
+    fn parse_begin_transaction(&mut self) -> Result<Statement> {
+        self.consume_token(TokenType::Begin, "Expected BEGIN")?;
+        // Optional TRANSACTION or WORK keyword
+        let _ = self.match_identifier_token("TRANSACTION");
+        let _ = self.match_identifier_token("WORK");
+        
+        Ok(Statement::BeginTransaction)
+    }
+
+    /// Parse COMMIT transaction statement
+    fn parse_commit_transaction(&mut self) -> Result<Statement> {
+        self.consume_token(TokenType::Commit, "Expected COMMIT")?;
+        let _ = self.match_identifier_token("TRANSACTION");
+        let _ = self.match_identifier_token("WORK");
+        Ok(Statement::CommitTransaction)
+    }
+
+    /// Parse ROLLBACK transaction statement
+    fn parse_rollback_transaction(&mut self) -> Result<Statement> {
+        self.consume_token(TokenType::Rollback, "Expected ROLLBACK")?;
+        let _ = self.match_identifier_token("TRANSACTION");
+        let _ = self.match_identifier_token("WORK");
+        Ok(Statement::RollbackTransaction)
     }
 
     /// Parse block statement (BEGIN...END)

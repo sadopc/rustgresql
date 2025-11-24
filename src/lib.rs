@@ -60,6 +60,7 @@ pub struct Database {
     pub config: Config,
     buffer_manager: std::sync::Arc<storage::BufferPoolManager>,
     catalog_manager: std::sync::Arc<catalog::CatalogManager>,
+    pub transaction_manager: std::sync::Arc<transaction::TransactionManager>,
 }
 
 impl Database {
@@ -83,10 +84,16 @@ impl Database {
         catalog_manager.initialize()?;
         let catalog_manager = Arc::new(catalog_manager);
 
+        // Initialize transaction manager
+        let mut transaction_manager = transaction::TransactionManager::new();
+        transaction_manager.set_catalog(catalog_manager.clone());
+        let transaction_manager = Arc::new(transaction_manager);
+
         Ok(Self {
             config,
             buffer_manager,
             catalog_manager,
+            transaction_manager,
         })
     }
 
@@ -120,10 +127,16 @@ impl Database {
         catalog_manager.initialize()?;
         let catalog_manager = Arc::new(catalog_manager);
 
+        // Initialize transaction manager
+        let mut transaction_manager = transaction::TransactionManager::new();
+        transaction_manager.set_catalog(catalog_manager.clone());
+        let transaction_manager = Arc::new(transaction_manager);
+
         Ok(Self {
             config,
             buffer_manager,
             catalog_manager,
+            transaction_manager,
         })
     }
 

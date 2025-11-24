@@ -275,6 +275,16 @@ impl SystemTableManager {
         Ok(table_list)
     }
 
+    /// Get all rows from a table
+    pub fn get_all_rows(&self, table_name: &str) -> Result<Vec<Vec<crate::types::Value>>> {
+        let tables = self.tables.lock().unwrap();
+        if let Some(table) = tables.get(table_name) {
+            let data = table.data.lock().unwrap();
+            return Ok(data.clone());
+        }
+        Ok(vec![])
+    }
+
     /// Insert data into a table
     pub fn insert(&self, table_name: &str, row: Vec<crate::types::Value>) -> Result<()> {
         let tables = self.tables.lock().unwrap();
@@ -320,8 +330,53 @@ impl SystemTableManager {
         Ok(())
     }
 
+    /// Get a row from a table by row index without removing it
+    pub fn get_row(&self, table_name: &str, row_index: usize) -> Result<Option<Vec<crate::types::Value>>> {
+        let tables = self.tables.lock().unwrap();
+        if let Some(table) = tables.get(table_name) {
+            let data = table.data.lock().unwrap();
+
+            // Check if row index is valid
+            if row_index >= data.len() {
+                return Ok(None);
+            }
+
+            // Clone the row data
+            let row = data[row_index].clone();
+            Ok(Some(row))
+        } else {
+            Err(crate::error::RustgreSQLError::NotFound(
+                format!("Table '{}' not found", table_name)
+            ))
+        }
+    }
+
+    /// Restore a row to a table at a specific index (for rollback)
+    pub fn restore_row(&self, table_name: &str, row_index: usize, row_data: Vec<crate::types::Value>) -> Result<()> {
+        let tables = self.tables.lock().unwrap();
+        if let Some(table) = tables.get(table_name) {
+            let mut data = table.data.lock().unwrap();
+
+            // Ensure the vector is large enough
+            while row_index >= data.len() {
+                data.push(vec![]);
+            }
+
+            // Insert the row at the specified index, pushing existing rows forward
+            data.insert(row_index, row_data);
+
+            log::debug!("Restored row at index {} to table {}", row_index, table_name);
+            Ok(())
+        } else {
+            Err(crate::error::RustgreSQLError::NotFound(
+                format!("Table '{}' not found", table_name)
+            ))
+        }
+    }
+
     /// Delete a row from a table by row index
-    pub fn delete_row(&self, table_name: &str, row_index: usize) -> Result<()> {
+    /// Returns the old row data if successful
+    pub fn delete_row(&self, table_name: &str, row_index: usize) -> Result<Option<Vec<crate::types::Value>>> {
         let tables = self.tables.lock().unwrap();
         if let Some(table) = tables.get(table_name) {
             let mut data = table.data.lock().unwrap();
@@ -333,8 +388,8 @@ impl SystemTableManager {
                 ));
             }
 
-            // Remove the row from memory
-            data.remove(row_index);
+            // Remove and capture the row from memory
+            let old_row = data.remove(row_index);
 
             // If we have a buffer manager, mark pages as dirty to persist the deletion
             if let Some(ref buffer_manager) = *self.buffer_manager.lock().unwrap() {
@@ -343,12 +398,13 @@ impl SystemTableManager {
                 // For now, we rely on the eventual flush of all pages
                 buffer_manager.flush_all_pages()?;
             }
+
+            Ok(Some(old_row))
         } else {
-            return Err(crate::error::RustgreSQLError::NotFound(
+            Err(crate::error::RustgreSQLError::NotFound(
                 format!("Table '{}' not found", table_name)
-            ));
+            ))
         }
-        Ok(())
     }
 
     /// Persist a row to disk pages

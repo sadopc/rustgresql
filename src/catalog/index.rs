@@ -230,6 +230,24 @@ impl IndexManager {
         Ok(None)
     }
 
+    /// Get unique indexes (excluding primary keys) for a table
+    pub fn get_table_unique_indexes(&self, table_id: u64) -> Result<Vec<IndexInfo>> {
+        let table_indexes = self.table_indexes.lock().unwrap();
+        let indexes = self.indexes.lock().unwrap();
+
+        let mut result = Vec::new();
+        if let Some(index_names) = table_indexes.get(&table_id) {
+            for index_name in index_names {
+                if let Some(index_info) = indexes.get(index_name) {
+                    if index_info.def.unique && !index_info.def.primary_key {
+                        result.push(index_info.clone());
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
     /// Check if index exists
     pub fn index_exists(&self, name: &str) -> bool {
         let indexes = self.indexes.lock().unwrap();

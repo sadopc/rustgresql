@@ -349,12 +349,7 @@ mod tests {
         }) {
             // Verify we have a window function
             let has_window_function = select_statement.columns.iter().any(|col| {
-                match col {
-                    crate::sql::ast::SelectItem::Expression(expr, _) => {
-                        contains_window_function(expr)
-                    }
-                    _ => false,
-                }
+                contains_window_function(&col.expr)
             });
 
             assert!(has_window_function, "AST should contain a window function");

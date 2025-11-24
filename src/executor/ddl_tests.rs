@@ -615,4 +615,45 @@ mod tests {
         // We should get 2 rows (both Alice and Bob have age > 18)
         assert_eq!(result.rows.len(), 2, "Expected 2 rows from view query");
     }
+
+    #[test]
+    fn test_boolean_default_values() {
+        let engine = create_test_engine();
+
+        // Create a table with BOOLEAN columns and DEFAULT values
+        let create_table_sql = "CREATE TABLE test_boolean (
+            id INTEGER PRIMARY KEY,
+            is_active BOOLEAN,
+            is_deleted BOOLEAN DEFAULT FALSE
+        )";
+        let table_statements = parse_sql(create_table_sql).unwrap();
+        engine.execute_query(&table_statements[0]).unwrap();
+
+        // Insert data without specifying is_deleted (should use DEFAULT FALSE)
+        let insert_sql = "INSERT INTO test_boolean (id, is_active) VALUES (1, TRUE), (2, FALSE)";
+        let insert_statements = parse_sql(insert_sql).unwrap();
+        let insert_result = engine.execute_query(&insert_statements[0]);
+        assert!(insert_result.is_ok(), "INSERT execution failed: {:?}", insert_result);
+
+        // Select and verify the data
+        let select_sql = "SELECT * FROM test_boolean ORDER BY id";
+        let select_statements = parse_sql(select_sql).unwrap();
+        let select_result = engine.execute_query(&select_statements[0]);
+        assert!(select_result.is_ok(), "SELECT execution failed: {:?}", select_result);
+
+        let (result, _stats) = select_result.unwrap();
+        assert_eq!(result.rows.len(), 2, "Expected 2 rows");
+
+        // Verify first row: id=1, is_active=true, is_deleted should be false (DEFAULT)
+        assert_eq!(result.rows[0].values.len(), 3);
+        // Row 1
+        assert_eq!(result.rows[0].values[0].to_string(), "1");
+        assert_eq!(result.rows[0].values[1].to_string(), "true");
+        assert_eq!(result.rows[0].values[2].to_string(), "false", "is_deleted should be FALSE (from DEFAULT)");
+
+        // Row 2
+        assert_eq!(result.rows[1].values[0].to_string(), "2");
+        assert_eq!(result.rows[1].values[1].to_string(), "false");
+        assert_eq!(result.rows[1].values[2].to_string(), "false", "is_deleted should be FALSE (from DEFAULT)");
+    }
 }

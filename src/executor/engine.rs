@@ -83,6 +83,37 @@ impl Executor {
         }
     }
 
+    /// Create executor with catalog, buffer manager, and transaction manager
+    pub fn with_catalog_buffer_and_tm(
+        catalog: std::sync::Arc<crate::catalog::CatalogManager>,
+        buffer_manager: std::sync::Arc<crate::storage::BufferPoolManager>,
+        transaction_manager: std::sync::Arc<crate::transaction::TransactionManager>
+    ) -> Self {
+        let mut context = ExecutionContext::new();
+        context.set_catalog(catalog.clone());
+        context.set_buffer_manager(buffer_manager.clone());
+        context.set_transaction_manager(transaction_manager.clone());
+
+        Self {
+            context,
+            planner: OptimizedQueryPlanner::new(),
+            stats: ExecutionStats {
+                rows_scanned: 0,
+                rows_filtered: 0,
+                rows_produced: 0,
+                execution_time_ms: 0,
+            },
+            catalog,
+            buffer_manager,
+            query_rewriter: QueryRewriter::new(),
+            procedure_executor: ProcedureExecutor::new(),
+        }
+    }
+
+    pub fn set_transaction_id(&mut self, transaction_id: u64) {
+        self.context.transaction_id = Some(transaction_id);
+    }
+
     /// Create a buffer manager for the executor
     fn create_buffer_manager() -> std::sync::Arc<crate::storage::BufferPoolManager> {
         use crate::storage::file_manager::DefaultFileManager;
@@ -166,6 +197,12 @@ impl Executor {
             Statement::Continue(_) => QueryResult { rows: vec![], column_names: vec![] },
             Statement::Declare(_) => QueryResult { rows: vec![], column_names: vec![] },
             Statement::RaiseStatement(_) => QueryResult { rows: vec![], column_names: vec![] },
+            
+            // Transaction control statements are handled by the transaction manager in the main loop
+            // or by the executor if we move logic here. For now, just return empty result.
+            Statement::BeginTransaction | Statement::CommitTransaction | Statement::RollbackTransaction => {
+                QueryResult { rows: vec![], column_names: vec![] }
+            }
         };
 
         let execution_time = start_time.elapsed().as_millis() as u64;
@@ -1376,12 +1413,14 @@ impl Executor {
     /// Check if a data type is supported
     fn is_data_type_supported(&self, data_type: &DataType) -> bool {
         match &data_type.kind {
-            DataTypeKind::Integer | DataTypeKind::BigInt | DataTypeKind::Real |
+            DataTypeKind::SmallInt | DataTypeKind::Integer | DataTypeKind::BigInt | DataTypeKind::Real |
             DataTypeKind::DoublePrecision | DataTypeKind::Numeric(_, _) | DataTypeKind::Decimal(_, _) |
             DataTypeKind::Text | DataTypeKind::Varchar(_) |
             DataTypeKind::Char(_) | DataTypeKind::Boolean | DataTypeKind::Date |
+            DataTypeKind::Time | DataTypeKind::TimeWithTimeZone |
             DataTypeKind::Timestamp | DataTypeKind::TimestampWithTimeZone |
-            DataTypeKind::Serial | DataTypeKind::BigSerial => true,
+            DataTypeKind::Interval | DataTypeKind::Serial | DataTypeKind::BigSerial |
+            DataTypeKind::Uuid | DataTypeKind::Array(_) => true,
             _ => false, // Unsupported types for now
         }
     }
@@ -2479,17 +2518,26 @@ impl Executor {
 pub struct ExecutionEngine {
     catalog: std::sync::Arc<CatalogManager>,
     buffer_manager: std::sync::Arc<crate::storage::BufferPoolManager>,
+    pub transaction_manager: Option<std::sync::Arc<crate::transaction::TransactionManager>>,
 }
 
 impl ExecutionEngine {
     pub fn new() -> Self {
         let catalog = get_catalog();
         let buffer_manager = Self::create_buffer_manager();
-        Self { catalog, buffer_manager }
+        Self { catalog, buffer_manager, transaction_manager: None }
     }
 
     pub fn with_catalog_and_buffer(catalog: std::sync::Arc<CatalogManager>, buffer_manager: std::sync::Arc<crate::storage::BufferPoolManager>) -> Self {
-        Self { catalog, buffer_manager }
+        Self { catalog, buffer_manager, transaction_manager: None }
+    }
+
+    pub fn with_catalog_buffer_and_tm(
+        catalog: std::sync::Arc<CatalogManager>, 
+        buffer_manager: std::sync::Arc<crate::storage::BufferPoolManager>,
+        transaction_manager: std::sync::Arc<crate::transaction::TransactionManager>
+    ) -> Self {
+        Self { catalog, buffer_manager, transaction_manager: Some(transaction_manager) }
     }
 
     fn create_buffer_manager() -> std::sync::Arc<crate::storage::BufferPoolManager> {
@@ -2514,12 +2562,19 @@ impl ExecutionEngine {
 
     /// Create a new executor
     pub fn create_executor(&self) -> Executor {
-        Executor::with_catalog_and_buffer(self.catalog.clone(), self.buffer_manager.clone())
+        if let Some(ref tm) = self.transaction_manager {
+            Executor::with_catalog_buffer_and_tm(self.catalog.clone(), self.buffer_manager.clone(), tm.clone())
+        } else {
+            Executor::with_catalog_and_buffer(self.catalog.clone(), self.buffer_manager.clone())
+        }
     }
 
     /// Execute a query with a new executor
-    pub fn execute_query(&self, statement: &Statement) -> Result<(QueryResult, ExecutionStats)> {
+    pub fn execute_query(&self, statement: &Statement, transaction_id: Option<u64>) -> Result<(QueryResult, ExecutionStats)> {
         let mut executor = self.create_executor();
+        if let Some(tx_id) = transaction_id {
+            executor.set_transaction_id(tx_id);
+        }
         let result = executor.execute_statement(statement)?;
         let stats = executor.get_stats().clone();
         Ok((result, stats))

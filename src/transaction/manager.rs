@@ -2,11 +2,19 @@
 //!
 //! Coordinates WAL, MVCC, and lock management for ACID transactions
 
-use crate::{error::RustgreSQLError, Result, TransactionId};
+use crate::{error::RustgreSQLError, Result, TransactionId, types::Value};
 use crate::transaction::{wal::{WALManager, WALRecord}, mvcc::{MVCCManager, Snapshot}};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+/// Information needed to restore a deleted row
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteRestoreInfo {
+    pub table_name: String,
+    pub row_index: usize,
+    pub old_row_data: Vec<Value>,
+}
 
 /// Transaction isolation levels
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -90,6 +98,8 @@ pub struct TransactionManager {
     wal: Option<Arc<Mutex<WALManager>>>,
     /// MVCC manager
     mvcc: Arc<Mutex<MVCCManager>>,
+    /// Catalog manager (for table operations during rollback)
+    pub catalog: Option<std::sync::Arc<crate::catalog::CatalogManager>>,
 }
 
 impl TransactionManager {
@@ -100,6 +110,7 @@ impl TransactionManager {
             active_transactions: Arc::new(Mutex::new(HashMap::new())),
             wal: None,
             mvcc: Arc::new(Mutex::new(MVCCManager::new())),
+            catalog: None,
         }
     }
 
@@ -110,6 +121,7 @@ impl TransactionManager {
             active_transactions: Arc::new(Mutex::new(HashMap::new())),
             wal: Some(wal),
             mvcc: Arc::new(Mutex::new(MVCCManager::new())),
+            catalog: None,
         }
     }
 
@@ -249,8 +261,33 @@ impl TransactionManager {
         // Rollback modified pages
         for (page_id, old_data) in &transaction.modified_pages {
             log::debug!("Rolling back page {} to original state", page_id);
-            // In a real implementation, this would restore the page from old_data
-            // For now, we just log it
+
+            // Deserialize the restoration info
+            use bincode;
+            let restore_info: DeleteRestoreInfo = match bincode::deserialize(old_data) {
+                Ok(info) => info,
+                Err(e) => {
+                    log::error!("Failed to deserialize delete restore info for rollback: {}", e);
+                    continue;
+                }
+            };
+
+            log::debug!("Restoring row at index {} in table {}", restore_info.row_index, restore_info.table_name);
+
+            // Restore the row using the catalog manager
+            if let Some(ref catalog) = self.catalog {
+                if let Err(e) = catalog.table_manager.restore_row(
+                    &restore_info.table_name,
+                    restore_info.row_index,
+                    restore_info.old_row_data.clone()
+                ) {
+                    log::error!("Failed to restore row in table {}: {}", restore_info.table_name, e);
+                } else {
+                    log::debug!("Successfully restored row in table {} at index {}", restore_info.table_name, restore_info.row_index);
+                }
+            } else {
+                log::warn!("Cannot restore row: catalog manager not available");
+            }
         }
 
         // Update MVCC (abort removes all uncommitted versions)
@@ -336,10 +373,28 @@ impl TransactionManager {
     pub fn log_delete(
         &self,
         transaction_id: TransactionId,
-        page_id: crate::PageId,
-        offset: usize,
-        old_data: Vec<u8>,
+        table_name: String,
+        row_index: usize,
+        old_row_data: Vec<Value>,
     ) -> Result<()> {
+        // Create restoration info
+        let restore_info = DeleteRestoreInfo {
+            table_name,
+            row_index,
+            old_row_data,
+        };
+
+        // Serialize the restoration info
+        use bincode;
+        let restore_info_bytes = bincode::serialize(&restore_info)
+            .map_err(|e| crate::error::RustgreSQLError::Serialization(
+                format!("Failed to serialize delete restore info: {}", e)
+            ))?;
+
+        // Use row_index as the page_id for storage (simplified approach)
+        let page_id = row_index as crate::PageId;
+        let old_data = restore_info_bytes;
+
         // Update transaction's modified pages
         {
             let mut active = self.active_transactions.lock().unwrap();
@@ -356,7 +411,7 @@ impl TransactionManager {
                 0,
                 None, // prev_lsn will be set
                 page_id,
-                offset,
+                row_index,
                 old_data,
             );
 
@@ -377,6 +432,11 @@ impl TransactionManager {
     /// Get MVCC manager reference
     pub fn mvcc(&self) -> Arc<Mutex<MVCCManager>> {
         self.mvcc.clone()
+    }
+
+    /// Set catalog manager (needed for rollback operations)
+    pub fn set_catalog(&mut self, catalog: std::sync::Arc<crate::catalog::CatalogManager>) {
+        self.catalog = Some(catalog);
     }
 
     /// Get transaction statistics
