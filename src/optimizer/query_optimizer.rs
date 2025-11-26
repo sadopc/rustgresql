@@ -171,27 +171,76 @@ impl OptimizedQueryPlanner {
                             })
                             .collect();
 
-                        // Separate window functions from regular projections
-                        let (window_funcs, regular_projections): (Vec<_>, Vec<_>) = projections
-                            .into_iter()
-                            .partition(|(_name, expr)| matches!(expr, Expression::WindowFunction(_)));
+                        // Check if any projections contain window functions (recursively)
+                        let has_window_funcs = self.has_window_functions(&projections.iter().map(|(_, expr)| expr.clone()).collect::<Vec<_>>());
 
-                        // Apply regular projections if any
-                        if !regular_projections.is_empty() || window_funcs.is_empty() {
+                        if !has_window_funcs {
+                            // No window functions - simple projection
                             plan = PlanNode::Project {
                                 input: Box::new(plan),
-                                columns: if window_funcs.is_empty() { regular_projections.clone() } else { regular_projections },
+                                columns: projections,
                                 table_aliases: std::collections::HashMap::new(),
                                 left_columns: None,
                                 right_columns: None,
                             };
-                        }
+                        } else {
+                            // Window functions present - use three-stage approach
+                            let (base_columns, window_functions, computed_columns) =
+                                self.extract_and_replace_window_functions(&projections);
 
-                        // Apply window functions if any
-                        if !window_funcs.is_empty() {
-                            plan = PlanNode::Window {
+                            // Save column names before moving
+                            let base_column_names: Vec<String> = base_columns.iter().map(|(name, _)| name.clone()).collect();
+                            let window_function_names: Vec<String> = window_functions.iter().map(|(name, _)| name.clone()).collect();
+
+                            // First Project: base columns only
+                            if !base_columns.is_empty() {
+                                plan = PlanNode::Project {
+                                    input: Box::new(plan),
+                                    columns: base_columns,
+                                    table_aliases: std::collections::HashMap::new(),
+                                    left_columns: None,
+                                    right_columns: None,
+                                };
+                            }
+
+                            // Window node: compute window functions
+                            if !window_functions.is_empty() {
+                                plan = PlanNode::Window {
+                                    input: Box::new(plan),
+                                    window_functions: window_functions,
+                                };
+                            }
+
+                            // Final Project: all output columns
+                            let mut final_columns: Vec<(String, Expression)> = Vec::new();
+
+                            // Pass-through base columns
+                            for name in &base_column_names {
+                                final_columns.push((name.clone(), Expression::Column {
+                                    table: None,
+                                    name: name.clone(),
+                                }));
+                            }
+
+                            // Pass-through window function columns (only user-visible ones, not generated names)
+                            for name in &window_function_names {
+                                if !name.starts_with("win_func_") {
+                                    final_columns.push((name.clone(), Expression::Column {
+                                        table: None,
+                                        name: name.clone(),
+                                    }));
+                                }
+                            }
+
+                            // Add computed columns (which reference window function results)
+                            final_columns.extend(computed_columns);
+
+                            plan = PlanNode::Project {
                                 input: Box::new(plan),
-                                window_functions: window_funcs,
+                                columns: final_columns,
+                                table_aliases: std::collections::HashMap::new(),
+                                left_columns: None,
+                                right_columns: None,
                             };
                         }
                 }
@@ -756,6 +805,141 @@ impl OptimizedQueryPlanner {
                 name_a == name_b && args_a.len() == args_b.len()
             }
             _ => false,
+        }
+    }
+
+    /// Check if any expression contains window functions (recursively)
+    fn has_window_functions(&self, expressions: &[Expression]) -> bool {
+        expressions.iter().any(|expr| self.contains_window_functions(expr))
+    }
+
+    /// Recursively check if an expression contains window functions
+    fn contains_window_functions(&self, expr: &Expression) -> bool {
+        match expr {
+            Expression::WindowFunction(_) => true,
+            Expression::BinaryOp { left, right, .. } => {
+                self.contains_window_functions(left) || self.contains_window_functions(right)
+            }
+            Expression::UnaryOp { expr, .. } => self.contains_window_functions(expr),
+            Expression::Function { args, .. } => {
+                args.iter().any(|arg| self.contains_window_functions(arg))
+            }
+            Expression::Cast { expr, .. } => self.contains_window_functions(expr),
+            Expression::Case { base, branches, else_result } => {
+                base.as_ref().map(|e| self.contains_window_functions(e)).unwrap_or(false)
+                    || branches.iter().any(|b| {
+                        self.contains_window_functions(&b.condition)
+                            || self.contains_window_functions(&b.result)
+                    })
+                    || else_result.as_ref().map(|e| self.contains_window_functions(e)).unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+
+    /// Extract and replace window functions in complex expressions
+    /// Returns: (base_columns, window_functions, computed_columns)
+    fn extract_and_replace_window_functions(
+        &self,
+        projections: &[(String, Expression)],
+    ) -> (Vec<(String, Expression)>, Vec<(String, Expression)>, Vec<(String, Expression)>) {
+        let mut base_columns = Vec::new();
+        let mut window_functions = Vec::new();
+        let mut computed_columns = Vec::new();
+        let mut window_func_counter = 0;
+
+        for (name, expr) in projections {
+            if self.contains_window_functions(expr) {
+                if matches!(expr, Expression::WindowFunction(_)) {
+                    // Direct window function
+                    window_functions.push((name.clone(), expr.clone()));
+                } else {
+                    // Computed expression with embedded window functions
+                    let (extracted_funcs, modified_expr) =
+                        self.extract_window_functions_from_expression(expr, &mut window_func_counter);
+                    window_functions.extend(extracted_funcs);
+                    computed_columns.push((name.clone(), modified_expr));
+                }
+            } else {
+                base_columns.push((name.clone(), expr.clone()));
+            }
+        }
+
+        (base_columns, window_functions, computed_columns)
+    }
+
+    /// Extract window functions from an expression, replacing them with column references
+    fn extract_window_functions_from_expression(
+        &self,
+        expr: &Expression,
+        counter: &mut usize,
+    ) -> (Vec<(String, Expression)>, Expression) {
+        match expr {
+            Expression::WindowFunction(_) => {
+                let alias = format!("win_func_{}", *counter);
+                *counter += 1;
+                (
+                    vec![(alias.clone(), expr.clone())],
+                    Expression::Column { table: None, name: alias },
+                )
+            }
+            Expression::BinaryOp { left, op, right } => {
+                let (left_funcs, left_modified) =
+                    self.extract_window_functions_from_expression(left, counter);
+                let (right_funcs, right_modified) =
+                    self.extract_window_functions_from_expression(right, counter);
+                let mut all_funcs = left_funcs;
+                all_funcs.extend(right_funcs);
+                (
+                    all_funcs,
+                    Expression::BinaryOp {
+                        left: Box::new(left_modified),
+                        op: op.clone(),
+                        right: Box::new(right_modified),
+                    },
+                )
+            }
+            Expression::UnaryOp { op, expr: inner } => {
+                let (funcs, modified) =
+                    self.extract_window_functions_from_expression(inner, counter);
+                (
+                    funcs,
+                    Expression::UnaryOp {
+                        op: op.clone(),
+                        expr: Box::new(modified),
+                    },
+                )
+            }
+            Expression::Function { name, args, distinct } => {
+                let mut all_funcs = Vec::new();
+                let mut modified_args = Vec::new();
+                for arg in args {
+                    let (funcs, modified) =
+                        self.extract_window_functions_from_expression(arg, counter);
+                    all_funcs.extend(funcs);
+                    modified_args.push(modified);
+                }
+                (
+                    all_funcs,
+                    Expression::Function {
+                        name: name.clone(),
+                        args: modified_args,
+                        distinct: *distinct,
+                    },
+                )
+            }
+            Expression::Cast { expr: inner, data_type } => {
+                let (funcs, modified) =
+                    self.extract_window_functions_from_expression(inner, counter);
+                (
+                    funcs,
+                    Expression::Cast {
+                        expr: Box::new(modified),
+                        data_type: data_type.clone(),
+                    },
+                )
+            }
+            _ => (vec![], expr.clone()),
         }
     }
 }

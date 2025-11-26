@@ -85,6 +85,7 @@ pub enum TokenType {
     Data,
     Serial,
     BigSerial,
+    Cast,
 
     // Window function keywords
     RowNumber,
@@ -149,6 +150,7 @@ pub enum TokenType {
     Plus,
     Minus,
     Divide,
+    Concatenate,
 
     // Punctuation
     LeftParen,
@@ -163,6 +165,7 @@ pub enum TokenType {
     // Literals
     Identifier(String),
     String(String),
+    QuotedIdentifier(String),
     Number(String),
 
     // Special
@@ -253,6 +256,7 @@ impl Token {
                 | TokenType::Data
                 | TokenType::Serial
                 | TokenType::BigSerial
+                | TokenType::Cast
                 | TokenType::RowNumber
                 | TokenType::Rank
                 | TokenType::DenseRank
@@ -346,6 +350,12 @@ impl Lexer {
                 continue;
             }
 
+            // Handle double-quoted identifiers
+            if current_char == '"' {
+                self.consume_quoted_identifier()?;
+                continue;
+            }
+
             // Handle identifiers and keywords
             if current_char.is_alphabetic() || current_char == '_' {
                 self.consume_identifier_or_keyword();
@@ -406,6 +416,18 @@ impl Lexer {
                     self.add_token(TokenType::GreaterThanOrEquals, 2);
                 } else {
                     self.add_token(TokenType::GreaterThan, 1);
+                }
+                continue;
+            }
+
+            if current_char == '|' {
+                if self.peek_char() == Some('|') {
+                    self.add_token(TokenType::Concatenate, 2);
+                } else {
+                    return Err(crate::error::RustgreSQLError::Parse(
+                        format!("Unexpected character '|' at line {}, column {}",
+                               self.line, self.column)
+                    ));
                 }
                 continue;
             }
@@ -535,6 +557,49 @@ impl Lexer {
             start_line,
             start_column,
             string_value,
+        ));
+
+        Ok(())
+    }
+
+    /// Consume double-quoted identifier
+    fn consume_quoted_identifier(&mut self) -> Result<()> {
+        self.advance(1); // Skip opening quote
+        let start_line = self.line;
+        let start_column = self.column;
+        let mut identifier = String::new();
+
+        while !self.is_at_end() {
+            let current = self.current_char();
+
+            if current == '"' {
+                // Check for escaped quote
+                if self.peek_char() == Some('"') {
+                    identifier.push('"');
+                    self.advance(2); // Consume both quotes
+                } else {
+                    // End of identifier
+                    self.advance(1);
+                    break;
+                }
+            } else {
+                identifier.push(current);
+                self.advance(1);
+            }
+        }
+
+        if self.is_at_end() {
+            return Err(crate::error::RustgreSQLError::Parse(
+                format!("Unterminated quoted identifier starting at line {}, column {}",
+                       start_line, start_column)
+            ));
+        }
+
+        self.tokens.push(Token::new(
+            TokenType::QuotedIdentifier(identifier.clone()),
+            start_line,
+            start_column,
+            identifier,
         ));
 
         Ok(())
@@ -685,6 +750,7 @@ impl Lexer {
             "DATA" => TokenType::Data,
             "SERIAL" => TokenType::Serial,
             "BIGSERIAL" => TokenType::BigSerial,
+            "CAST" => TokenType::Cast,
             // Window functions - only tokenize as function keywords when followed by parentheses
             "ROW_NUMBER" => if is_followed_by_paren { TokenType::RowNumber } else { TokenType::Identifier(identifier.clone()) },
             "RANK" => if is_followed_by_paren { TokenType::Rank } else { TokenType::Identifier(identifier.clone()) },
@@ -895,5 +961,29 @@ mod tests {
         assert_eq!(tokens[7].token_type, TokenType::Identifier("ADD".to_string()));
         assert_eq!(tokens[8].token_type, TokenType::References);
         assert_eq!(tokens[9].token_type, TokenType::Check);
+    }
+
+    #[test]
+    fn test_quoted_identifiers() {
+        // Test basic quoted identifier
+        let mut lexer = Lexer::new("SELECT \"count\", \"sum\" FROM \"table\"");
+        let tokens = lexer.tokenize().unwrap();
+
+        assert_eq!(tokens[1].token_type, TokenType::QuotedIdentifier("count".to_string()));
+        assert_eq!(tokens[3].token_type, TokenType::QuotedIdentifier("sum".to_string()));
+        assert_eq!(tokens[5].token_type, TokenType::QuotedIdentifier("table".to_string()));
+
+        // Test quoted identifier with reserved keyword
+        assert_eq!(tokens[1].value, "count");
+        assert_eq!(tokens[3].value, "sum");
+    }
+
+    #[test]
+    fn test_quoted_identifier_with_escaped_quotes() {
+        // Test escaped double quotes
+        let mut lexer = Lexer::new("SELECT \"column\"\"name\" FROM users");
+        let tokens = lexer.tokenize().unwrap();
+
+        assert_eq!(tokens[1].token_type, TokenType::QuotedIdentifier("column\"name".to_string()));
     }
 }

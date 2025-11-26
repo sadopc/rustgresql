@@ -304,6 +304,7 @@ fn format_binary_operator(op: &crate::sql::ast::BinaryOperator) -> &'static str 
         crate::sql::ast::BinaryOperator::Subtract => "-",
         crate::sql::ast::BinaryOperator::Multiply => "*",
         crate::sql::ast::BinaryOperator::Divide => "/",
+        crate::sql::ast::BinaryOperator::Concatenate => "||",
     }
 }
 

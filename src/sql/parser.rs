@@ -216,7 +216,7 @@ impl Parser {
             // Check for alias (AS identifier or just identifier)
             if self.match_token(TokenType::As) {
                 alias = Some(self.consume_identifier()?);
-            } else if let TokenType::Identifier(_) = self.peek().token_type {
+            } else if matches!(self.peek().token_type, TokenType::Identifier(_) | TokenType::QuotedIdentifier(_)) {
                 // Check if next token is an alias (not a keyword)
                 let next_token = self.peek();
                 if !next_token.is_keyword() {
@@ -236,7 +236,7 @@ impl Parser {
                 // Check for alias (AS identifier or just identifier)
                 if self.match_token(TokenType::As) {
                     alias = Some(self.consume_identifier()?);
-                } else if let TokenType::Identifier(_) = self.peek().token_type {
+                } else if matches!(self.peek().token_type, TokenType::Identifier(_) | TokenType::QuotedIdentifier(_)) {
                     // Check if next token is an alias (not a keyword)
                     let next_token = self.peek();
                     if !next_token.is_keyword() {
@@ -391,7 +391,7 @@ impl Parser {
             // Check for alias (AS identifier or just identifier)
             if self.match_token(TokenType::As) {
                 alias = Some(self.consume_identifier()?);
-            } else if let TokenType::Identifier(_) = self.peek().token_type {
+            } else if matches!(self.peek().token_type, TokenType::Identifier(_) | TokenType::QuotedIdentifier(_)) {
                 // Check if next token is an alias (not a keyword)
                 let next_token = self.peek();
                 if !next_token.is_keyword() {
@@ -411,7 +411,7 @@ impl Parser {
                 // Check for alias (AS identifier or just identifier)
                 if self.match_token(TokenType::As) {
                     alias = Some(self.consume_identifier()?);
-                } else if let TokenType::Identifier(_) = self.peek().token_type {
+                } else if matches!(self.peek().token_type, TokenType::Identifier(_) | TokenType::QuotedIdentifier(_)) {
                     // Check if next token is an alias (not a keyword)
                     let next_token = self.peek();
                     if !next_token.is_keyword() {
@@ -426,13 +426,14 @@ impl Parser {
             }
         }
 
-        // Parse FROM clause
-        self.consume_token(TokenType::From, "Expected FROM")?;
+        // Parse FROM clause (optional for literal SELECTs)
         let mut from = Vec::new();
-        from.push(self.parse_table_ref()?);
-
-        while self.match_token(TokenType::Comma) {
+        if self.match_token(TokenType::From) {
             from.push(self.parse_table_ref()?);
+
+            while self.match_token(TokenType::Comma) {
+                from.push(self.parse_table_ref()?);
+            }
         }
 
         // Parse joins
@@ -1172,7 +1173,7 @@ impl Parser {
             let mut alias = None;
             if self.match_token(TokenType::As) {
                 alias = Some(self.consume_identifier()?);
-            } else if let TokenType::Identifier(_) = self.peek().token_type {
+            } else if matches!(self.peek().token_type, TokenType::Identifier(_) | TokenType::QuotedIdentifier(_)) {
                 // Check if next token is an alias (not a keyword)
                 let next_token = self.peek();
                 if !next_token.is_keyword() {
@@ -1191,7 +1192,7 @@ impl Parser {
 
             if self.match_token(TokenType::As) {
                 alias = Some(self.consume_identifier()?);
-            } else if let TokenType::Identifier(_) = self.peek().token_type {
+            } else if matches!(self.peek().token_type, TokenType::Identifier(_) | TokenType::QuotedIdentifier(_)) {
                 // Check if next token is an alias (not a keyword)
                 let next_token = self.peek();
                 if !next_token.is_keyword() {
@@ -1385,11 +1386,11 @@ impl Parser {
         Ok(expr)
     }
 
-    /// Parse additive expression (+, -)
+    /// Parse additive expression (+, -, ||)
     fn parse_additive_expression(&mut self) -> Result<Expression> {
         let mut expr = self.parse_multiplicative_expression()?;
 
-        while self.match_token(TokenType::Plus) || self.match_token(TokenType::Minus) {
+        while self.match_token(TokenType::Plus) || self.match_token(TokenType::Minus) || self.match_token(TokenType::Concatenate) {
             let op = self.previous().token_type.clone();
             let right = self.parse_multiplicative_expression()?;
 
@@ -1397,7 +1398,13 @@ impl Parser {
             // This would need proper type checking in a complete implementation
             expr = Expression::BinaryOp {
                 left: Box::new(expr),
-                op: if op == TokenType::Plus { BinaryOperator::Add } else { BinaryOperator::Subtract },
+                op: if op == TokenType::Plus {
+                    BinaryOperator::Add
+                } else if op == TokenType::Minus {
+                    BinaryOperator::Subtract
+                } else {
+                    BinaryOperator::Concatenate
+                },
                 right: Box::new(right),
             };
         }
@@ -1479,6 +1486,26 @@ impl Parser {
     /// Parse primary expression
     fn parse_primary_expression(&mut self) -> Result<Expression> {
         match &self.peek().token_type {
+            TokenType::Cast => {
+                self.advance(); // Consume 'CAST' token
+
+                self.consume_token(TokenType::LeftParen, "Expected '(' after CAST")?;
+
+                // Parse the expression to cast
+                let expr = self.parse_expression()?;
+
+                self.consume_token(TokenType::As, "Expected 'AS' after CAST expression")?;
+
+                // Parse the target data type
+                let data_type = self.parse_data_type()?;
+
+                self.consume_token(TokenType::RightParen, "Expected ')' after CAST data type")?;
+
+                Ok(Expression::Cast {
+                    expr: Box::new(expr),
+                    data_type,
+                })
+            }
             TokenType::String(_) => {
                 let value = self.advance().value.clone();
                 Ok(Expression::Value(crate::types::Value {
@@ -1499,7 +1526,7 @@ impl Parser {
                     }))
                 }
             }
-            TokenType::Identifier(name) => {
+            TokenType::Identifier(name) | TokenType::QuotedIdentifier(name) => {
                 let name = name.clone();
                 self.advance();
 
@@ -1703,11 +1730,56 @@ impl Parser {
                     negated: false,
                 })
             }
+            TokenType::Case => self.parse_case_expression(),
             _ => Err(RustgreSQLError::Parse(
                 format!("Unexpected token '{}' at line {}, column {}",
                        self.peek().value, self.peek().line, self.peek().column)
             ))
         }
+    }
+
+    /// Parse CASE expression
+    fn parse_case_expression(&mut self) -> Result<Expression> {
+        self.advance(); // Consume 'CASE' token
+
+        let mut base: Option<Box<Expression>> = None;
+        let mut branches = Vec::new();
+
+        // Check if this is a simple CASE (has an expression before WHEN)
+        // or a searched CASE (directly starts with WHEN)
+        if self.peek().token_type != TokenType::When {
+            // Simple CASE: CASE expr WHEN value THEN result
+            let expr = self.parse_expression()?;
+            base = Some(Box::new(expr));
+        }
+
+        // Parse WHEN...THEN branches
+        while self.match_token(TokenType::When) {
+            let condition = self.parse_expression()?;
+
+            self.consume_token(TokenType::Then, "Expected 'THEN' after WHEN condition")?;
+
+            let result = self.parse_expression()?;
+            branches.push(crate::sql::ast::CaseBranch {
+                condition: Box::new(condition),
+                result: Box::new(result),
+            });
+        }
+
+        // Parse optional ELSE clause
+        let else_result = if self.match_token(TokenType::Else) {
+            Some(Box::new(self.parse_expression()?))
+        } else {
+            None
+        };
+
+        self.consume_token(TokenType::End, "Expected 'END' after CASE expression")?;
+
+        Ok(Expression::Case {
+            base,
+            branches,
+            else_result,
+        })
     }
 
     /// Parse literal value for DEFAULT
@@ -1722,7 +1794,7 @@ impl Parser {
                     Ok(crate::types::Value::integer(n.parse().unwrap_or(0)))
                 }
             }
-            TokenType::Identifier(i) => Ok(crate::types::Value::string(i.clone())),
+            TokenType::Identifier(i) | TokenType::QuotedIdentifier(i) => Ok(crate::types::Value::string(i.clone())),
             TokenType::True => Ok(crate::types::Value::boolean(true)),
             TokenType::False => Ok(crate::types::Value::boolean(false)),
             _ => Err(RustgreSQLError::Parse(
@@ -1750,9 +1822,45 @@ impl Parser {
 
     /// Consume identifier
     fn consume_identifier(&mut self) -> Result<String> {
-        match self.peek().token_type {
-            TokenType::Identifier(ref name) => {
+        let token = self.peek();
+        match &token.token_type {
+            TokenType::Identifier(ref name) | TokenType::QuotedIdentifier(ref name) => {
                 let name = name.clone();
+                self.advance();
+                Ok(name)
+            }
+            TokenType::String(ref name) => {
+                let name = name.clone();
+                self.advance();
+                Ok(name)
+            }
+            // Accept keywords as identifiers (valid in SQL when not used in keyword context)
+            TokenType::Select | TokenType::Insert | TokenType::Update | TokenType::Delete |
+            TokenType::Create | TokenType::Table | TokenType::Index | TokenType::From | TokenType::Where |
+            TokenType::Into | TokenType::Values | TokenType::Primary | TokenType::Key | TokenType::Not |
+            TokenType::Null | TokenType::And | TokenType::Or | TokenType::Order | TokenType::By |
+            TokenType::Group | TokenType::Having | TokenType::Join | TokenType::Inner | TokenType::Left |
+            TokenType::Right | TokenType::Full | TokenType::Outer | TokenType::Cross | TokenType::Anti |
+            TokenType::Semi | TokenType::On | TokenType::As | TokenType::Distinct | TokenType::Count |
+            TokenType::Sum | TokenType::Avg | TokenType::Min | TokenType::Max | TokenType::Set |
+            TokenType::Drop | TokenType::Alter | TokenType::References | TokenType::If | TokenType::Exists |
+            TokenType::Default | TokenType::Check | TokenType::Constraint | TokenType::Foreign |
+            TokenType::Add | TokenType::Column | TokenType::Rename | TokenType::To | TokenType::Union |
+            TokenType::Intersect | TokenType::Except | TokenType::All | TokenType::Unique | TokenType::Over |
+            TokenType::Partition | TokenType::Window | TokenType::Rows | TokenType::Range | TokenType::Between |
+            TokenType::Unbounded | TokenType::Preceding | TokenType::Following | TokenType::Current |
+            TokenType::With | TokenType::Recursive | TokenType::View | TokenType::Materialized | TokenType::Refresh |
+            TokenType::Concurrently | TokenType::Cascade | TokenType::Data | TokenType::Serial | TokenType::BigSerial |
+            TokenType::Cast | TokenType::RowNumber | TokenType::Rank | TokenType::DenseRank | TokenType::Lag |
+            TokenType::Lead | TokenType::FirstValue | TokenType::LastValue | TokenType::Ntile | TokenType::Asc |
+            TokenType::Desc | TokenType::Nulls | TokenType::First | TokenType::Last | TokenType::True |
+            TokenType::False | TokenType::Procedure | TokenType::Function | TokenType::Language | TokenType::Begin |
+            TokenType::End | TokenType::Commit | TokenType::Rollback | TokenType::Declare | TokenType::Loop |
+            TokenType::While | TokenType::For | TokenType::Then | TokenType::Else | TokenType::Case |
+            TokenType::When | TokenType::Return | TokenType::Exit | TokenType::Continue | TokenType::Perform |
+            TokenType::Raise | TokenType::Exception | TokenType::Replace | TokenType::Definer | TokenType::Of |
+            TokenType::Call | TokenType::Security | TokenType::Like | TokenType::ILike | TokenType::In | TokenType::Is => {
+                let name = token.value.clone();
                 self.advance();
                 Ok(name)
             }
@@ -1790,7 +1898,7 @@ impl Parser {
     fn match_identifier_token(&mut self, identifier: &str) -> Result<bool> {
         let token_type = self.peek().token_type.clone();
         match token_type {
-            TokenType::Identifier(id) if id.to_uppercase() == identifier => {
+            TokenType::Identifier(id) | TokenType::QuotedIdentifier(id) if id.to_uppercase() == identifier => {
                 self.advance();
                 Ok(true)
             }
@@ -1886,7 +1994,7 @@ impl Parser {
         if self.match_token(TokenType::Current) {
             // Check for "ROW" identifier in "CURRENT ROW"
             match &self.peek().token_type {
-                TokenType::Identifier(id) if id.to_uppercase() == "ROW" => {
+                TokenType::Identifier(id) | TokenType::QuotedIdentifier(id) if id.to_uppercase() == "ROW" => {
                     self.advance();
                 }
                 _ => {
@@ -1926,7 +2034,7 @@ impl Parser {
     fn parse_named_window(&mut self) -> Result<NamedWindow> {
         // Parse window name (identifier)
         let window_name = match &self.peek().token_type {
-            TokenType::Identifier(name) => {
+            TokenType::Identifier(name) | TokenType::QuotedIdentifier(name) => {
                 let name = name.clone();
                 self.advance();
                 name
@@ -2869,6 +2977,27 @@ mod tests {
             assert!(delete.where_clause.is_some());
         } else {
             panic!("Expected DELETE statement");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_union_all_parsing() -> Result<()> {
+        let sql = "SELECT 'High Earners' AS category, COUNT(*) AS count FROM employees WHERE salary > 80000.00 UNION ALL SELECT 'Low Earners' AS category, COUNT(*) AS count FROM employees WHERE salary <= 60000.00 UNION ALL SELECT 'Mid Range' AS category, COUNT(*) AS count FROM employees WHERE salary > 60000.00 AND salary <= 80000.00;";
+
+        println!("Testing UNION ALL query parsing...");
+        println!("SQL: {}", sql);
+
+        match parse_sql(sql) {
+            Ok(statements) => {
+                println!("Successfully parsed {} statements", statements.len());
+                assert!(statements.len() > 0);
+            }
+            Err(e) => {
+                println!("Parse error: {:?}", e);
+                return Err(e);
+            }
         }
 
         Ok(())

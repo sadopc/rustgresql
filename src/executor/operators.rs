@@ -223,6 +223,7 @@ impl FilterOperator {
                     None
                 }
             }
+            PlanNode::CTEScan { alias, cte_name } => alias.clone().or_else(|| Some(cte_name.clone())),
             _ => None,
         }
     }
@@ -400,12 +401,23 @@ impl ProjectOperator {
                     None
                 }
             }
+            PlanNode::CTEScan { alias, cte_name } => alias.clone().or_else(|| Some(cte_name.clone())),
             _ => None,
         }
     }
 
     pub fn execute(&self, context: &mut ExecutionContext) -> Result<QueryResult> {
         let input_result = self.input.execute(context)?;
+        println!("DEBUG: ProjectOperator executing with {} input columns: {:?}", input_result.column_names.len(), input_result.column_names);
+        println!("DEBUG: ProjectOperator has {} output columns:", self.columns.len());
+        for (i, (name, expr)) in self.columns.iter().enumerate() {
+            println!("DEBUG:   Output column {}: {} = {:?}", i, name, match expr {
+                Expression::Column { name, .. } => format!("Column({})", name),
+                Expression::BinaryOp { .. } => "BinaryOp(...)".to_string(),
+                Expression::WindowFunction(_) => "WindowFunction".to_string(),
+                _ => format!("{:?}", expr).chars().take(30).collect::<String>(),
+            });
+        }
 
         // Extract column names and compute projected values using real expression evaluator
         let column_names: Vec<String> = self.columns.iter().map(|(name, _)| name.clone()).collect();
@@ -2771,16 +2783,20 @@ impl WindowOperator {
     pub fn execute(&self, context: &mut ExecutionContext) -> Result<QueryResult> {
         context.log("Executing WindowOperator");
         println!("DEBUG: WindowOperator executing with {} window functions", self.window_functions.len());
+        for (i, (alias, _)) in self.window_functions.iter().enumerate() {
+            println!("DEBUG: Window function {} has alias '{}'", i, alias);
+        }
 
         // Execute input to get source data
         let input_result = self.input.execute(context)?;
         context.log(&format!("WindowOperator received {} rows from input", input_result.rows.len()));
+        println!("DEBUG: WindowOperator input columns: {:?}", input_result.column_names);
 
         if input_result.rows.is_empty() {
             // Return empty result with window function columns
             let mut column_names = input_result.column_names.clone();
-            for (i, window_func) in self.window_functions.iter().enumerate() {
-                column_names.push(format!("window_{}", i));
+            for (alias, _) in &self.window_functions {
+                column_names.push(alias.clone());
             }
             return Ok(QueryResult {
                 rows: Vec::new(),
@@ -2796,6 +2812,10 @@ impl WindowOperator {
 
         // Apply window functions to each partition
         let (result_rows, result_column_names) = self.apply_window_functions(partitions, &input_result.column_names)?;
+        println!("DEBUG: WindowOperator producing {} output columns: {:?}", result_column_names.len(), result_column_names);
+        for (i, col_name) in result_column_names.iter().enumerate() {
+            println!("DEBUG: Output column {}: '{}'", i, col_name);
+        }
 
         context.log(&format!("WindowOperator returning {} rows", result_rows.len()));
 
@@ -2915,33 +2935,79 @@ impl WindowOperator {
         }
 
         for partition in partitions {
-            // Initialize window function states for this partition
-            let mut window_states: Vec<WindowFunctionState> = self.window_functions
-                .iter()
-                .enumerate()
-                .map(|(i, (_alias, window_func))| self.initialize_window_function(i, window_func))
-                .collect();
+            // For each window function, we need to process in its specific sorted order
+            // Collect all window function results, then combine with original rows
+            let num_funcs = self.window_functions.len();
+            let num_rows = partition.len();
 
-            // Process each row in the partition
-            for (row_index, row) in partition.iter().enumerate() {
-                let mut result_row = row.clone();
+            // window_results[func_index][original_row_index] = Value
+            let mut window_results: Vec<Vec<Value>> = vec![vec![Value { kind: ValueKind::Null(crate::types::NullValue) }; num_rows]; num_funcs];
 
-                // Evaluate each window function for this row
-                for (func_index, (_alias, window_func)) in self.window_functions.iter().enumerate() {
+            for (func_index, (_alias, window_func)) in self.window_functions.iter().enumerate() {
+                // Sort partition according to THIS window function's ORDER BY
+                // Keep track of original indices so we can map results back
+                let mut sorted_with_indices: Vec<(usize, Vec<Value>)> = partition
+                    .iter()
+                    .enumerate()
+                    .map(|(i, row)| (i, row.clone()))
+                    .collect();
+
+                // Sort by this window function's ORDER BY clause
+                let func_order_by = &window_func.window_clause.order_by;
+                if !func_order_by.is_empty() {
+                    sorted_with_indices.sort_by(|(_, a), (_, b)| {
+                        for order_by_expr in func_order_by {
+                            let context_a = self.create_sorting_context(a, input_column_names);
+                            let context_b = self.create_sorting_context(b, input_column_names);
+
+                            let val_a = evaluator.evaluate(&order_by_expr.expr, &context_a);
+                            let val_b = evaluator.evaluate(&order_by_expr.expr, &context_b);
+
+                            match (val_a, val_b) {
+                                (Ok(a_val), Ok(b_val)) => {
+                                    let ordering = compare_values(&a_val, &b_val, order_by_expr.nulls);
+                                    if ordering != std::cmp::Ordering::Equal {
+                                        return if order_by_expr.direction == crate::sql::ast::SortDirection::Desc {
+                                            ordering.reverse()
+                                        } else {
+                                            ordering
+                                        };
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        std::cmp::Ordering::Equal
+                    });
+                }
+
+                // Now evaluate this window function on the sorted partition
+                let sorted_partition: Vec<Vec<Value>> = sorted_with_indices.iter().map(|(_, row)| row.clone()).collect();
+                let mut state = self.initialize_window_function(func_index, window_func);
+
+                for (sorted_row_index, (original_index, row)) in sorted_with_indices.iter().enumerate() {
                     let context = self.create_sorting_context(row, input_column_names);
-                    let window_value = self.evaluate_window_function(
+                    let window_value = self.evaluate_window_function_with_order(
                         func_index,
                         window_func,
-                        &partition,
-                        row_index,
-                        &mut window_states[func_index],
+                        &sorted_partition,
+                        sorted_row_index,
+                        &mut state,
                         &evaluator,
                         &context,
                         input_column_names,
                     )?;
-                    result_row.push(window_value);
+                    // Store result at original row index
+                    window_results[func_index][*original_index] = window_value;
                 }
+            }
 
+            // Combine original rows with all window function results
+            for (row_idx, row) in partition.iter().enumerate() {
+                let mut result_row = row.clone();
+                for func_results in &window_results {
+                    result_row.push(func_results[row_idx].clone());
+                }
                 result_rows.push(result_row);
             }
         }
@@ -3179,6 +3245,132 @@ impl WindowOperator {
         }
     }
 
+    /// Evaluate a window function using the function's own ORDER BY clause
+    /// This is used when each window function may have different ORDER BY
+    fn evaluate_window_function_with_order(
+        &self,
+        func_index: usize,
+        window_func: &crate::sql::ast::WindowFunction,
+        partition: &[Vec<Value>],
+        current_row_index: usize,
+        state: &mut WindowFunctionState,
+        evaluator: &ExpressionEvaluator,
+        context: &EvaluationContext,
+        input_column_names: &[String],
+    ) -> Result<Value> {
+        match window_func.name.to_uppercase().as_str() {
+            "ROW_NUMBER" => {
+                if let WindowFunctionState::RowNumber { count } = state {
+                    *count += 1;
+                    Ok(Value { kind: ValueKind::Integer(*count as i64) })
+                } else {
+                    Err(crate::error::RustgreSQLError::InvalidOperation("Invalid window function state for ROW_NUMBER".to_string()))
+                }
+            }
+            "RANK" => {
+                if let WindowFunctionState::Rank { current_rank, prev_values } = state {
+                    // Use the window function's own ORDER BY, not self.order_by
+                    let current_values = self.get_order_by_values_for_func(
+                        partition,
+                        current_row_index,
+                        evaluator,
+                        &window_func.window_clause.order_by,
+                        input_column_names,
+                    )?;
+
+                    if let Some(ref prev_vals) = prev_values {
+                        if self.values_equal(&current_values, prev_vals) {
+                            // Same values as previous row, same rank
+                            Ok(Value { kind: ValueKind::Integer(*current_rank as i64) })
+                        } else {
+                            // Different values, rank = number of previous rows + 1
+                            *current_rank = current_row_index + 1;
+                            *prev_values = Some(current_values);
+                            Ok(Value { kind: ValueKind::Integer(*current_rank as i64) })
+                        }
+                    } else {
+                        // First row
+                        *current_rank = 1;
+                        *prev_values = Some(current_values);
+                        Ok(Value { kind: ValueKind::Integer(1) })
+                    }
+                } else {
+                    Err(crate::error::RustgreSQLError::InvalidOperation("Invalid window function state for RANK".to_string()))
+                }
+            }
+            "DENSE_RANK" => {
+                if let WindowFunctionState::DenseRank { current_rank, prev_values } = state {
+                    // Use the window function's own ORDER BY, not self.order_by
+                    let current_values = self.get_order_by_values_for_func(
+                        partition,
+                        current_row_index,
+                        evaluator,
+                        &window_func.window_clause.order_by,
+                        input_column_names,
+                    )?;
+
+                    if let Some(ref prev_vals) = prev_values {
+                        if self.values_equal(&current_values, prev_vals) {
+                            // Same values as previous row, same rank
+                            Ok(Value { kind: ValueKind::Integer(*current_rank as i64) })
+                        } else {
+                            // Different values, increment rank
+                            *current_rank += 1;
+                            *prev_values = Some(current_values);
+                            Ok(Value { kind: ValueKind::Integer(*current_rank as i64) })
+                        }
+                    } else {
+                        // First row
+                        *current_rank = 1;
+                        *prev_values = Some(current_values);
+                        Ok(Value { kind: ValueKind::Integer(1) })
+                    }
+                } else {
+                    Err(crate::error::RustgreSQLError::InvalidOperation("Invalid window function state for DENSE_RANK".to_string()))
+                }
+            }
+            // For other window functions, delegate to the original method
+            _ => self.evaluate_window_function(
+                func_index,
+                window_func,
+                partition,
+                current_row_index,
+                state,
+                evaluator,
+                context,
+                input_column_names,
+            ),
+        }
+    }
+
+    /// Get ORDER BY values using a specific ORDER BY clause (not self.order_by)
+    fn get_order_by_values_for_func(
+        &self,
+        partition: &[Vec<Value>],
+        row_index: usize,
+        evaluator: &ExpressionEvaluator,
+        order_by: &[crate::sql::ast::OrderBy],
+        input_column_names: &[String],
+    ) -> Result<Vec<Value>> {
+        let mut values = Vec::new();
+        let row = &partition[row_index];
+
+        // Create temporary context with row data
+        let mut temp_context = EvaluationContext::new();
+        for (i, column_name) in input_column_names.iter().enumerate() {
+            if i < row.len() {
+                temp_context.columns.insert(column_name.clone(), row[i].clone());
+            }
+        }
+
+        for order_by_expr in order_by {
+            let value = evaluator.evaluate(&order_by_expr.expr, &temp_context)?;
+            values.push(value);
+        }
+
+        Ok(values)
+    }
+
     /// Get ORDER BY values for a specific row
     fn get_order_by_values(&self, partition: &[Vec<Value>], row_index: usize, evaluator: &ExpressionEvaluator, context: &EvaluationContext) -> Result<Vec<Value>> {
         let mut values = Vec::new();
@@ -3240,7 +3432,9 @@ impl WindowOperator {
         let mut frame_start = 0;
         let mut frame_end = current_row_index;
 
-        // If no window frame is specified, default to RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        // If no window frame is specified:
+        // - If there's an ORDER BY, default to RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        // - If there's no ORDER BY, default to RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING (entire partition)
         if let Some(ref frame) = window_func.window_clause.window_frame {
             match frame.mode {
                 crate::sql::ast::WindowFrameMode::Rows => {
@@ -3320,6 +3514,15 @@ impl WindowOperator {
                         "RANGE mode not yet implemented for window frames".to_string()
                     ));
                 }
+            }
+        } else {
+            // No explicit window frame specified
+            if window_func.window_clause.order_by.is_empty() {
+                // No ORDER BY: aggregate over entire partition (unbounded preceding to unbounded following)
+                frame_end = partition_size - 1;
+            } else {
+                // Has ORDER BY but no frame: default to unbounded preceding to current row
+                // (this is already set by the initialization above)
             }
         }
 

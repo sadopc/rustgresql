@@ -340,26 +340,163 @@ mod tests {
         assert!(result.is_ok(), "Failed to parse original failing query: {:?}", result.err());
 
         // Verify the AST structure is correct
-        let ast = result.unwrap();
-        if let Some(select_statement) = ast.body.iter().find_map(|stmt| {
+        let statements = result.unwrap();
+        if let Some(select_statement) = statements.iter().find_map(|stmt| {
             match stmt {
                 crate::sql::ast::Statement::Select(select) => Some(select),
                 _ => None,
             }
         }) {
-            // Verify we have a window function
-            let has_window_function = select_statement.columns.iter().any(|col| {
-                contains_window_function(&col.expr)
-            });
+            // Verify we have a window function - handle the SelectStatement enum
+            let has_window_function = if let crate::sql::ast::SelectStatement::Simple { columns, .. } = select_statement {
+                columns.iter().any(|col| {
+                    contains_window_function(&col.expr)
+                })
+            } else {
+                false
+            };
 
             assert!(has_window_function, "AST should contain a window function");
+        }
+    }
+
+    #[test]
+    fn test_complex_expressions_with_window_functions() {
+        // Test the specific case mentioned in the issue: e.salary - AVG(e.salary) OVER (PARTITION BY e.department_id)
+        let sql = "SELECT
+                     e.salary - AVG(e.salary) OVER (PARTITION BY e.department_id) as salary_diff,
+                     e.name,
+                     e.department_id,
+                     e.salary
+                  FROM employees e";
+
+        let mut lexer = Lexer::new(sql);
+        let tokens = lexer.tokenize().unwrap();
+
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+
+        assert!(result.is_ok(), "Failed to parse complex expression with window function: {:?}", result.err());
+
+        let statements = result.unwrap();
+        assert!(!statements.is_empty());
+
+        if let crate::sql::ast::Statement::Select(select) = &statements[0] {
+            if let crate::sql::ast::SelectStatement::Simple { columns, .. } = select {
+                // Find the complex expression column
+                let complex_expr_col = columns.iter().find(|col| col.alias.as_ref().map_or(false, |alias| alias == "salary_diff"));
+                assert!(complex_expr_col.is_some(), "Expected to find salary_diff column");
+
+                // Verify it contains a window function
+                let expr = &complex_expr_col.unwrap().expr;
+
+                // Test the planner's contains_window_functions method
+                let planner = crate::executor::planner::QueryPlanner::new();
+                assert!(planner.contains_window_functions(expr), "Planner should detect window function in complex expression");
+
+                // Test the extraction and replacement logic
+                let mut counter = 0;
+                let (extracted_funcs, modified_expr) = planner.extract_window_functions_from_expression(expr, &mut counter);
+
+                assert_eq!(extracted_funcs.len(), 1, "Should extract exactly one window function");
+                assert!(matches!(&extracted_funcs[0].1, crate::sql::ast::Expression::WindowFunction(_)),
+                        "Extracted function should be a WindowFunction");
+
+                // The modified expression should be a BinaryOp with a column reference on the right side
+                if let crate::sql::ast::Expression::BinaryOp { left: _, op, right } = &modified_expr {
+                    assert!(matches!(op, crate::sql::ast::BinaryOperator::Subtract), "Should be subtraction");
+
+                    // Right side should be a column reference to the extracted window function
+                    if let crate::sql::ast::Expression::Column { name, .. } = right.as_ref() {
+                        assert!(name.starts_with("win_func_"), "Should reference generated window function name");
+                    } else {
+                        panic!("Right side should be a column reference, got {:?}", right);
+                    }
+                } else {
+                    panic!("Modified expression should be BinaryOp, got {:?}", modified_expr);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_multiple_window_functions_in_complex_expression() {
+        // Test an expression with multiple window functions
+        let sql = "SELECT
+                     AVG(salary) OVER (PARTITION BY department) - LAG(salary, 1) OVER (ORDER BY hire_date) as diff_with_lag
+                  FROM employees";
+
+        let mut lexer = Lexer::new(sql);
+        let tokens = lexer.tokenize().unwrap();
+
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+
+        assert!(result.is_ok(), "Failed to parse expression with multiple window functions: {:?}", result.err());
+
+        let statements = result.unwrap();
+        if let crate::sql::ast::Statement::Select(select) = &statements[0] {
+            if let crate::sql::ast::SelectStatement::Simple { columns, .. } = select {
+                let expr = &columns[0].expr;
+
+                let planner = crate::executor::planner::QueryPlanner::new();
+                assert!(planner.contains_window_functions(expr), "Should detect window functions");
+
+                let mut counter = 0;
+                let (extracted_funcs, modified_expr) = planner.extract_window_functions_from_expression(expr, &mut counter);
+
+                assert_eq!(extracted_funcs.len(), 2, "Should extract exactly two window functions");
+
+                // The modified expression should be a BinaryOp with two column references
+                if let crate::sql::ast::Expression::BinaryOp { left, right, .. } = &modified_expr {
+                    if let (crate::sql::ast::Expression::Column { name: left_name, .. },
+                            crate::sql::ast::Expression::Column { name: right_name, .. }) = (left.as_ref(), right.as_ref()) {
+                        assert!(left_name.starts_with("win_func_"), "Left should reference window function");
+                        assert!(right_name.starts_with("win_func_"), "Right should reference window function");
+                        assert_ne!(left_name, right_name, "Should be different window function references");
+                    } else {
+                        panic!("Both sides should be column references");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_nested_window_function_expressions() {
+        // Test deeply nested expressions containing window functions
+        let sql = "SELECT
+                     (e.salary * 2) - (AVG(e.salary) OVER (PARTITION BY e.department_id) + 1000) as complex_calc
+                  FROM employees e";
+
+        let mut lexer = Lexer::new(sql);
+        let tokens = lexer.tokenize().unwrap();
+
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse();
+
+        assert!(result.is_ok(), "Failed to parse nested expression: {:?}", result.err());
+
+        let statements = result.unwrap();
+        if let crate::sql::ast::Statement::Select(select) = &statements[0] {
+            if let crate::sql::ast::SelectStatement::Simple { columns, .. } = select {
+                let expr = &columns[0].expr;
+
+                let planner = crate::executor::planner::QueryPlanner::new();
+                assert!(planner.contains_window_functions(expr), "Should detect window function in nested expression");
+
+                let mut counter = 0;
+                let (extracted_funcs, _modified_expr) = planner.extract_window_functions_from_expression(expr, &mut counter);
+
+                assert_eq!(extracted_funcs.len(), 1, "Should extract exactly one window function from nested expression");
+            }
         }
     }
 
     // Helper function to check if an expression contains a window function
     fn contains_window_function(expr: &crate::sql::ast::Expression) -> bool {
         match expr {
-            crate::sql::ast::Expression::Function { window_clause: Some(_), .. } => true,
+            crate::sql::ast::Expression::WindowFunction(_) => true,
             crate::sql::ast::Expression::Function { args, .. } => {
                 args.iter().any(|arg| contains_window_function(arg))
             }
@@ -367,6 +504,9 @@ mod tests {
                 contains_window_function(left) || contains_window_function(right)
             }
             crate::sql::ast::Expression::UnaryOp { expr, .. } => {
+                contains_window_function(expr)
+            }
+            crate::sql::ast::Expression::Cast { expr, .. } => {
                 contains_window_function(expr)
             }
             _ => false,

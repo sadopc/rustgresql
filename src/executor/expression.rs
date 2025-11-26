@@ -506,6 +506,7 @@ impl ExpressionEvaluator {
                     }
 
                     // Not found
+                    println!("WARNING: Column '{}' not found in evaluation context", name);
                     Ok(Value { kind: ValueKind::Null(NullValue) })
                 } else {
                     // Unqualified column: check columns map first
@@ -516,9 +517,11 @@ impl ExpressionEvaluator {
                         if let Some(idx) = context.columns.keys().position(|k| k == name) {
                             Ok(row_data[idx].clone())
                         } else {
+                            println!("WARNING: Column '{}' not found in evaluation context (row_data)", name);
                             Ok(Value { kind: ValueKind::Null(NullValue) })
                         }
                     } else {
+                        println!("WARNING: Column '{}' not found in evaluation context (no row_data)", name);
                         Ok(Value { kind: ValueKind::Null(NullValue) })
                     }
                 }
@@ -555,6 +558,14 @@ impl ExpressionEvaluator {
                 Self::evaluate_unary_operation(*op, &inner_val)
             }
 
+            Expression::Cast { expr, data_type } => {
+                // Evaluate the expression to cast
+                let value = self.evaluate(expr, context)?;
+
+                // Perform type conversion
+                Self::evaluate_cast(&value, data_type)
+            }
+
             Expression::Function { name, args, distinct: _ } => {
                 self.evaluate_function(name, args, context)
             }
@@ -587,6 +598,41 @@ impl ExpressionEvaluator {
                 Err(RustgreSQLError::InvalidOperation("Window functions must be evaluated by WindowOperator".to_string()))
             }
 
+            Expression::Case { base, branches, else_result } => {
+                // Evaluate CASE expression
+                // For simple CASE (has base expression), we compare the base against each WHEN value
+                // For searched CASE (no base), we evaluate each WHEN condition
+
+                if let Some(base_expr) = base {
+                    // Simple CASE: CASE expr WHEN value1 THEN result1 WHEN value2 THEN result2 ELSE result END
+                    let base_value = self.evaluate(base_expr, context)?;
+
+                    for branch in branches {
+                        let when_value = self.evaluate(&branch.condition, context)?;
+                        // Compare base_value with when_value using equality
+                        let equals_result = Self::evaluate_equals(&base_value, &when_value)?;
+                        if matches!(ThreeValuedLogic::from_value(&equals_result), ThreeValuedLogic::True) {
+                            return Ok(self.evaluate(&branch.result, context)?);
+                        }
+                    }
+                } else {
+                    // Searched CASE: CASE WHEN cond1 THEN result1 WHEN cond2 THEN result2 ELSE result END
+                    for branch in branches {
+                        let condition_value = self.evaluate(&branch.condition, context)?;
+                        if matches!(ThreeValuedLogic::from_value(&condition_value), ThreeValuedLogic::True) {
+                            return Ok(self.evaluate(&branch.result, context)?);
+                        }
+                    }
+                }
+
+                // No branch matched, return ELSE result or NULL
+                if let Some(else_expr) = else_result {
+                    Ok(self.evaluate(else_expr, context)?)
+                } else {
+                    Ok(Value { kind: crate::types::ValueKind::Null(crate::types::NullValue) })
+                }
+            }
+
             Expression::Exists { subquery, negated } => {
                 // Execute the subquery and check if it returns any rows
                 self.evaluate_exists_subquery(subquery.as_ref(), *negated, context)
@@ -609,6 +655,7 @@ impl ExpressionEvaluator {
             BinaryOperator::Subtract => Self::evaluate_subtraction(left, right),
             BinaryOperator::Multiply => Self::evaluate_multiplication(left, right),
             BinaryOperator::Divide => Self::evaluate_division(left, right),
+            BinaryOperator::Concatenate => Self::evaluate_concatenation(left, right),
 
             // Comparison operators
             BinaryOperator::Equals => Self::evaluate_equals(left, right),
@@ -673,6 +720,83 @@ impl ExpressionEvaluator {
         }
     }
 
+    /// Evaluate a CAST expression
+    fn evaluate_cast(value: &Value, target_type: &crate::types::DataType) -> Result<Value> {
+        // If the value is NULL, the result is always NULL
+        if let ValueKind::Null(_) = value.kind {
+            return Ok(Value { kind: ValueKind::Null(NullValue) });
+        }
+
+        match &target_type.kind {
+            crate::types::DataTypeKind::Varchar(_) => {
+                // Convert to VARCHAR (string)
+                match &value.kind {
+                    ValueKind::String(s) => Ok(Value { kind: ValueKind::String(s.clone()) }),
+                    ValueKind::Integer(i) => Ok(Value { kind: ValueKind::String(i.to_string()) }),
+                    ValueKind::Float(f) => Ok(Value { kind: ValueKind::String(f.to_string()) }),
+                    ValueKind::Boolean(b) => Ok(Value { kind: ValueKind::String(b.to_string()) }),
+                    ValueKind::Timestamp(t) => Ok(Value { kind: ValueKind::String(t.to_string()) }),
+                    ValueKind::List(_) => Ok(Value { kind: ValueKind::String("[list]".to_string()) }),
+                    ValueKind::Null(_) => Ok(Value { kind: ValueKind::Null(NullValue) }),
+                }
+            }
+            crate::types::DataTypeKind::Integer => {
+                // Convert to INTEGER
+                match &value.kind {
+                    ValueKind::Integer(i) => Ok(Value { kind: ValueKind::Integer(*i) }),
+                    ValueKind::Float(f) => Ok(Value { kind: ValueKind::Integer(*f as i64) }),
+                    ValueKind::String(s) => {
+                        if let Ok(i) = s.parse::<i64>() {
+                            Ok(Value { kind: ValueKind::Integer(i) })
+                        } else {
+                            Ok(Value { kind: ValueKind::Null(NullValue) })
+                        }
+                    }
+                    ValueKind::Boolean(b) => Ok(Value { kind: ValueKind::Integer(if *b { 1 } else { 0 }) }),
+                    ValueKind::Null(_) => Ok(Value { kind: ValueKind::Null(NullValue) }),
+                    _ => Ok(Value { kind: ValueKind::Null(NullValue) }),
+                }
+            }
+            crate::types::DataTypeKind::Real | crate::types::DataTypeKind::DoublePrecision => {
+                // Convert to FLOAT
+                match &value.kind {
+                    ValueKind::Integer(i) => Ok(Value { kind: ValueKind::Float(*i as f64) }),
+                    ValueKind::Float(f) => Ok(Value { kind: ValueKind::Float(*f) }),
+                    ValueKind::String(s) => {
+                        if let Ok(f) = s.parse::<f64>() {
+                            Ok(Value { kind: ValueKind::Float(f) })
+                        } else {
+                            Ok(Value { kind: ValueKind::Null(NullValue) })
+                        }
+                    }
+                    ValueKind::Null(_) => Ok(Value { kind: ValueKind::Null(NullValue) }),
+                    _ => Ok(Value { kind: ValueKind::Null(NullValue) }),
+                }
+            }
+            crate::types::DataTypeKind::Boolean => {
+                // Convert to BOOLEAN
+                match &value.kind {
+                    ValueKind::Boolean(b) => Ok(Value { kind: ValueKind::Boolean(*b) }),
+                    ValueKind::Integer(i) => Ok(Value { kind: ValueKind::Boolean(*i != 0) }),
+                    ValueKind::String(s) => {
+                        let s_lower = s.to_lowercase();
+                        if s_lower == "true" || s_lower == "t" || s_lower == "1" {
+                            Ok(Value { kind: ValueKind::Boolean(true) })
+                        } else if s_lower == "false" || s_lower == "f" || s_lower == "0" {
+                            Ok(Value { kind: ValueKind::Boolean(false) })
+                        } else {
+                            Ok(Value { kind: ValueKind::Null(NullValue) })
+                        }
+                    }
+                    ValueKind::Null(_) => Ok(Value { kind: ValueKind::Null(NullValue) }),
+                    _ => Ok(Value { kind: ValueKind::Null(NullValue) }),
+                }
+            }
+            // Add more type conversions as needed
+            _ => Ok(Value { kind: ValueKind::Null(NullValue) }),
+        }
+    }
+
     /// Handle NULL values in binary operations according to SQL three-valued logic
     fn handle_null_in_binary_operation(op: BinaryOperator) -> Result<Value> {
         match op {
@@ -688,7 +812,8 @@ impl ExpressionEvaluator {
             }
             // Arithmetic operators return NULL if either operand is NULL
             BinaryOperator::Add | BinaryOperator::Subtract |
-            BinaryOperator::Multiply | BinaryOperator::Divide => {
+            BinaryOperator::Multiply | BinaryOperator::Divide |
+            BinaryOperator::Concatenate => {
                 Ok(Value { kind: ValueKind::Null(NullValue) })
             }
             // Other operators
@@ -696,7 +821,7 @@ impl ExpressionEvaluator {
         }
     }
 
-    // Arithmetic operations
+    // Arithmetic and string operations
     fn evaluate_addition(left: &Value, right: &Value) -> Result<Value> {
         match (&left.kind, &right.kind) {
             (ValueKind::Integer(l), ValueKind::Integer(r)) => {
@@ -785,6 +910,23 @@ impl ExpressionEvaluator {
                 }
             }
             _ => Err(RustgreSQLError::Type("Invalid types for division".to_string())),
+        }
+    }
+
+    fn evaluate_concatenation(left: &Value, right: &Value) -> Result<Value> {
+        match (&left.kind, &right.kind) {
+            (ValueKind::String(l), ValueKind::String(r)) => {
+                Ok(Value { kind: ValueKind::String(l.clone() + r) })
+            }
+            (ValueKind::String(s), _) => {
+                Ok(Value { kind: ValueKind::String(s.clone() + &format!("{:?}", right)) })
+            }
+            (_, ValueKind::String(s)) => {
+                Ok(Value { kind: ValueKind::String(format!("{:?}{}", left, s)) })
+            }
+            _ => {
+                Ok(Value { kind: ValueKind::String(format!("{:?}{:?}", left, right)) })
+            }
         }
     }
 

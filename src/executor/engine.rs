@@ -876,6 +876,7 @@ impl Executor {
             BinaryOperator::Subtract => "-",
             BinaryOperator::Multiply => "*",
             BinaryOperator::Divide => "/",
+            BinaryOperator::Concatenate => "||",
         }
     }
 

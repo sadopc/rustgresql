@@ -144,6 +144,11 @@ pub enum Expression {
         op: UnaryOperator,
         expr: Box<Expression>,
     },
+    /// CAST expression
+    Cast {
+        expr: Box<Expression>,
+        data_type: crate::types::DataType,
+    },
     /// Subquery
     Subquery(Box<Statement>),
     /// EXISTS subquery
@@ -157,6 +162,24 @@ pub enum Expression {
     Star,
     /// Parameter placeholder
     Parameter(usize),
+    /// CASE expression
+    Case {
+        /// Optional base expression for simple CASE (CASE expr WHEN value THEN result)
+        base: Option<Box<Expression>>,
+        /// WHEN...THEN branches
+        branches: Vec<CaseBranch>,
+        /// Optional ELSE result
+        else_result: Option<Box<Expression>>,
+    },
+}
+
+/// Branch in a CASE expression
+#[derive(Debug, Clone)]
+pub struct CaseBranch {
+    /// Condition expression (for searched CASE) or value to compare (for simple CASE)
+    pub condition: Box<Expression>,
+    /// Result expression when condition matches
+    pub result: Box<Expression>,
 }
 
 /// Binary operators
@@ -179,6 +202,7 @@ pub enum BinaryOperator {
     Subtract,
     Multiply,
     Divide,
+    Concatenate,
 }
 
 /// Unary operators
