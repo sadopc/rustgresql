@@ -1,6 +1,6 @@
 # RustgreSQL
 
-A PostgreSQL-compatible relational database written in Rust for educational purposes.
+A PostgreSQL like relational database written in Rust for educational purposes.
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
