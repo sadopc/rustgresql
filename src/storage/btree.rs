@@ -135,19 +135,29 @@ impl BTreeNode {
         let split_pos = self.entry_count / 2;
         let mut right_node = BTreeNode::new(self.node_type);
 
-        // Move entries to right node
+        // Move entries to right node (entries after split_pos go to right)
         right_node.entries = self.entries.split_off(split_pos);
-        right_node.entry_count = right_node.entries.len();
 
         // For internal nodes, also move children
-        if self.node_type == BTreeNodeType::Internal {
+        // An internal node with n entries has n+1 children
+        // After split at position split_pos:
+        // - Left node keeps entries[0..split_pos-1] and children[0..split_pos]
+        // - The entry at split_pos-1 (after pop) becomes separator
+        // - Right node gets entries[split_pos+1..] and children[split_pos+1..]
+        if self.node_type == BTreeNodeType::Internal && !self.children.is_empty() {
+            // Split children: right node gets children from split_pos+1 onwards
+            // This ensures left has split_pos children (for split_pos-1 entries after separator removal)
+            // and right has the remaining children
             let child_split_pos = split_pos + 1;
-            right_node.children = self.children.split_off(child_split_pos);
+            if child_split_pos <= self.children.len() {
+                right_node.children = self.children.split_off(child_split_pos);
+            }
         }
 
-        // Get the middle entry (separator)
-        let separator = self.entries.pop().unwrap();
-        self.entry_count -= 1;
+        // Get the middle entry (separator) - this is the first entry of right_node
+        let separator = right_node.entries.remove(0);
+        right_node.entry_count = right_node.entries.len();
+        self.entry_count = self.entries.len();
 
         (right_node, separator)
     }
@@ -321,6 +331,16 @@ impl BTree {
             BTreeNodeType::Internal => {
                 // Find appropriate child
                 let child_idx = node.find_insert_position(&key);
+
+                // Ensure children array has the required element
+                // An internal node with n entries should have n+1 children
+                if child_idx >= node.children.len() {
+                    return Err(crate::error::RustgreSQLError::Index(
+                        format!("B-Tree internal node corruption: child_idx {} >= children.len() {} (entries: {})",
+                               child_idx, node.children.len(), node.entries.len())
+                    ));
+                }
+
                 let child_id = node.children[child_idx];
 
                 let (child_id, mut child_node) = self.load_node(child_id)?;
@@ -386,6 +406,15 @@ impl BTree {
             BTreeNodeType::Internal => {
                 // Find appropriate child
                 let child_idx = node.find_insert_position(key);
+
+                // Ensure children array has the required element
+                if child_idx >= node.children.len() {
+                    return Err(crate::error::RustgreSQLError::Index(
+                        format!("B-Tree search: child_idx {} >= children.len() {} (entries: {})",
+                               child_idx, node.children.len(), node.entries.len())
+                    ));
+                }
+
                 let child_id = node.children[child_idx];
 
                 let (_, child_node) = self.load_node(child_id)?;
@@ -431,6 +460,15 @@ impl BTree {
             }
             BTreeNodeType::Internal => {
                 let child_idx = node.find_insert_position(key);
+
+                // Ensure children array has the required element
+                if child_idx >= node.children.len() {
+                    return Err(crate::error::RustgreSQLError::Index(
+                        format!("B-Tree delete: child_idx {} >= children.len() {} (entries: {})",
+                               child_idx, node.children.len(), node.entries.len())
+                    ));
+                }
+
                 let child_id = node.children[child_idx];
 
                 let (_, mut child_node) = self.load_node(child_id)?;
@@ -532,6 +570,9 @@ impl BTreeIterator {
 
         while current_node.node_type == BTreeNodeType::Internal {
             stack.push_back((current_id, current_node.clone(), 0));
+            if current_node.children.is_empty() {
+                break;
+            }
             current_id = current_node.children[0];
             let (_, node) = btree.load_node(current_id)?;
             current_node = node;

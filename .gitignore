@@ -70,9 +70,13 @@ data/
 db/
 logs/
 
---help
---test
---file
+# History files
+*_history.txt
 
-*.sql
-*.txt
+# Python virtual environment
+venv/
+__pycache__/
+*.py
+
+# Temporary debug files
+/tmp/

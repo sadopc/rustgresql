@@ -279,6 +279,12 @@ impl AggregateState {
     pub fn update(&mut self, value: &Value) -> Result<()> {
         match self {
             AggregateState::Count { count, distinct, values } => {
+                // Skip NULL values - COUNT(column) and COUNT(DISTINCT column) should not count NULLs
+                // Only COUNT(*) counts NULLs, but that case is handled separately in operators.rs
+                if matches!(value.kind, ValueKind::Null(_)) {
+                    return Ok(());
+                }
+
                 if *distinct {
                     let value_str = format!("{:?}", value);
                     if values.insert(value_str) {
@@ -955,46 +961,69 @@ impl ExpressionEvaluator {
 
     fn evaluate_less_than(left: &Value, right: &Value) -> Result<Value> {
         let result = match (&left.kind, &right.kind) {
-            (ValueKind::Integer(l), ValueKind::Integer(r)) => l < r,
-            (ValueKind::Float(l), ValueKind::Float(r)) => l < r,
-            (ValueKind::String(l), ValueKind::String(r)) => l < r,
+            (ValueKind::Integer(l), ValueKind::Integer(r)) => Some(l < r),
+            (ValueKind::Float(l), ValueKind::Float(r)) => Some(l < r),
+            (ValueKind::String(l), ValueKind::String(r)) => Some(l < r),
             (ValueKind::Boolean(l), ValueKind::Boolean(r)) => {
                 // FALSE < TRUE in SQL boolean ordering
-                !l && *r
+                Some(!l && *r)
             }
-            (ValueKind::Integer(l), ValueKind::Float(r)) => (*l as f64) < *r,
-            (ValueKind::Float(l), ValueKind::Integer(r)) => *l < (*r as f64),
-            _ => false,
+            (ValueKind::Integer(l), ValueKind::Float(r)) => Some((*l as f64) < *r),
+            (ValueKind::Float(l), ValueKind::Integer(r)) => Some(*l < (*r as f64)),
+            (ValueKind::Timestamp(l), ValueKind::Timestamp(r)) => Some(l < r),
+            // Incompatible types - return Unknown (NULL)
+            _ => None,
         };
-        Ok(Value { kind: ValueKind::Boolean(result) })
+        match result {
+            Some(b) => Ok(Value { kind: ValueKind::Boolean(b) }),
+            None => Ok(Value { kind: ValueKind::Null(NullValue) }),
+        }
     }
 
     fn evaluate_less_than_or_equals(left: &Value, right: &Value) -> Result<Value> {
         let less_than = Self::evaluate_less_than(left, right)?;
         let equals = Self::evaluate_equals(left, right)?;
 
-        if let (ValueKind::Boolean(lt), ValueKind::Boolean(eq)) = (less_than.kind, equals.kind) {
-            Ok(Value { kind: ValueKind::Boolean(lt || eq) })
-        } else {
-            Err(RustgreSQLError::Execution("LESS THAN OR EQUALS operation failed".to_string()))
+        match (&less_than.kind, &equals.kind) {
+            (ValueKind::Boolean(lt), ValueKind::Boolean(eq)) => {
+                Ok(Value { kind: ValueKind::Boolean(*lt || *eq) })
+            }
+            // If either is NULL/Unknown, propagate Unknown
+            (ValueKind::Null(_), _) | (_, ValueKind::Null(_)) => {
+                Ok(Value { kind: ValueKind::Null(NullValue) })
+            }
+            _ => Err(RustgreSQLError::Execution("LESS THAN OR EQUALS operation failed".to_string()))
         }
     }
 
     fn evaluate_greater_than(left: &Value, right: &Value) -> Result<Value> {
-        let less_than_or_equals = Self::evaluate_less_than_or_equals(left, right)?;
-        if let ValueKind::Boolean(lte) = less_than_or_equals.kind {
-            Ok(Value { kind: ValueKind::Boolean(!lte) })
-        } else {
-            Err(RustgreSQLError::Execution("GREATER THAN operation failed".to_string()))
+        let result = match (&left.kind, &right.kind) {
+            (ValueKind::Integer(l), ValueKind::Integer(r)) => Some(l > r),
+            (ValueKind::Float(l), ValueKind::Float(r)) => Some(l > r),
+            (ValueKind::String(l), ValueKind::String(r)) => Some(l > r),
+            (ValueKind::Boolean(l), ValueKind::Boolean(r)) => {
+                // TRUE > FALSE in SQL boolean ordering
+                Some(*l && !*r)
+            }
+            (ValueKind::Integer(l), ValueKind::Float(r)) => Some((*l as f64) > *r),
+            (ValueKind::Float(l), ValueKind::Integer(r)) => Some(*l > (*r as f64)),
+            (ValueKind::Timestamp(l), ValueKind::Timestamp(r)) => Some(l > r),
+            // Incompatible types - return Unknown (NULL)
+            _ => None,
+        };
+        match result {
+            Some(b) => Ok(Value { kind: ValueKind::Boolean(b) }),
+            None => Ok(Value { kind: ValueKind::Null(NullValue) }),
         }
     }
 
     fn evaluate_greater_than_or_equals(left: &Value, right: &Value) -> Result<Value> {
         let less_than = Self::evaluate_less_than(left, right)?;
-        if let ValueKind::Boolean(lt) = less_than.kind {
-            Ok(Value { kind: ValueKind::Boolean(!lt) })
-        } else {
-            Err(RustgreSQLError::Execution("GREATER THAN OR EQUALS operation failed".to_string()))
+        match less_than.kind {
+            ValueKind::Boolean(lt) => Ok(Value { kind: ValueKind::Boolean(!lt) }),
+            // If Unknown, stay Unknown
+            ValueKind::Null(_) => Ok(Value { kind: ValueKind::Null(NullValue) }),
+            _ => Err(RustgreSQLError::Execution("GREATER THAN OR EQUALS operation failed".to_string()))
         }
     }
 
@@ -1145,6 +1174,23 @@ impl ExpressionEvaluator {
                 match arg.kind {
                     ValueKind::String(s) => Ok(Value { kind: ValueKind::Integer(s.len() as i64) }),
                     _ => Err(RustgreSQLError::Type("LENGTH function requires string argument".to_string())),
+                }
+            }
+            "NULLIF" => {
+                if args.len() != 2 {
+                    return Err(RustgreSQLError::InvalidOperation(
+                        "NULLIF function requires exactly 2 arguments".to_string()
+                    ));
+                }
+                let arg1 = self.evaluate(&args[0], context)?;
+                let arg2 = self.evaluate(&args[1], context)?;
+
+                // NULLIF returns NULL if both args are equal, otherwise returns first arg
+                let equals_result = Self::evaluate_equals(&arg1, &arg2)?;
+                if matches!(equals_result.kind, ValueKind::Boolean(true)) {
+                    Ok(Value { kind: ValueKind::Null(NullValue) })
+                } else {
+                    Ok(arg1)
                 }
             }
             _ => Err(RustgreSQLError::InvalidOperation(format!("Unknown function: {}", name))),
