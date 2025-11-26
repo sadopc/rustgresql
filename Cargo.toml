@@ -2,7 +2,7 @@
 name = "rustgresql"
 version = "0.1.0"
 edition = "2021"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["Serdar ALBAYRAK <albayrak.serdar8@gmail.com>"]
 description = "A PostgreSQL-like database implemented in Rust"
 license = "MIT"
 
