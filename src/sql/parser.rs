@@ -148,9 +148,11 @@ impl Parser {
         self.consume_token(TokenType::LeftParen, "Expected '(' before CTE query")?;
 
         // Parse the CTE query (must be a SELECT statement)
+        // Use stop_at_paren=true so we don't consume ORDER BY/LIMIT/OFFSET that belong to outer query
         let query = match self.peek().token_type {
             TokenType::Select => {
-                let stmt = self.parse_statement()?;
+                self.advance(); // consume SELECT
+                let stmt = self.parse_select_after_select_impl(true)?;
                 match stmt {
                     Statement::Select(select) => select,
                     _ => return Err(RustgreSQLError::Parse(
@@ -194,11 +196,18 @@ impl Parser {
     /// Parse SELECT statement (consumes SELECT token)
     fn parse_select(&mut self) -> Result<Statement> {
         self.consume_token(TokenType::Select, "Expected SELECT")?;
-        self.parse_select_after_select()
+        self.parse_select_after_select_impl(false)
     }
 
     /// Parse SELECT statement after SELECT token has been consumed
     fn parse_select_after_select(&mut self) -> Result<Statement> {
+        self.parse_select_after_select_impl(false)
+    }
+
+    /// Parse SELECT statement after SELECT token has been consumed
+    /// If stop_at_paren is true, don't parse ORDER BY/LIMIT/OFFSET if we see a RightParen
+    /// (used for CTEs and subqueries where these clauses belong to the outer query)
+    fn parse_select_after_select_impl(&mut self, stop_at_paren: bool) -> Result<Statement> {
 
         let distinct = self.match_token(TokenType::Distinct);
 
@@ -210,9 +219,9 @@ impl Parser {
                 alias: None,
             });
         } else {
-            let mut expr = self.parse_expression()?;
+            let expr = self.parse_expression()?;
             let mut alias = None;
-            
+
             // Check for alias (AS identifier or just identifier)
             if self.match_token(TokenType::As) {
                 alias = Some(self.consume_identifier()?);
@@ -223,32 +232,33 @@ impl Parser {
                     alias = Some(self.consume_identifier()?);
                 }
             }
-            
+
             columns.push(crate::sql::ast::ColumnSpec {
                 expr,
                 alias,
             });
+        }
 
-            while self.match_token(TokenType::Comma) {
-                let mut expr = self.parse_expression()?;
-                let mut alias = None;
-                
-                // Check for alias (AS identifier or just identifier)
-                if self.match_token(TokenType::As) {
+        // Continue parsing more columns after comma (whether first was * or expression)
+        while self.match_token(TokenType::Comma) {
+            let expr = self.parse_expression()?;
+            let mut alias = None;
+
+            // Check for alias (AS identifier or just identifier)
+            if self.match_token(TokenType::As) {
+                alias = Some(self.consume_identifier()?);
+            } else if matches!(self.peek().token_type, TokenType::Identifier(_) | TokenType::QuotedIdentifier(_)) {
+                // Check if next token is an alias (not a keyword)
+                let next_token = self.peek();
+                if !next_token.is_keyword() {
                     alias = Some(self.consume_identifier()?);
-                } else if matches!(self.peek().token_type, TokenType::Identifier(_) | TokenType::QuotedIdentifier(_)) {
-                    // Check if next token is an alias (not a keyword)
-                    let next_token = self.peek();
-                    if !next_token.is_keyword() {
-                        alias = Some(self.consume_identifier()?);
-                    }
                 }
-                
-                columns.push(crate::sql::ast::ColumnSpec {
-                    expr,
-                    alias,
-                });
             }
+
+            columns.push(crate::sql::ast::ColumnSpec {
+                expr,
+                alias,
+            });
         }
 
         // Parse FROM clause (optional for scalar queries)
@@ -291,9 +301,14 @@ impl Parser {
             None
         };
 
-        // Parse ORDER BY clause
+        // Parse ORDER BY clause (skip if we're inside parentheses and next token is RightParen)
         let mut order_by = Vec::new();
-        if self.match_token(TokenType::Order) {
+        let should_parse_order_by = if stop_at_paren && self.peek().token_type == TokenType::RightParen {
+            false
+        } else {
+            self.match_token(TokenType::Order)
+        };
+        if should_parse_order_by {
             self.consume_token(TokenType::By, "Expected BY after ORDER")?;
             order_by.push(self.parse_order_by()?);
             while self.match_token(TokenType::Comma) {
@@ -301,22 +316,28 @@ impl Parser {
             }
         }
 
-        // Parse LIMIT clause
-        let limit = if self.match_identifier_token("LIMIT")? {
+        // Parse LIMIT clause (skip if we're inside parentheses and next token is RightParen)
+        let limit = if stop_at_paren && self.peek().token_type == TokenType::RightParen {
+            None
+        } else if self.match_identifier_token("LIMIT")? {
             Some(self.parse_number()?)
         } else {
             None
         };
 
-        // Parse OFFSET clause
-        let offset = if self.match_identifier_token("OFFSET")? {
+        // Parse OFFSET clause (skip if we're inside parentheses and next token is RightParen)
+        let offset = if stop_at_paren && self.peek().token_type == TokenType::RightParen {
+            None
+        } else if self.match_identifier_token("OFFSET")? {
             Some(self.parse_number()?)
         } else {
             None
         };
 
         // Parse set operations (UNION, INTERSECT, EXCEPT) after the first SELECT
-          let select_statement = self.parse_set_operations(SelectStatement::Simple {
+        // Skip if we're inside parentheses and next token is RightParen
+        let select_statement = if stop_at_paren && self.peek().token_type == TokenType::RightParen {
+            SelectStatement::Simple {
                 with_clause: None,
                 distinct,
                 columns,
@@ -329,7 +350,23 @@ impl Parser {
                 limit,
                 offset,
                 named_windows: Vec::new(),
-            })?;
+            }
+        } else {
+            self.parse_set_operations(SelectStatement::Simple {
+                with_clause: None,
+                distinct,
+                columns,
+                from,
+                joins,
+                where_clause,
+                group_by,
+                having,
+                order_by,
+                limit,
+                offset,
+                named_windows: Vec::new(),
+            })?
+        };
 
         Ok(Statement::Select(select_statement))
     }
@@ -385,9 +422,9 @@ impl Parser {
                 alias: None,
             });
         } else {
-            let mut expr = self.parse_expression()?;
+            let expr = self.parse_expression()?;
             let mut alias = None;
-            
+
             // Check for alias (AS identifier or just identifier)
             if self.match_token(TokenType::As) {
                 alias = Some(self.consume_identifier()?);
@@ -398,32 +435,33 @@ impl Parser {
                     alias = Some(self.consume_identifier()?);
                 }
             }
-            
+
             columns.push(crate::sql::ast::ColumnSpec {
                 expr,
                 alias,
             });
+        }
 
-            while self.match_token(TokenType::Comma) {
-                let mut expr = self.parse_expression()?;
-                let mut alias = None;
-                
-                // Check for alias (AS identifier or just identifier)
-                if self.match_token(TokenType::As) {
+        // Continue parsing more columns after comma (whether first was * or expression)
+        while self.match_token(TokenType::Comma) {
+            let expr = self.parse_expression()?;
+            let mut alias = None;
+
+            // Check for alias (AS identifier or just identifier)
+            if self.match_token(TokenType::As) {
+                alias = Some(self.consume_identifier()?);
+            } else if matches!(self.peek().token_type, TokenType::Identifier(_) | TokenType::QuotedIdentifier(_)) {
+                // Check if next token is an alias (not a keyword)
+                let next_token = self.peek();
+                if !next_token.is_keyword() {
                     alias = Some(self.consume_identifier()?);
-                } else if matches!(self.peek().token_type, TokenType::Identifier(_) | TokenType::QuotedIdentifier(_)) {
-                    // Check if next token is an alias (not a keyword)
-                    let next_token = self.peek();
-                    if !next_token.is_keyword() {
-                        alias = Some(self.consume_identifier()?);
-                    }
                 }
-                
-                columns.push(crate::sql::ast::ColumnSpec {
-                    expr,
-                    alias,
-                });
             }
+
+            columns.push(crate::sql::ast::ColumnSpec {
+                expr,
+                alias,
+            });
         }
 
         // Parse FROM clause (optional for literal SELECTs)
@@ -1462,7 +1500,8 @@ impl Parser {
                     ));
                 }
 
-                let subquery_statement = self.parse_select_after_select()?;
+                // Use stop_at_paren=true so we don't consume ORDER BY/LIMIT/OFFSET that belong to outer query
+                let subquery_statement = self.parse_select_after_select_impl(true)?;
 
                 self.consume_token(TokenType::RightParen, "Expected ')' after NOT EXISTS subquery")?;
 
@@ -1633,7 +1672,8 @@ impl Parser {
                     if std::env::var("DEBUG_PARSER").is_ok() {
                         println!("DEBUG: Parsing subquery in parenthesized expression");
                     }
-                    let subquery_statement = self.parse_select_after_select()?;
+                    // Use stop_at_paren=true so we don't consume ORDER BY/LIMIT/OFFSET that belong to outer query
+                    let subquery_statement = self.parse_select_after_select_impl(true)?;
                     self.consume_token(TokenType::RightParen, "Expected ')' after subquery")?;
                     Ok(Expression::Subquery(Box::new(subquery_statement)))
                 } else {
@@ -1721,7 +1761,8 @@ impl Parser {
                     ));
                 }
 
-                let subquery_statement = self.parse_select_after_select()?;
+                // Use stop_at_paren=true so we don't consume ORDER BY/LIMIT/OFFSET that belong to outer query
+                let subquery_statement = self.parse_select_after_select_impl(true)?;
 
                 self.consume_token(TokenType::RightParen, "Expected ')' after EXISTS subquery")?;
 

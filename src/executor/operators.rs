@@ -211,19 +211,31 @@ impl FilterOperator {
         })
     }
 
-    /// Extract table alias from the input plan node
+    /// Extract table alias from the input plan node (recursively searches through the plan tree)
     fn extract_table_alias(&self) -> Option<String> {
-        match &*self.input {
+        Self::extract_table_alias_recursive(&self.input)
+    }
+
+    /// Recursively search through the plan tree to find the table alias
+    fn extract_table_alias_recursive(node: &PlanNode) -> Option<String> {
+        match node {
             PlanNode::Scan { alias, .. } => alias.clone(),
-            PlanNode::Project { table_aliases, .. } => {
+            PlanNode::CTEScan { alias, cte_name } => alias.clone().or_else(|| Some(cte_name.clone())),
+            PlanNode::Project { table_aliases, input, .. } => {
                 // For Project nodes, check if there's only one table alias
                 if table_aliases.len() == 1 {
                     table_aliases.values().next().cloned()
                 } else {
-                    None
+                    Self::extract_table_alias_recursive(input)
                 }
             }
-            PlanNode::CTEScan { alias, cte_name } => alias.clone().or_else(|| Some(cte_name.clone())),
+            // Recursively search through intermediate nodes
+            PlanNode::Filter { input, .. } => Self::extract_table_alias_recursive(input),
+            PlanNode::Aggregate { input, .. } => Self::extract_table_alias_recursive(input),
+            PlanNode::Sort { input, .. } => Self::extract_table_alias_recursive(input),
+            PlanNode::Limit { input, .. } => Self::extract_table_alias_recursive(input),
+            PlanNode::Distinct { input, .. } => Self::extract_table_alias_recursive(input),
+            PlanNode::Window { input, .. } => Self::extract_table_alias_recursive(input),
             _ => None,
         }
     }
@@ -389,35 +401,37 @@ impl ProjectOperator {
         }
     }
 
-    /// Extract table alias from the input plan node (for ProjectOperator)
+    /// Extract table alias from the input plan node (recursively searches through the plan tree)
     fn extract_table_alias(&self) -> Option<String> {
-        match &*self.input {
+        Self::extract_table_alias_recursive_proj(&self.input)
+    }
+
+    /// Recursively search through the plan tree to find the table alias
+    fn extract_table_alias_recursive_proj(node: &PlanNode) -> Option<String> {
+        match node {
             PlanNode::Scan { alias, .. } => alias.clone(),
-            PlanNode::Project { table_aliases, .. } => {
+            PlanNode::CTEScan { alias, cte_name } => alias.clone().or_else(|| Some(cte_name.clone())),
+            PlanNode::Project { table_aliases, input, .. } => {
                 // For Project nodes, check if there's only one table alias
                 if table_aliases.len() == 1 {
                     table_aliases.values().next().cloned()
                 } else {
-                    None
+                    Self::extract_table_alias_recursive_proj(input)
                 }
             }
-            PlanNode::CTEScan { alias, cte_name } => alias.clone().or_else(|| Some(cte_name.clone())),
+            // Recursively search through intermediate nodes
+            PlanNode::Filter { input, .. } => Self::extract_table_alias_recursive_proj(input),
+            PlanNode::Aggregate { input, .. } => Self::extract_table_alias_recursive_proj(input),
+            PlanNode::Sort { input, .. } => Self::extract_table_alias_recursive_proj(input),
+            PlanNode::Limit { input, .. } => Self::extract_table_alias_recursive_proj(input),
+            PlanNode::Distinct { input, .. } => Self::extract_table_alias_recursive_proj(input),
+            PlanNode::Window { input, .. } => Self::extract_table_alias_recursive_proj(input),
             _ => None,
         }
     }
 
     pub fn execute(&self, context: &mut ExecutionContext) -> Result<QueryResult> {
         let input_result = self.input.execute(context)?;
-        println!("DEBUG: ProjectOperator executing with {} input columns: {:?}", input_result.column_names.len(), input_result.column_names);
-        println!("DEBUG: ProjectOperator has {} output columns:", self.columns.len());
-        for (i, (name, expr)) in self.columns.iter().enumerate() {
-            println!("DEBUG:   Output column {}: {} = {:?}", i, name, match expr {
-                Expression::Column { name, .. } => format!("Column({})", name),
-                Expression::BinaryOp { .. } => "BinaryOp(...)".to_string(),
-                Expression::WindowFunction(_) => "WindowFunction".to_string(),
-                _ => format!("{:?}", expr).chars().take(30).collect::<String>(),
-            });
-        }
 
         // Extract column names and compute projected values using real expression evaluator
         let column_names: Vec<String> = self.columns.iter().map(|(name, _)| name.clone()).collect();
@@ -2682,19 +2696,28 @@ impl SubqueryOperator {
 
         // Inject outer context values into correlated context
         // The correlated_columns list tells us which outer columns we need
+        // Store both qualified (e.g., "rd.id") and unqualified (e.g., "id") keys for robust lookup
         let mut outer_values = std::collections::HashMap::new();
 
         for correlated_column in &self.correlated_columns {
             if let Some(value) = outer_context.columns.get(correlated_column) {
                 correlated_context.log(&format!("Injecting correlated column {} = {:?}", correlated_column, value));
                 outer_values.insert(correlated_column.clone(), value.clone());
+                // Also store unqualified version for robust lookup
+                if let Some(dot_pos) = correlated_column.find('.') {
+                    let unqualified_name = &correlated_column[dot_pos + 1..];
+                    outer_values.insert(unqualified_name.to_string(), value.clone());
+                }
             } else {
                 // Fallback: if qualified name not found, try to extract unqualified part
                 if let Some(dot_pos) = correlated_column.find('.') {
                     let unqualified_name = &correlated_column[dot_pos + 1..];
                     if let Some(value) = outer_context.columns.get(unqualified_name) {
                         correlated_context.log(&format!("Injecting correlated column {} (found as {})", correlated_column, unqualified_name));
+                        // Store with qualified key (for exact match)
                         outer_values.insert(correlated_column.clone(), value.clone());
+                        // Also store with unqualified key (for fallback)
+                        outer_values.insert(unqualified_name.to_string(), value.clone());
                     }
                 }
             }
@@ -2782,15 +2805,10 @@ impl WindowOperator {
 
     pub fn execute(&self, context: &mut ExecutionContext) -> Result<QueryResult> {
         context.log("Executing WindowOperator");
-        println!("DEBUG: WindowOperator executing with {} window functions", self.window_functions.len());
-        for (i, (alias, _)) in self.window_functions.iter().enumerate() {
-            println!("DEBUG: Window function {} has alias '{}'", i, alias);
-        }
 
         // Execute input to get source data
         let input_result = self.input.execute(context)?;
         context.log(&format!("WindowOperator received {} rows from input", input_result.rows.len()));
-        println!("DEBUG: WindowOperator input columns: {:?}", input_result.column_names);
 
         if input_result.rows.is_empty() {
             // Return empty result with window function columns
@@ -2812,10 +2830,6 @@ impl WindowOperator {
 
         // Apply window functions to each partition
         let (result_rows, result_column_names) = self.apply_window_functions(partitions, &input_result.column_names)?;
-        println!("DEBUG: WindowOperator producing {} output columns: {:?}", result_column_names.len(), result_column_names);
-        for (i, col_name) in result_column_names.iter().enumerate() {
-            println!("DEBUG: Output column {}: '{}'", i, col_name);
-        }
 
         context.log(&format!("WindowOperator returning {} rows", result_rows.len()));
 

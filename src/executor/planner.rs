@@ -171,7 +171,6 @@ pub enum PlanNode {
 impl PlanNode {
     /// Execute the plan node and return results
     pub fn execute(&self, context: &mut ExecutionContext) -> Result<QueryResult> {
-        println!("DEBUG: PlanNode::execute called with {:?}", std::mem::discriminant(self));
         match self {
             PlanNode::Scan { table_name, .. } => {
                 // Create TableScanner with catalog and buffer manager from context
@@ -216,7 +215,6 @@ impl PlanNode {
                 operator.execute(context)
             }
             PlanNode::Project { input, columns, .. } => {
-                println!("DEBUG: Executing Project with {} columns", columns.len());
                 let input_plan = input.as_ref().clone();
                 let operator = ProjectOperator::new(input_plan, columns.clone());
                 operator.execute(context)
@@ -346,7 +344,6 @@ impl PlanNode {
                 operator.execute(context)
             }
             PlanNode::Window { input, window_functions } => {
-                println!("DEBUG: Executing Window with {} window functions", window_functions.len());
                 let input_plan = input.as_ref().clone();
 
                 // Extract WindowFunction objects from expressions
@@ -455,16 +452,6 @@ impl QueryPlanner {
 
     /// Create execution plan from SELECT statement
     pub fn plan_select(&self, select: &SelectStatement) -> Result<ExecutionPlan> {
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/window_debug.log")
-            .map(|mut f| {
-                use std::io::Write;
-                writeln!(f, "WINDOW_FUNC_DEBUG: plan_select called!").unwrap();
-                f.flush().unwrap();
-            });
-        println!("DEBUG: plan_select called");
         match select {
             SelectStatement::Simple {
                 distinct,
@@ -480,7 +467,6 @@ impl QueryPlanner {
                 offset,
                 ..
             } => {
-                println!("DEBUG: plan_select - Simple statement with {} columns", columns.len());
                 // Check if this is a CTE query first
                 if let Some(with_clause) = with_clause {
                     return self.plan_cte_select(with_clause, select);
@@ -531,7 +517,6 @@ impl QueryPlanner {
                 } else {
                     // Check if we have aggregation
                     let has_aggregation = !group_by.is_empty() || self.has_aggregate_functions(&columns.iter().map(|c| c.expr.clone()).collect::<Vec<_>>());
-                    println!("DEBUG: has_aggregation = {}, group_by.is_empty() = {}", has_aggregation, group_by.is_empty());
 
                     let projections: Result<Vec<(String, Expression)>> = columns
                         .iter()
@@ -585,48 +570,9 @@ impl QueryPlanner {
 
                     let all_projections = projections?;
 
-                    // Check if any expressions contain window functions (using the new recursive method)
-                    let _ = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/tmp/window_debug.log")
-                        .map(|mut f| {
-                            use std::io::Write;
-                            writeln!(f, "WINDOW_FUNC_DEBUG: Checking {} projections for window functions", all_projections.len()).unwrap();
-                            for (i, (name, expr)) in all_projections.iter().enumerate() {
-                                writeln!(f, "WINDOW_FUNC_DEBUG:   Projection {}: {} = {:?}", i, name, match expr {
-                                    Expression::WindowFunction(_) => "WindowFunction",
-                                    Expression::BinaryOp { .. } => "BinaryOp",
-                                    Expression::Column { .. } => "Column",
-                                    _ => "Other"
-                                }).unwrap();
-                            }
-                            f.flush().unwrap();
-                        });
-
                     let has_window_funcs = self.has_window_functions(&all_projections.iter().map(|(_, expr)| expr).cloned().collect::<Vec<_>>());
-                    println!("DEBUG: has_window_funcs = {}", has_window_funcs);
-                    let _ = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/tmp/window_debug.log")
-                        .map(|mut f| {
-                            use std::io::Write;
-                            writeln!(f, "WINDOW_FUNC_DEBUG: has_window_funcs = {}", has_window_funcs).unwrap();
-                            f.flush().unwrap();
-                        });
 
                     if !has_window_funcs {
-                        // No window functions, use the original simple approach
-                        let _ = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("/tmp/window_debug.log")
-                            .map(|mut f| {
-                                use std::io::Write;
-                                writeln!(f, "WINDOW_FUNC_DEBUG: No window functions found, using regular projections").unwrap();
-                                f.flush().unwrap();
-                            });
                         plan = PlanNode::Project {
                             input: Box::new(plan),
                             columns: all_projections,
@@ -635,39 +581,15 @@ impl QueryPlanner {
                             right_columns: None,
                         };
                     } else {
-                        // Use the new approach to extract and replace window functions in complex expressions
-                        let _ = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("/tmp/window_debug.log")
-                            .map(|mut f| {
-                                use std::io::Write;
-                                writeln!(f, "WINDOW_FUNC_DEBUG: Extracting window functions from complex expressions").unwrap();
-                                f.flush().unwrap();
-                            });
-                        let (base_columns, window_functions, computed_columns) = self.extract_and_replace_window_functions(&all_projections);
-                        let _ = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("/tmp/window_debug.log")
-                            .map(|mut f| {
-                                use std::io::Write;
-                                writeln!(f, "WINDOW_FUNC_DEBUG: Found {} base columns, {} window functions, {} computed columns",
-                                        base_columns.len(), window_functions.len(), computed_columns.len()).unwrap();
-                                f.flush().unwrap();
-                            });
+                        // Extract and replace window functions in complex expressions
+                        let (base_columns, window_functions, computed_columns) = self.extract_and_replace_window_functions(&all_projections, from);
 
                         // Save column names before moving them into plan nodes
                         let base_column_names: Vec<String> = base_columns.iter().map(|(name, _)| name.clone()).collect();
                         let window_function_names: Vec<String> = window_functions.iter().map(|(name, _)| name.clone()).collect();
 
                         // First, add a Project node to keep only base columns
-                        // This ensures the Window node only receives base table columns
                         if !base_columns.is_empty() {
-                            println!("DEBUG: Creating Project node with {} base columns BEFORE Window", base_columns.len());
-                            for (i, (name, _)) in base_columns.iter().enumerate() {
-                                println!("DEBUG:   Base column {}: {}", i, name);
-                            }
                             plan = PlanNode::Project {
                                 input: Box::new(plan),
                                 columns: base_columns,
@@ -679,20 +601,13 @@ impl QueryPlanner {
 
                         // Apply window functions
                         if !window_functions.is_empty() {
-                            println!("DEBUG: Creating Window node with {} window functions", window_functions.len());
-                            for name in &window_function_names {
-                                println!("DEBUG:   Window function: {}", name);
-                            }
                             plan = PlanNode::Window {
                                 input: Box::new(plan),
                                 window_functions: window_functions,
                             };
                         }
 
-                        // Now apply a final Project node to produce ALL output columns
-                        // The Window node outputs [base_columns + window_function_results]
-                        // We need to include: base columns (as pass-through), window function columns (as pass-through), and computed columns
-                        // Build the final output columns list
+                        // Build final output columns list
                         let mut final_columns: Vec<(String, Expression)> = Vec::new();
 
                         // Add base columns as pass-through column references
@@ -704,7 +619,6 @@ impl QueryPlanner {
                         }
 
                         // Add window function columns as pass-through column references
-                        // (These are available from the Window node's output)
                         for name in &window_function_names {
                             final_columns.push((name.clone(), Expression::Column {
                                 table: None,
@@ -714,15 +628,6 @@ impl QueryPlanner {
 
                         // Add computed columns (which reference window function results)
                         final_columns.extend(computed_columns);
-
-                        println!("DEBUG: Creating final Project node with {} total columns", final_columns.len());
-                        for (i, (name, expr)) in final_columns.iter().enumerate() {
-                            println!("DEBUG:   Final column {}: {} = {:?}", i, name, match expr {
-                                Expression::Column { .. } => "Column",
-                                Expression::BinaryOp { .. } => "BinaryOp",
-                                _ => "Other"
-                            });
-                        }
 
                         plan = PlanNode::Project {
                             input: Box::new(plan),
@@ -939,7 +844,6 @@ impl QueryPlanner {
         // First check if this table name refers to a materialized CTE
         if let Some(cte_result) = self.materialized_ctes.get(table_name) {
             // This is a CTE reference - create a CTEScan plan node
-            println!("DEBUG: Resolving '{}' as CTE with {} rows", table_name, cte_result.rows.len());
             return Ok(PlanNode::CTEScan {
                 cte_name: table_name.to_string(),
                 alias: alias.map(|a| a.clone()),
@@ -1024,13 +928,9 @@ impl QueryPlanner {
             Expression::Function { name, .. } => {
                 matches!(name.to_uppercase().as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
             }
-            Expression::Subquery(subquery_stmt) => {
-                // Check if the subquery contains aggregate functions
-                let contains_agg = self.subquery_contains_aggregate(subquery_stmt);
-                if std::env::var("DEBUG_SUBQUERY").is_ok() {
-                    println!("DEBUG: Subquery contains aggregate: {}", contains_agg);
-                }
-                contains_agg
+            Expression::Subquery(_) => {
+                // Subqueries are scalar expressions, not aggregate functions in the outer scope
+                false
             }
             _ => false,
         }
@@ -1452,28 +1352,48 @@ impl QueryPlanner {
         (window_functions, regular_projections)
     }
 
+    /// Get all column names from tables/CTEs in the FROM clause
+    /// Used for expanding Star expressions in window function contexts
+    fn get_columns_from_from_clause(&self, from: &[TableRef]) -> Vec<String> {
+        let mut columns = Vec::new();
+        for table_ref in from {
+            match table_ref {
+                TableRef::Table { name, .. } => {
+                    // Check if it's a CTE first
+                    if let Some(cte_result) = self.materialized_ctes.get(name) {
+                        columns.extend(cte_result.column_names.clone());
+                    } else if let Some(catalog) = &self.catalog {
+                        // Get from catalog
+                        if let Ok(Some(table_def)) = catalog.get_table(name) {
+                            for col in &table_def.columns {
+                                columns.push(col.name.clone());
+                            }
+                        }
+                    }
+                }
+                TableRef::Subquery { .. } => {
+                    // Subquery columns would need to be resolved separately
+                    // For now, this is a limitation
+                }
+            }
+        }
+        columns
+    }
+
     /// Extract window functions from complex expressions and generate replacements
     /// Returns (base_columns, window_functions, computed_columns)
     /// - base_columns: projections without window functions
     /// - window_functions: extracted window functions with their aliases
     /// - computed_columns: expressions that reference window functions
-    fn extract_and_replace_window_functions(&self, projections: &[(String, Expression)]) -> (Vec<(String, Expression)>, Vec<(String, Expression)>, Vec<(String, Expression)>) {
+    fn extract_and_replace_window_functions(&self, projections: &[(String, Expression)], from: &[TableRef]) -> (Vec<(String, Expression)>, Vec<(String, Expression)>, Vec<(String, Expression)>) {
         let mut base_columns = Vec::new();
         let mut window_functions = Vec::new();
         let mut window_func_aliases = HashMap::new();
         let mut computed_columns = Vec::new();
         let mut window_func_counter = 0;
 
-        println!("DEBUG: Processing {} projections", projections.len());
-
         // First pass: identify direct window functions and collect their aliases
         for (name, expr) in projections {
-            println!("DEBUG: Processing projection '{}' with expression type {:?}", name, match expr {
-                Expression::WindowFunction(_) => "WindowFunction",
-                Expression::BinaryOp { .. } => "BinaryOp",
-                _ => "Other"
-            });
-
             if self.contains_window_functions(expr) {
                 let (extracted_funcs, _) = self.extract_window_functions_from_expression(
                     expr,
@@ -1489,28 +1409,22 @@ impl QueryPlanner {
             }
         }
 
-        println!("DEBUG: Window function aliases: {:?}", window_func_aliases);
-
         // Reset counter for second pass
         window_func_counter = 0;
 
         // Second pass: extract and separate into categories
         for (name, expr) in projections {
-            println!("DEBUG: Second pass - Processing '{}', contains_window_functions={}", name, self.contains_window_functions(expr));
             if self.contains_window_functions(expr) {
                 let (extracted_funcs, modified_expr) = self.extract_window_functions_from_expression(
                     expr,
                     &mut window_func_counter
                 );
 
-                println!("DEBUG: Second pass - '{}' has {} extracted functions, is_direct_window_function={}", name, extracted_funcs.len(), matches!(expr, Expression::WindowFunction(_)));
-
                 if matches!(expr, Expression::WindowFunction(_)) {
                     // Direct window function
                     for (_, window_func_expr) in extracted_funcs.iter() {
                         window_functions.push((name.clone(), window_func_expr.clone()));
                     }
-                    println!("DEBUG: Second pass - Added '{}' to window_functions", name);
                 } else {
                     // Computed expression with window functions
                     // Replace generated names with actual aliases
@@ -1522,17 +1436,20 @@ impl QueryPlanner {
                     }
                     window_functions.extend(extracted_funcs);
                     computed_columns.push((name.clone(), corrected_expr));
-                    println!("DEBUG: Second pass - Added '{}' to computed_columns", name);
+                }
+            } else if matches!(expr, Expression::Star) {
+                // Expand star to actual column names from FROM clause
+                let column_names = self.get_columns_from_from_clause(from);
+                for col_name in column_names {
+                    base_columns.push((col_name.clone(), Expression::Column {
+                        table: None,
+                        name: col_name.clone(),
+                    }));
                 }
             } else {
                 base_columns.push((name.clone(), expr.clone()));
-                println!("DEBUG: Second pass - Added '{}' to base_columns", name);
             }
         }
-
-        println!("DEBUG: Final base_columns: {}", base_columns.len());
-        println!("DEBUG: Final window_functions: {}", window_functions.len());
-        println!("DEBUG: Final computed_columns: {}", computed_columns.len());
 
         (base_columns, window_functions, computed_columns)
     }
@@ -1609,7 +1526,6 @@ impl QueryPlanner {
                     name: generated_name.clone(),
                 };
 
-                println!("DEBUG: Extracted window function as '{}', replacing with column reference", generated_name);
                 (vec![(generated_name, window_func_expr)], replacement_expr)
             },
 

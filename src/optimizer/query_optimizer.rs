@@ -174,6 +174,17 @@ impl OptimizedQueryPlanner {
                         // Check if any projections contain window functions (recursively)
                         let has_window_funcs = self.has_window_functions(&projections.iter().map(|(_, expr)| expr.clone()).collect::<Vec<_>>());
 
+                        // Check if any projections contain star expressions
+                        let has_star = projections.iter().any(|(_, expr)| matches!(expr, Expression::Star));
+
+                        // If we have both window functions and star expressions, fall back to base planner
+                        // The base planner has catalog access needed to expand star to actual column names
+                        if has_window_funcs && has_star {
+                            return Err(crate::error::RustgreSQLError::Internal(
+                                "Window functions with SELECT * not supported in optimizer, falling back to base planner".to_string()
+                            ));
+                        }
+
                         if !has_window_funcs {
                             // No window functions - simple projection
                             plan = PlanNode::Project {
