@@ -118,7 +118,7 @@ cargo build --release
 ### Running the REPL
 
 ```bash
-cargo run --release
+cargo run --release --bin rustgresql
 ```
 
 Example session:
